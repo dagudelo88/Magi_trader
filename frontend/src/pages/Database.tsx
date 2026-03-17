@@ -1,4 +1,38 @@
+import { useState, useEffect } from "react";
+import LiveCryptoFeed from "../components/LiveCryptoFeed";
+
 export default function Database() {
+  const [isActive, setIsActive] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    fetchStatus();
+  }, []);
+
+  const fetchStatus = async () => {
+    try {
+      const res = await fetch("http://localhost:8000/api/data/status");
+      const data = await res.json();
+      setIsActive(data.active);
+    } catch (e) {
+      console.error("Error fetching status", e);
+    }
+  };
+
+  const toggleCollection = async () => {
+    setLoading(true);
+    try {
+      const endpoint = isActive ? "/api/data/stop" : "/api/data/start";
+      const res = await fetch(`http://localhost:8000${endpoint}`, { method: "POST" });
+      const data = await res.json();
+      setIsActive(data.active);
+    } catch (e) {
+      console.error("Error toggling collection", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <main className="flex-1 flex flex-col overflow-hidden p-6">
       <div className="flex justify-between items-center mb-6">
@@ -33,20 +67,24 @@ export default function Database() {
         </div>
       </div>
 
+      <div className="mb-8">
+        <LiveCryptoFeed />
+      </div>
+
       <div className="flex-1 bg-panel border border-border rounded-custom overflow-hidden flex flex-col">
         <div className="p-4 border-b border-border flex justify-between items-center bg-surface/50">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider">Storage Distribution</h3>
           <select className="bg-surface border border-border text-white text-xs px-2 py-1 rounded outline-none focus:border-primary">
             <option>All Tables</option>
-            <option>ticks_log</option>
-            <option>trades</option>
-            <option>bots</option>
+            <option>market_ticks</option>
+            <option>bot_decisions</option>
+            <option>market_depth</option>
           </select>
         </div>
         <div className="flex-1 p-6 flex flex-col gap-4">
           <div className="w-full">
             <div className="flex justify-between text-xs mb-1">
-              <span className="text-gray-400">ticks_log</span>
+              <span className="text-gray-400">market_ticks</span>
               <span className="text-gray-500 font-mono">18.2 MB (74%)</span>
             </div>
             <div className="w-full bg-surface rounded-full h-2">
@@ -55,7 +93,7 @@ export default function Database() {
           </div>
           <div className="w-full">
             <div className="flex justify-between text-xs mb-1">
-              <span className="text-gray-400">trades</span>
+              <span className="text-gray-400">bot_decisions</span>
               <span className="text-gray-500 font-mono">5.1 MB (20%)</span>
             </div>
             <div className="w-full bg-surface rounded-full h-2">
@@ -64,7 +102,7 @@ export default function Database() {
           </div>
           <div className="w-full">
             <div className="flex justify-between text-xs mb-1">
-              <span className="text-gray-400">bots & strategies</span>
+              <span className="text-gray-400">market_depth</span>
               <span className="text-gray-500 font-mono">1.2 MB (6%)</span>
             </div>
             <div className="w-full bg-surface rounded-full h-2">
@@ -73,7 +111,27 @@ export default function Database() {
           </div>
           
           <div className="mt-auto pt-6 border-t border-border flex justify-between items-center">
-            <p className="text-xs text-gray-500">ML Data collection is currently <span className="text-green-500 font-bold">ACTIVE</span></p>
+            <div className="flex items-center gap-4">
+              <p className="text-xs text-gray-500">
+                ML Data collection is currently{" "}
+                <span className={isActive ? "text-green-500 font-bold" : "text-red-500 font-bold"}>
+                  {isActive ? "ACTIVE" : "STOPPED"}
+                </span>
+              </p>
+              <button 
+                onClick={toggleCollection}
+                disabled={loading}
+                className={`px-3 py-1 text-xs font-bold rounded ${
+                  isActive 
+                    ? "bg-red-500/10 text-red-500 hover:bg-red-500/20" 
+                    : "bg-green-500/10 text-green-500 hover:bg-green-500/20"
+                } transition-colors border ${
+                  isActive ? "border-red-500/20" : "border-green-500/20"
+                }`}
+              >
+                {loading ? "..." : isActive ? "Stop Collection" : "Start Collection"}
+              </button>
+            </div>
             <button className="text-xs text-red-500 hover:text-red-400 transition-colors underline">Purge Simulation Logs</button>
           </div>
         </div>

@@ -19,7 +19,6 @@ export function TopNav() {
         <nav className="flex items-center space-x-6 text-sm font-medium text-gray-400">
           <Link to="/" className={`transition-colors ${location.pathname === '/' ? 'text-white border-b-2 border-primary py-5' : 'hover:text-white'}`}>Dashboard</Link>
           <Link to="/bots" className={`transition-colors ${isActive('/bots') ? 'text-white border-b-2 border-primary py-5' : 'hover:text-white'}`}>Bots</Link>
-          <Link to="/strategies" className={`transition-colors ${isActive('/strategies') ? 'text-white border-b-2 border-primary py-5' : 'hover:text-white'}`}>Strategies</Link>
           <Link to="/performance" className={`transition-colors ${isActive('/performance') ? 'text-white border-b-2 border-primary py-5' : 'hover:text-white'}`}>Performance</Link>
           <Link to="/database" className={`transition-colors ${isActive('/database') ? 'text-white border-b-2 border-primary py-5' : 'hover:text-white'}`}>Database</Link>
           <Link to="/settings" className={`transition-colors ${isActive('/settings') ? 'text-white border-b-2 border-primary py-5' : 'hover:text-white'}`}>Settings</Link>
