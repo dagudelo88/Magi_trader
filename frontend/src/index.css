@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #1152d4;
+  --color-surface: #0a0a0a;
+  --color-panel: #161616;
+  --color-border: #262626;
+  
+  --radius-custom: 8px;
+  
+  --font-sans: "Inter", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+}
+
+@layer base {
+  body {
+    @apply bg-surface text-gray-200 font-sans h-screen overflow-hidden flex flex-col;
+  }
+}
+
+@layer utilities {
+  /* Terminal-style scrollbar for logs */
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0a0a0a;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #333;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #444;
+  }
+  
+  .custom-glow {
+    box-shadow: 0 0 15px rgba(17, 82, 212, 0.1);
+  }
+}
