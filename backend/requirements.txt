@@ -5,3 +5,4 @@ pandas
 pyarrow
 fastparquet
 websockets
+python-dotenv
