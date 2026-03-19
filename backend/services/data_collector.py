@@ -13,16 +13,16 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 # Ensure backend folder is in path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from database import get_db_connection
+from tracked_markets import (
+    TRACKED_USDT_STREAM_IDS,
+    BTC_STREAM_ID,
+    alt_stream_ids,
+    stream_id_to_ccxt,
+)
 
-# Settings
-# Binance streams require lowercase symbols without slashes
-TARGET_ASSETS = ['solusdt', 'ethusdt', 'adausdt']
-BTC_SYMBOL = 'btcusdt'
-ALL_SYMBOLS = [BTC_SYMBOL] + TARGET_ASSETS
-
-# Initialize state dictionary
+# Initialize state dictionary (eight USDT pairs + BTC; see tracked_markets.py)
 state = {}
-for sym in ALL_SYMBOLS:
+for sym in TRACKED_USDT_STREAM_IDS:
     state[sym] = {
         'price': deque(maxlen=60), 
         'volume': 0.0, 
@@ -44,7 +44,7 @@ def get_roc(price_history, seconds):
 async def binance_ws_listener():
     # Build the combined stream URL
     streams = []
-    for sym in ALL_SYMBOLS:
+    for sym in TRACKED_USDT_STREAM_IDS:
         streams.append(f"{sym}@ticker")
         streams.append(f"{sym}@bookTicker")
         
@@ -52,7 +52,11 @@ async def binance_ws_listener():
     
     # Determine endpoint based on Testnet toggle
     use_testnet = os.getenv("TESTNET", "True").lower() == "true"
-    base_url = "wss://testnet.binance.vision" if use_testnet else "wss://stream.binance.com:9443"
+    base_url = (
+        "wss://stream.testnet.binance.vision"
+        if use_testnet
+        else "wss://stream.binance.com:9443"
+    )
     ws_url = f"{base_url}/stream?streams={stream_path}"
     
     print(f"Connecting to Binance WS: {base_url} (Testnet: {use_testnet})")
@@ -117,14 +121,14 @@ async def data_logger():
                 state[sym]['price'].append(latest)
             
             # Calculate BTC base features
-            btc_roc_1s = get_roc(state[BTC_SYMBOL]['price'], 1)
-            btc_roc_5s = get_roc(state[BTC_SYMBOL]['price'], 5)
-            btc_price = state[BTC_SYMBOL]['price'][-1] if len(state[BTC_SYMBOL]['price']) > 0 else 0
-            btc_vol = state[BTC_SYMBOL]['volume']
+            btc_roc_1s = get_roc(state[BTC_STREAM_ID]['price'], 1)
+            btc_roc_5s = get_roc(state[BTC_STREAM_ID]['price'], 5)
+            btc_price = state[BTC_STREAM_ID]['price'][-1] if len(state[BTC_STREAM_ID]['price']) > 0 else 0
+            btc_vol = state[BTC_STREAM_ID]['volume']
             
             cursor = conn.cursor()
             
-            for asset in TARGET_ASSETS:
+            for asset in alt_stream_ids():
                 asset_price = state[asset]['price'][-1] if len(state[asset]['price']) > 0 else 0
                 if asset_price == 0 or btc_price == 0:
                     continue
@@ -138,13 +142,12 @@ async def data_logger():
                 features = {
                     'bid': state[asset]['bid'],
                     'ask': state[asset]['ask'],
-                    'btc_bid': state[BTC_SYMBOL]['bid'],
-                    'btc_ask': state[BTC_SYMBOL]['ask'],
-                    'btc_spread_bps': state[BTC_SYMBOL]['spread_bps']
+                    'btc_bid': state[BTC_STREAM_ID]['bid'],
+                    'btc_ask': state[BTC_STREAM_ID]['ask'],
+                    'btc_spread_bps': state[BTC_STREAM_ID]['spread_bps']
                 }
                 
-                # We save the display name back to original format (e.g., SOL/USDT) for DB consistency
-                db_asset_name = f"{asset[:3].upper()}/USDT"
+                db_asset_name = stream_id_to_ccxt(asset)
                 
                 cursor.execute("""
                     INSERT INTO market_ticks 
@@ -166,7 +169,7 @@ async def data_logger():
 
 async def main():
     print("Starting Native Binance WebSocket streams for Lead-Lag Arbitrage ML...")
-    print(f"Tracking BTC and: {', '.join([a.upper() for a in TARGET_ASSETS])}")
+    print(f"Tracking {len(TRACKED_USDT_STREAM_IDS)} pairs: {', '.join(TRACKED_USDT_STREAM_IDS)}")
     
     # Run the WS listener and DB logger concurrently
     await asyncio.gather(

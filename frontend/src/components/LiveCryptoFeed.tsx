@@ -1,9 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-
-const TOP_10_PAIRS = [
-  "btcusdt", "ethusdt", "adausdt", "solusdt", 
-  "xrpusdt", "bnbusdt", "dogeusdt", "trxusdt"
-];
+import { API_BASE } from "../config";
+import { TRACKED_STREAM_IDS_FALLBACK } from "../trackedMarketsFallback";
 
 const UPDATE_INTERVAL_MS = 1000;
 
@@ -14,6 +11,7 @@ type PriceData = {
 
 export default function LiveCryptoFeed() {
   const [prices, setPrices] = useState<Record<string, PriceData>>({});
+  const [streamIds, setStreamIds] = useState<string[]>([]);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [timeToNext, setTimeToNext] = useState(UPDATE_INTERVAL_MS);
   
@@ -22,9 +20,25 @@ export default function LiveCryptoFeed() {
   const previousPrices = useRef<Record<string, string>>({});
 
   useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/market/tracked`)
+      .then((r) => r.json())
+      .then((d: { stream_ids?: string[] }) => {
+        if (cancelled) return;
+        setStreamIds(Array.isArray(d.stream_ids) && d.stream_ids.length ? d.stream_ids : TRACKED_STREAM_IDS_FALLBACK);
+      })
+      .catch(() => {
+        if (!cancelled) setStreamIds(TRACKED_STREAM_IDS_FALLBACK);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (streamIds.length === 0) return;
     let ignore = false;
-    // Connect to Binance Public WebSocket using @trade to get every single actual trade that happens instantly
-    const streams = TOP_10_PAIRS.map(pair => `${pair}@trade`).join("/");
+    const streams = streamIds.map((pair) => `${pair}@trade`).join("/");
     const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
 
     ws.onopen = () => {
@@ -61,18 +75,19 @@ export default function LiveCryptoFeed() {
         ws.close();
       }
     };
-  }, []);
+  }, [streamIds]);
 
   // Timer and Batch Update Loop
   useEffect(() => {
+    if (streamIds.length === 0) return;
+    const ids = streamIds;
     const flushInterval = setInterval(() => {
       // Flush buffered prices to state once per second
       if (Object.keys(pendingPrices.current).length > 0) {
         setPrices(prev => {
           const nextState: Record<string, PriceData> = { ...prev };
           
-          // Force update all pairs we are tracking
-          TOP_10_PAIRS.forEach(pair => {
+          ids.forEach(pair => {
             const symbol = pair.toUpperCase();
             const newPrice = pendingPrices.current[symbol] || previousPrices.current[symbol];
             
@@ -109,7 +124,7 @@ export default function LiveCryptoFeed() {
       clearInterval(flushInterval);
       clearInterval(timerInterval);
     };
-  }, []);
+  }, [streamIds]);
 
   const formatTime = (date: Date) => {
     const hhmmss = date.toLocaleTimeString(navigator.language, { hour12: false });
@@ -149,7 +164,7 @@ export default function LiveCryptoFeed() {
         </div>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 overflow-y-auto">
-        {TOP_10_PAIRS.map((pair) => {
+        {(streamIds.length ? streamIds : TRACKED_STREAM_IDS_FALLBACK).map((pair) => {
           const symbol = pair.toUpperCase();
           const data = prices[symbol];
           

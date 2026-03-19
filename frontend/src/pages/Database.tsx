@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import LiveCryptoFeed from "../components/LiveCryptoFeed";
+import { API_BASE } from "../config";
 
 export default function Database() {
   const [isActive, setIsActive] = useState(false);
@@ -11,7 +12,7 @@ export default function Database() {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch("http://localhost:8000/api/data/status");
+      const res = await fetch(`${API_BASE}/api/data/status`);
       const data = await res.json();
       setIsActive(data.active);
     } catch (e) {
@@ -23,7 +24,7 @@ export default function Database() {
     setLoading(true);
     try {
       const endpoint = isActive ? "/api/data/stop" : "/api/data/start";
-      const res = await fetch(`http://localhost:8000${endpoint}`, { method: "POST" });
+      const res = await fetch(`${API_BASE}${endpoint}`, { method: "POST" });
       const data = await res.json();
       setIsActive(data.active);
     } catch (e) {
