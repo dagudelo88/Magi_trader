@@ -9,6 +9,7 @@ interface BotRow {
   symbol: string;
   strategy: string;
   status: string;
+  execution_mode: string;
   initial_budget_quote: number | null;
 }
 
@@ -263,10 +264,19 @@ export default function BotsList() {
               className="bg-panel border border-border rounded p-4 flex flex-col sm:flex-row sm:items-center gap-3"
             >
               <Link to={`/bots/${bot.bot_id}`} className="flex-1 min-w-0 group">
-                <div className="flex items-center gap-2 mb-1">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <span className={`text-[9px] font-bold tracking-widest uppercase px-2 py-0.5 rounded ${statusBadge(bot.status)}`}>
                     {bot.status}
                   </span>
+                  {bot.execution_mode === 'live' ? (
+                    <span className="text-[9px] font-black tracking-widest uppercase px-2 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/40">
+                      ● LIVE
+                    </span>
+                  ) : (
+                    <span className="text-[9px] font-bold tracking-widest uppercase px-2 py-0.5 rounded bg-blue-500/15 text-blue-300 border border-blue-400/25">
+                      TESTNET
+                    </span>
+                  )}
                   <h3 className="text-base font-bold text-white group-hover:text-primary truncate transition-colors">
                     {bot.name}
                   </h3>

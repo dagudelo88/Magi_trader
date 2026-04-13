@@ -240,9 +240,15 @@ def init_db():
             strategy TEXT NOT NULL DEFAULT 'sma_cross',
             strategy_params_json TEXT,
             status TEXT NOT NULL DEFAULT 'stopped',
+            execution_mode TEXT NOT NULL DEFAULT 'testnet',
             created_at INTEGER NOT NULL
         )
     """)
+    # Migration: add execution_mode column to existing databases
+    try:
+        cursor.execute("ALTER TABLE bots ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'testnet'")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_logs (
@@ -289,35 +295,6 @@ def init_db():
         cursor.executemany(
             "INSERT INTO app_settings (key, value) VALUES (?, ?)",
             defaults,
-        )
-
-    cursor.execute("SELECT COUNT(*) AS c FROM bots")
-    if cursor.fetchone()["c"] == 0:
-        now = int(time.time() * 1000)
-        seed_bots = [
-            (
-                "1",
-                "Alpha_Trend_v4",
-                "BTC/USDT",
-                "sma_cross",
-                '{"fast_period": 5, "slow_period": 15, "quote_fraction": 0.02, "base_fraction": 0.5, "min_trade_interval_sec": 300}',
-                "stopped",
-                now,
-            ),
-            (
-                "2",
-                "Eth_Momentum_Sim",
-                "ETH/USDT",
-                "sma_cross",
-                '{"fast_period": 5, "slow_period": 15, "quote_fraction": 0.02, "base_fraction": 0.5, "min_trade_interval_sec": 300}',
-                "stopped",
-                now,
-            ),
-        ]
-        cursor.executemany(
-            """INSERT INTO bots (bot_id, name, symbol, strategy, strategy_params_json, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            seed_bots,
         )
 
     conn.commit()
@@ -628,13 +605,56 @@ def fetch_bot_orders_chronological(bot_id: str) -> list[dict[str, Any]]:
         conn.close()
 
 
+def get_latest_tick_id(symbol: str) -> int | None:
+    """Return the most recent tick_id for the given CCXT symbol, or None."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT tick_id FROM market_ticks WHERE target_asset = ? ORDER BY timestamp DESC LIMIT 1",
+            (symbol,),
+        )
+        row = cur.fetchone()
+        return int(row["tick_id"]) if row else None
+    finally:
+        conn.close()
+
+
+def record_bot_decision(
+    bot_id: str,
+    symbol: str,
+    mode: str,
+    action: str,
+    confidence: float | None,
+    executed: bool,
+) -> None:
+    """
+    Log a BUY / SELL / HOLD decision to bot_decisions for ML labelling.
+    Links to the latest market_tick for `symbol` when available.
+    """
+    tick_id = get_latest_tick_id(symbol)
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO bot_decisions (bot_id, tick_id, mode, action, confidence, executed)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (bot_id, tick_id, mode, action.upper(), confidence, int(executed)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def create_bot(
     name: str,
     symbol: str,
     strategy: str = "sma_cross",
     strategy_params_json: str | None = None,
+    execution_mode: str = "testnet",
 ) -> dict[str, Any]:
-    """Create a new bot and return its full record."""
+    """Create a new bot in testnet mode by default and return its full record."""
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -647,13 +667,43 @@ def create_bot(
         now = int(time.time() * 1000)
         cur.execute(
             """
-            INSERT INTO bots (bot_id, name, symbol, strategy, strategy_params_json, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'stopped', ?)
+            INSERT INTO bots
+              (bot_id, name, symbol, strategy, strategy_params_json, status, execution_mode, created_at)
+            VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?)
             """,
-            (new_id, name.strip(), symbol.upper().strip(), strategy, strategy_params_json, now),
+            (new_id, name.strip(), symbol.upper().strip(), strategy, strategy_params_json,
+             execution_mode, now),
         )
         conn.commit()
         cur.execute("SELECT * FROM bots WHERE bot_id = ?", (new_id,))
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def set_bot_execution_mode(bot_id: str, execution_mode: str) -> dict[str, Any]:
+    """
+    Switch a bot between 'testnet' and 'live'.
+    Bot must be stopped — the same strategy code runs on both; only the exchange
+    endpoint changes (testnet.binance.vision vs api.binance.com).
+    """
+    if execution_mode not in ("testnet", "live"):
+        raise ValueError("execution_mode must be 'testnet' or 'live'")
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"bot not found: {bot_id!r}")
+        if row["status"] == "running":
+            raise ValueError("stop the bot before changing execution mode")
+        cur.execute(
+            "UPDATE bots SET execution_mode = ? WHERE bot_id = ?",
+            (execution_mode, bot_id),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
         return _row_to_dict(cur.fetchone())
     finally:
         conn.close()

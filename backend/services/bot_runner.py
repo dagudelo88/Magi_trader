@@ -2,11 +2,14 @@
 Polls DB for bots with status=running and executes the configured strategy on Binance
 (Testnet by default, mainnet only when execution_mode=live in app_settings).
 
-Run as a subprocess from the API (same pattern as data_collector).
+Runs as an asyncio.Task inside uvicorn's lifespan (main.py). Do NOT start as a
+subprocess — it will create a duplicate runner. The __main__ block is retained only
+for occasional standalone debugging.
 """
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -19,14 +22,26 @@ _repo_root = os.path.abspath(os.path.join(_backend_dir, ".."))
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
+# Force UTF-8 output so Unicode characters never crash on Windows cp1252 consoles.
+# Wrapped in try/except because stdout may already be a broken pipe when spawned
+# as a subprocess by uvicorn (reconfigure raises on closed handles).
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(_repo_root, ".env"))
 load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
 # endregion
 
-from database import get_db_connection, record_bot_order
+from database import get_db_connection, record_bot_order, record_bot_decision, fetch_bot_orders_chronological
 from trading.app_settings import get_execution_mode, is_global_halt
+from trading.bot_performance import compute_strategy_performance
 from trading.exchange_factory import build_binance_spot
 from trading.strategies.sma_cross import default_strategy_params, evaluate_signal_details
 
@@ -64,7 +79,12 @@ def _log(bot_id: str, level: str, execution_mode: str, message: str) -> None:
         conn.commit()
     finally:
         conn.close()
-    print(f"[{level}] [{execution_mode}] bot={bot_id} {message}")
+    try:
+        print(f"[{level}] [{execution_mode}] bot={bot_id} {message}", flush=True)
+    except (OSError, ValueError):
+        # Stdout pipe is broken or closed (common when spawned as a subprocess).
+        # The DB write above already succeeded — this is just a console echo.
+        pass
 
 
 def _log_info_throttled(
@@ -114,6 +134,51 @@ def _merge_params(raw: str | None) -> dict[str, Any]:
         return base
 
 
+def _f_order(x: Any) -> float:
+    """Safe float coerce for order fields."""
+    try:
+        v = float(x)
+        return v if v == v else 0.0  # guard NaN
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _log_post_trade_balance(
+    bot_id: str,
+    execution_mode: str,
+    ex: Any,
+    base_cur: str,
+    quote_cur: str,
+) -> None:
+    """Fetch and log wallet balances immediately after a fill."""
+    try:
+        bal = ex.fetch_balance()
+        free_base = float(bal.get("free", {}).get(base_cur, 0) or 0)
+        free_quote = float(bal.get("free", {}).get(quote_cur, 0) or 0)
+        _log(
+            bot_id,
+            "info",
+            execution_mode,
+            f"Wallet after trade: {base_cur}={free_base:.8f}  {quote_cur}={free_quote:.4f}",
+        )
+    except Exception:
+        pass
+
+
+def _get_bot_position(bot_id: str, symbol: str) -> tuple[float, float]:
+    """
+    Returns (open_base_position, open_cost_basis_quote) for this bot
+    by replaying its order history using FIFO accounting.
+    Used to constrain trades to the bot's configured budget.
+    """
+    try:
+        orders = fetch_bot_orders_chronological(bot_id)
+        perf = compute_strategy_performance(orders, symbol)
+        return float(perf["open_base_position"]), float(perf["open_cost_basis_quote"])
+    except Exception:
+        return 0.0, 0.0
+
+
 def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
     bot_id = bot["bot_id"]
     symbol = bot["symbol"]
@@ -128,16 +193,10 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
             bot_id,
             execution_mode,
             "cooldown",
-            f"Waiting: post-trade cooldown — ~{left:.0f}s left before the next full market check "
-            f"(min_trade_interval_sec={interval_key:.0f}s).",
+            f"Cooldown: {left:.0f}s remaining before next market check "
+            f"(interval={interval_key:.0f}s).",
         )
-        if _debug_logs_enabled():
-            _log(
-                bot_id,
-                "debug",
-                execution_mode,
-                f"Cooldown detail: {left:.1f}s remaining.",
-            )
+        # No per-cycle debug countdown — it floods the log with no value.
         return
 
     timeframe = str(params.get("ohlcv_timeframe", "5m"))
@@ -147,15 +206,9 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
         bot_id,
         "info",
         execution_mode,
-        f"Decision: start cycle symbol={symbol} timeframe={timeframe} ohlcv_limit={limit}.",
+        f"Cycle: {symbol} {timeframe} — fetching {limit} candles…",
     )
 
-    _log(
-        bot_id,
-        "info",
-        execution_mode,
-        "Decision: fetching OHLCV from exchange…",
-    )
     try:
         ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
@@ -163,40 +216,18 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
         return
 
     if not ohlcv:
-        _log(
-            bot_id,
-            "warn",
-            execution_mode,
-            "Decision: OHLCV returned empty — cannot evaluate; will retry next poll.",
-        )
-        if _debug_logs_enabled():
-            _log(
-                bot_id,
-                "debug",
-                execution_mode,
-                f"OHLCV empty for {symbol} {timeframe}",
-            )
+        _log(bot_id, "warn", execution_mode, f"OHLCV empty for {symbol} {timeframe} — retrying next poll.")
         return
 
-    last_row = ohlcv[-1]
-    last_close = float(last_row[4])
-    last_open_ms = int(last_row[0])
+    last_close = float(ohlcv[-1][4])
     _log(
         bot_id,
         "info",
         execution_mode,
-        f"Decision: OHLCV ok — candles={len(ohlcv)} last_close={last_close} candle_open_ms={last_open_ms}.",
+        f"Market: last_close={last_close:.4f}  candles={len(ohlcv)}",
     )
-    if _debug_logs_enabled():
-        _log(
-            bot_id,
-            "debug",
-            execution_mode,
-            f"OHLCV {timeframe} n={len(ohlcv)} last_close={last_close} candle_open_ms={last_open_ms}",
-        )
 
     closes = [float(x[4]) for x in ohlcv]
-    _log(bot_id, "info", execution_mode, "Decision: running SMA crossover on closes…")
     details = evaluate_signal_details(
         closes,
         int(params["fast_period"]),
@@ -214,8 +245,8 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
                 bot_id,
                 "info",
                 execution_mode,
-                f"Decision: outcome HOLD (no cross) — fast={details.fast_sma:.8g} slow={details.slow_sma:.8g} "
-                f"prev_fast={details.prev_fast_sma:.8g} prev_slow={details.prev_slow_sma:.8g}; no order.",
+                f"Signal: HOLD — fast_sma={details.fast_sma:.4f}  slow_sma={details.slow_sma:.4f}  "
+                f"(gap={(details.fast_sma - details.slow_sma):+.4f})",
             )
         else:
             need = int(params["slow_period"]) + 2
@@ -223,29 +254,35 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
                 bot_id,
                 "info",
                 execution_mode,
-                f"Decision: outcome HOLD (warmup) — closes={details.close_count}, need>={need} bars; no order.",
+                f"Signal: HOLD (warmup) — {details.close_count}/{need} bars collected.",
             )
-        if _debug_logs_enabled():
-            _log(
-                bot_id,
-                "debug",
-                execution_mode,
-                f"Hold detail closes={details.close_count}",
-            )
+        try:
+            record_bot_decision(bot_id, symbol, execution_mode, "HOLD", None, False)
+        except Exception:
+            pass
         return
 
     _log(
         bot_id,
         "info",
         execution_mode,
-        f"Decision: outcome {details.signal.upper()} — crossover fast={details.fast_sma:.8g} "
-        f"slow={details.slow_sma:.8g} (prev fast={details.prev_fast_sma:.8g} slow={details.prev_slow_sma:.8g}).",
+        f"Signal: {details.signal.upper()} — fast_sma={details.fast_sma:.4f}  slow_sma={details.slow_sma:.4f}  "
+        f"(gap={(details.fast_sma - details.slow_sma):+.4f}  prev_gap={(details.prev_fast_sma - details.prev_slow_sma):+.4f})",
     )
 
-    _log(bot_id, "info", execution_mode, "Decision: loading market metadata and precision…")
+    # Confidence proxy: normalised SMA gap width (0–1 capped at 0.05 spread).
+    _signal_confidence: float | None = None
+    if (
+        details.fast_sma is not None
+        and details.slow_sma is not None
+        and details.slow_sma > 0
+    ):
+        _signal_confidence = round(
+            min(1.0, abs(details.fast_sma - details.slow_sma) / details.slow_sma * 20), 4
+        )
+
     try:
-        markets = ex.markets if ex.markets else None
-        if not markets:
+        if not ex.markets:
             ex.load_markets()
         market = ex.market(symbol)
     except Exception as e:
@@ -253,18 +290,9 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
         return
 
     limits = market.get("limits") or {}
-    amt_lim = limits.get("amount") or {}
-    cost_lim = limits.get("cost") or {}
-    min_amt = float(amt_lim.get("min") or 0)
-    min_cost = float(cost_lim.get("min") or 0)
-    _log(
-        bot_id,
-        "info",
-        execution_mode,
-        f"Decision: market limits — min_amount={min_amt} min_cost={min_cost}.",
-    )
+    min_amt = float((limits.get("amount") or {}).get("min") or 0)
+    min_cost = float((limits.get("cost") or {}).get("min") or 0)
 
-    _log(bot_id, "info", execution_mode, "Decision: fetching wallet balance…")
     try:
         balance = ex.fetch_balance()
     except Exception as e:
@@ -278,138 +306,257 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
         bot_id,
         "info",
         execution_mode,
-        f"Decision: balances — free {base_cur}={free_base} free {quote_cur}={free_quote}.",
+        f"Wallet before trade: {base_cur}={free_base:.8f}  {quote_cur}={free_quote:.4f}",
     )
 
     if details.signal == "buy":
         quote_fraction = float(params["quote_fraction"])
-        spend = free_quote * quote_fraction
-        _log(
-            bot_id,
-            "info",
-            execution_mode,
-            f"Decision: sizing BUY — quote_fraction={quote_fraction} spend_estimate={spend} (before precision).",
-        )
-        if spend < min_cost:
-            _log(
-                bot_id,
-                "warn",
-                execution_mode,
-                f"BUY skipped: quote spend {spend:.6f} below min cost {min_cost}",
-            )
+        initial_budget = float(params.get("initial_budget_quote") or 0)
+
+        if initial_budget > 0:
+            # Budget-constrained: only trade within the configured budget
+            _, open_cost = _get_bot_position(bot_id, symbol)
+            remaining_budget = max(0.0, initial_budget - open_cost)
+            if remaining_budget < min_cost:
+                _log(bot_id, "warn", execution_mode,
+                     f"BUY skipped — budget exhausted "
+                     f"({remaining_budget:.4f} {quote_cur} remaining < exchange min {min_cost} {quote_cur})")
+                return
+            # Ideal spend = fraction of remaining budget, capped by available funds
+            spend = min(quote_fraction * remaining_budget, remaining_budget, free_quote)
+            # If ideal spend falls below exchange minimum, bump up to minimum (budget permitting)
+            if spend < min_cost:
+                spend = min_cost
+            _log(bot_id, "info", execution_mode,
+                 f"Budget: {remaining_budget:.4f} {quote_cur} remaining of {initial_budget:.2f} {quote_cur} budget")
+        else:
+            # No budget configured — use exchange wallet as fallback
+            spend = free_quote * quote_fraction
+            if spend < min_cost:
+                _log(bot_id, "warn", execution_mode,
+                     f"BUY skipped — spend {spend:.4f} {quote_cur} below exchange minimum {min_cost} {quote_cur}")
+                return
+        if last_close <= 0:
+            _log(bot_id, "warn", execution_mode, "BUY skipped — last_close is zero")
             return
-        spend_prec = float(ex.cost_to_precision(symbol, spend))
-        _log(
-            bot_id,
-            "info",
-            execution_mode,
-            f"Decision: submitting MARKET BUY quoteOrderQty={spend_prec} …",
-        )
+
+        # Compute the buy quantity from spend, then apply lot-size precision.
+        # We use create_order(qty) instead of create_market_buy_order_with_cost(cost)
+        # because Binance converts cost→qty internally and rounds DOWN, which can leave
+        # the actual fill below min_cost — permanently creating an unsellable position.
+        qty_raw = spend / last_close
+        qty_prec = float(ex.amount_to_precision(symbol, qty_raw))
+
+        # If lot-size rounding dropped the notional below min_cost, ceiling-round
+        # the quantity up to the next valid lot step so the fill always meets the minimum.
+        if min_cost > 0 and qty_prec * last_close < min_cost:
+            try:
+                prec_val = market.get("precision", {}).get("amount")
+                if prec_val is not None:
+                    pv = float(prec_val)
+                    # CCXT precision can be in two modes:
+                    #   TICK_SIZE    — pv IS the step size  (e.g. 0.00001)
+                    #   DECIMAL_PLACES — pv is decimal count (e.g. 5 → step 0.00001)
+                    if pv > 0:
+                        step = pv if pv < 1 else 10.0 ** (-int(pv))
+                        p = max(0, round(-math.log10(step)))
+                        min_qty = min_cost / last_close
+                        qty_prec = round(math.ceil(round(min_qty / step, 9)) * step, p)
+            except Exception:
+                pass  # best-effort; proceed with rounded-down qty
+
+        if qty_prec <= 0:
+            _log(bot_id, "warn", execution_mode, "BUY skipped — quantity rounds to zero")
+            return
+
+        actual_spend = qty_prec * last_close
+        budget_ref = remaining_budget if initial_budget > 0 else free_quote
+        _log(bot_id, "info", execution_mode,
+             f"BUY order: spending ~{actual_spend:.4f} {quote_cur} "
+             f"({quote_fraction*100:.1f}% of {budget_ref:.4f} {quote_cur} remaining) @ ~{last_close:.2f}")
         try:
-            order = ex.create_market_buy_order_with_cost(symbol, spend_prec)
+            order = ex.create_order(symbol, "market", "buy", qty_prec)
             _last_trade_monotonic[bot_id] = time.monotonic()
             record_bot_order(bot_id, execution_mode, order)
-            _log(
-                bot_id,
-                "info",
-                execution_mode,
-                f"BUY filled/accepted id={order.get('id')} quoteOrderQty={spend_prec} status={order.get('status')}",
-            )
+            filled_base = _f_order(order.get("filled"))
+            cost_quote = _f_order(order.get("cost")) or actual_spend
+            avg_price = _f_order(order.get("average")) or (cost_quote / filled_base if filled_base > 0 else 0.0)
+            _log(bot_id, "info", execution_mode,
+                 f"[OK] BUY filled — spent {cost_quote:.4f} {quote_cur} "
+                 f"-> received {filled_base:.8f} {base_cur} "
+                 f"@ avg {avg_price:.2f} {quote_cur}/{base_cur}  [id={order.get('id')}]")
+            _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
+            try:
+                record_bot_decision(bot_id, symbol, execution_mode, "BUY", _signal_confidence, True)
+            except Exception:
+                pass
         except Exception as e:
+            try:
+                record_bot_decision(bot_id, symbol, execution_mode, "BUY", _signal_confidence, False)
+            except Exception:
+                pass
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
 
     elif details.signal == "sell":
         base_fraction = float(params["base_fraction"])
-        sell_amt = free_base * base_fraction
-        _log(
-            bot_id,
-            "info",
-            execution_mode,
-            f"Decision: sizing SELL — base_fraction={base_fraction} amount_estimate={sell_amt}.",
-        )
+        initial_budget = float(params.get("initial_budget_quote") or 0)
+
+        if initial_budget > 0:
+            # Sell only the base position this bot acquired with its own budget
+            open_base, _ = _get_bot_position(bot_id, symbol)
+            if open_base <= 1e-12:
+                _log(bot_id, "info", execution_mode,
+                     "SELL skipped — no open position in this bot's budget")
+                return
+            # Cap by what the exchange actually holds (safety net)
+            sell_amt = min(open_base * base_fraction, free_base)
+        else:
+            # No budget configured — use exchange wallet as fallback
+            sell_amt = free_base * base_fraction
+
+        # Minimum base-amount check
         if min_amt and sell_amt < min_amt:
-            _log(
-                bot_id,
-                "warn",
-                execution_mode,
-                f"SELL skipped: amount {sell_amt:.8f} below min {min_amt}",
-            )
+            _log(bot_id, "warn", execution_mode,
+                 f"SELL skipped — amount {sell_amt:.8f} {base_cur} below exchange minimum {min_amt}")
             return
+
+        # Minimum notional (quote value) check — same filter Binance enforces.
+        # If the fractional sell is too small, try selling the full position instead.
+        # Only skip entirely when even the full position is below minimum notional.
+        if min_cost > 0 and last_close > 0:
+            notional = sell_amt * last_close
+            if notional < min_cost:
+                full_position = open_base if initial_budget > 0 else free_base
+                full_notional = full_position * last_close
+                if full_notional >= min_cost:
+                    sell_amt = min(full_position, free_base)
+                    _log(bot_id, "info", execution_mode,
+                         f"SELL: fractional notional {notional:.4f} {quote_cur} < min {min_cost} "
+                         f"— selling full position {sell_amt:.8f} {base_cur} instead")
+                else:
+                    _log(bot_id, "warn", execution_mode,
+                         f"SELL skipped — position notional {full_notional:.4f} {quote_cur} "
+                         f"below exchange minimum {min_cost} {quote_cur}")
+                    return
+
         sell_prec = ex.amount_to_precision(symbol, sell_amt)
         if float(sell_prec) <= 0:
-            _log(
-                bot_id,
-                "warn",
-                execution_mode,
-                f"SELL skipped: rounded amount is zero (raw {sell_amt}).",
-            )
+            _log(bot_id, "warn", execution_mode,
+                 f"SELL skipped — rounded amount is zero (raw {sell_amt:.8f} {base_cur})")
             return
-        _log(
-            bot_id,
-            "info",
-            execution_mode,
-            f"Decision: submitting MARKET SELL amount={sell_prec} …",
-        )
+        _log(bot_id, "info", execution_mode,
+             f"SELL order: selling {sell_prec} {base_cur} "
+             f"(notional ~{float(sell_prec) * last_close:.4f} {quote_cur}) @ ~{last_close:.2f}")
         try:
             order = ex.create_order(symbol, "market", "sell", float(sell_prec))
             _last_trade_monotonic[bot_id] = time.monotonic()
             record_bot_order(bot_id, execution_mode, order)
-            _log(
-                bot_id,
-                "info",
-                execution_mode,
-                f"SELL filled/accepted id={order.get('id')} amount={sell_prec} status={order.get('status')}",
-            )
+            filled_base = _f_order(order.get("filled"))
+            cost_quote = _f_order(order.get("cost"))
+            avg_price = _f_order(order.get("average")) or (cost_quote / filled_base if filled_base > 0 else 0.0)
+            _log(bot_id, "info", execution_mode,
+                 f"[OK] SELL filled — sold {filled_base:.8f} {base_cur} "
+                 f"→ received {cost_quote:.4f} {quote_cur} "
+                 f"@ avg {avg_price:.2f} {quote_cur}/{base_cur}  [id={order.get('id')}]")
+            _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
+            try:
+                record_bot_decision(bot_id, symbol, execution_mode, "SELL", _signal_confidence, True)
+            except Exception:
+                pass
         except Exception as e:
+            try:
+                record_bot_decision(bot_id, symbol, execution_mode, "SELL", _signal_confidence, False)
+            except Exception:
+                pass
             _log(bot_id, "error", execution_mode, f"SELL failed: {e}\n{traceback.format_exc()}")
 
 
-def main():
+def _build_exchanges_for_bots(bots: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Build one CCXT exchange instance per unique execution_mode in the bot list.
+    Each bot carries its own execution_mode ('testnet' | 'live'), so a single
+    runner can serve mixed-mode bots safely.
+    """
+    exchanges: dict[str, Any] = {}
+    modes_needed = {bot.get("execution_mode", "testnet") for bot in bots}
+    for mode in modes_needed:
+        if mode in exchanges:
+            continue
+        try:
+            exchanges[mode] = build_binance_spot(mode)
+        except ValueError as e:
+            print(f"[bot_runner] Exchange config error for mode={mode}: {e}")
+    return exchanges
+
+
+async def run_async():
+    """Async entry-point embedded as an asyncio task in uvicorn's lifespan."""
+    import asyncio
     print("Bot runner started — polling for running bots.")
     while True:
         try:
-            if is_global_halt():
-                _throttled_print(
-                    "global_halt",
-                    f"[bot_runner] Waiting: global trading halt is ON — no bot cycles (sleep {POLL_SEC}s).",
-                )
-                time.sleep(POLL_SEC)
-                continue
+            _run_one_cycle()
+        except Exception:
+            pass
+        await asyncio.sleep(POLL_SEC)
 
-            mode = get_execution_mode()
-            try:
-                ex = build_binance_spot(mode)
-            except ValueError as e:
-                print(f"Exchange config error: {e}")
-                time.sleep(30)
-                continue
 
-            bots = _load_running_bots()
-            if not bots:
-                _throttled_print(
-                    "no_running_bots",
-                    f"[bot_runner] Waiting: no bots with status=running in DB (sleep {POLL_SEC}s).",
-                )
-                time.sleep(POLL_SEC)
-                continue
+def _run_one_cycle():
+    """One polling cycle — extracted so both the async and sync entrypoints share it."""
+    if is_global_halt():
+        _throttled_print(
+            "global_halt",
+            "[bot_runner] Waiting: global trading halt is ON — no bot cycles.",
+        )
+        return
 
-            for bot in bots:
-                try:
-                    _process_bot(ex, bot, mode)
-                except Exception:
-                    _log(
-                        bot["bot_id"],
-                        "error",
-                        mode,
-                        f"Unhandled: {traceback.format_exc()}",
-                    )
+    bots = _load_running_bots()
+    if not bots:
+        _throttled_print(
+            "no_running_bots",
+            f"[bot_runner] Waiting: no bots with status=running in DB (sleep {POLL_SEC}s).",
+        )
+        return
 
+    exchanges = _build_exchanges_for_bots(bots)
+
+    for bot in bots:
+        bot_mode = bot.get("execution_mode", "testnet")
+        ex = exchanges.get(bot_mode)
+        if ex is None:
+            _log(
+                bot["bot_id"],
+                "error",
+                bot_mode,
+                f"No exchange available for execution_mode={bot_mode!r} — check API keys in .env.",
+            )
+            continue
+        try:
+            _process_bot(ex, bot, bot_mode)
+        except Exception:
+            _log(
+                bot["bot_id"],
+                "error",
+                bot_mode,
+                f"Unhandled: {traceback.format_exc()}",
+            )
+
+
+def main():
+    """Synchronous blocking loop — used only when running as __main__ (standalone/legacy)."""
+    print("Bot runner started — polling for running bots.")
+    while True:
+        try:
+            _run_one_cycle()
             time.sleep(POLL_SEC)
         except KeyboardInterrupt:
             print("Bot runner stopped.")
             break
         except Exception:
-            print(traceback.format_exc())
+            try:
+                print(traceback.format_exc())
+            except (OSError, ValueError):
+                pass
             time.sleep(POLL_SEC)
 
 

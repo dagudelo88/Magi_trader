@@ -13,6 +13,7 @@ interface BotRecord {
   symbol: string;
   strategy: string;
   status: string;
+  execution_mode: string;
   strategy_params_json: string | null;
 }
 
@@ -51,6 +52,10 @@ interface StrategyHealth {
   current_capital_quote: number | null;
   pnl_return_on_budget_pct: number | null;
   max_drawdown_vs_budget_pct: number | null;
+  base_value_quote: number | null;
+  quote_remaining: number | null;
+  base_alloc_pct: number | null;
+  quote_alloc_pct: number | null;
 }
 
 interface BotOrderRow {
@@ -71,9 +76,18 @@ interface BotOrderRow {
   display_status?: string;
 }
 
+const _pad = (n: number, len = 2) => String(n).padStart(len, '0');
+
+function localDateTimeStr(d: Date, withMs = false): string {
+  const base =
+    `${d.getFullYear()}-${_pad(d.getMonth() + 1)}-${_pad(d.getDate())} ` +
+    `${_pad(d.getHours())}:${_pad(d.getMinutes())}:${_pad(d.getSeconds())}`;
+  return withMs ? `${base}.${_pad(d.getMilliseconds(), 3)}` : base;
+}
+
 function formatLogTime(ms: number) {
   try {
-    return new Date(ms).toISOString().replace('T', ' ').slice(0, 19);
+    return localDateTimeStr(new Date(ms));
   } catch {
     return String(ms);
   }
@@ -81,7 +95,7 @@ function formatLogTime(ms: number) {
 
 function formatLogTimeExec(ms: number) {
   try {
-    return new Date(ms).toISOString().replace('T', ' ').slice(0, 23);
+    return localDateTimeStr(new Date(ms), true);
   } catch {
     return String(ms);
   }
@@ -133,6 +147,113 @@ function formatLogLinePlain(log: BotLogRow) {
   return `[${formatLogTime(log.created_at)}] [${log.execution_mode}] [${log.level}] ${log.message}`;
 }
 
+interface PortfolioDistributionProps {
+  baseSym: string;
+  quoteSym: string;
+  baseValueQuote: number | null;
+  quoteRemaining: number | null;
+  baseAllocPct: number | null;
+  quoteAllocPct: number | null;
+  openBasePosition: number;
+  markPrice: number | null;
+}
+
+function PortfolioDistribution({
+  baseSym,
+  quoteSym,
+  baseValueQuote,
+  quoteRemaining,
+  baseAllocPct,
+  quoteAllocPct,
+  openBasePosition,
+  markPrice,
+}: PortfolioDistributionProps) {
+  const basePct = baseAllocPct ?? 0;
+  const quotePct = quoteAllocPct ?? 100;
+  const hasPosition = openBasePosition > 1e-12;
+
+  return (
+    <div className="border-b border-magi-grid/15 bg-magi-container-low/60 px-4 py-3 sm:px-6">
+      <div className="flex items-center justify-between mb-2">
+        <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">
+          Portfolio Allocation
+        </p>
+        {markPrice != null && hasPosition && (
+          <p className="font-label text-[9px] text-magi-muted/40">
+            mark {markPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}
+          </p>
+        )}
+      </div>
+
+      {/* Split bar */}
+      <div className="flex h-2.5 w-full overflow-hidden rounded-sm mb-3 bg-magi-grid/20">
+        {hasPosition && basePct > 0 && (
+          <div
+            className="h-full bg-magi-tertiary/70 transition-all duration-500"
+            style={{ width: `${basePct}%` }}
+          />
+        )}
+        <div
+          className="h-full bg-blue-500/40 transition-all duration-500"
+          style={{ width: `${quotePct}%` }}
+        />
+      </div>
+
+      {/* Legend row */}
+      <div className="flex items-start justify-between gap-4">
+        {/* Base asset */}
+        <div className="flex flex-col gap-0.5 min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="h-2 w-2 rounded-sm bg-magi-tertiary/70 shrink-0" />
+            <span className="font-label text-[11px] font-bold text-magi-tertiary">
+              {baseSym}
+            </span>
+            <span className="font-label text-[10px] text-magi-tertiary/80">
+              {basePct.toFixed(1)}%
+            </span>
+          </div>
+          {hasPosition ? (
+            <>
+              <p className="font-mono text-[11px] text-magi-on-bg pl-3.5">
+                {openBasePosition.toLocaleString(undefined, { maximumFractionDigits: 8, minimumFractionDigits: 5 })} {baseSym}
+              </p>
+              {baseValueQuote != null && (
+                <p className="font-mono text-[10px] text-magi-muted/50 pl-3.5">
+                  ≈ {baseValueQuote.toLocaleString(undefined, { maximumFractionDigits: 2 })} {quoteSym}
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="font-mono text-[11px] text-magi-muted/40 pl-3.5">0.00 {baseSym}</p>
+          )}
+        </div>
+
+        {/* Divider */}
+        <div className="h-10 w-px bg-magi-grid/20 shrink-0 self-center" />
+
+        {/* Quote asset */}
+        <div className="flex flex-col gap-0.5 min-w-0 text-right">
+          <div className="flex items-center gap-1.5 justify-end">
+            <span className="font-label text-[10px] text-blue-300/80">
+              {quotePct.toFixed(1)}%
+            </span>
+            <span className="font-label text-[11px] font-bold text-blue-300">
+              {quoteSym}
+            </span>
+            <span className="h-2 w-2 rounded-sm bg-blue-500/40 shrink-0" />
+          </div>
+          <p className="font-mono text-[11px] text-magi-on-bg">
+            {quoteRemaining != null
+              ? quoteRemaining.toLocaleString(undefined, { maximumFractionDigits: 2, minimumFractionDigits: 2 })
+              : '—'} {quoteSym}
+          </p>
+          <p className="font-mono text-[10px] text-magi-muted/40">available</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function BotDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -149,6 +270,8 @@ export default function BotDetail() {
   const [forkApplyBudget, setForkApplyBudget] = useState(false);
   const [forkBusy, setForkBusy] = useState(false);
   const [forkNameDraft, setForkNameDraft] = useState('');
+  const [showPromoteModal, setShowPromoteModal] = useState(false);
+  const [promoteBusy, setPromoteBusy] = useState(false);
   const [followLogBottom, setFollowLogBottom] = useState(true);
   const [logsCopied, setLogsCopied] = useState(false);
   const logScrollRef = useRef<HTMLDivElement>(null);
@@ -355,6 +478,27 @@ export default function BotDetail() {
     }
   };
 
+  const promoteBot = async (targetMode: 'testnet' | 'live') => {
+    if (!id) return;
+    setPromoteBusy(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${id}/execution-mode`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ execution_mode: targetMode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
+      setShowPromoteModal(false);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Update failed');
+    } finally {
+      setPromoteBusy(false);
+    }
+  };
+
   const setStatus = async (status: 'running' | 'stopped' | 'paused') => {
     if (!id) return;
     setBusy(true);
@@ -377,8 +521,10 @@ export default function BotDetail() {
 
   if (!id) return null;
 
+  // Bot's own execution_mode drives the badge (not the global setting)
+  const botExecMode = bot?.execution_mode ?? executionMode ?? 'testnet';
   const liveLabel =
-    executionMode === 'live' ? 'LIVE TRADING' : executionMode === 'testnet' ? 'TESTNET' : 'OFFLINE';
+    botExecMode === 'live' ? 'LIVE TRADING' : botExecMode === 'testnet' ? 'TESTNET' : 'OFFLINE';
   const strategyTag = bot?.strategy?.toUpperCase().replace(/-/g, '_') ?? '—';
   const qc = strategyHealth?.quote_currency ?? 'USDT';
   const winRateLabel =
@@ -407,14 +553,16 @@ export default function BotDetail() {
               </h1>
               <span
                 className={`font-label inline-flex items-center border px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
-                  executionMode === 'live'
-                    ? 'border-magi-tertiary/30 bg-magi-tertiary/10 text-magi-tertiary phosphor-green'
+                  botExecMode === 'live'
+                    ? 'border-red-400/40 bg-red-500/10 text-red-400'
                     : 'border-blue-400/30 bg-blue-500/10 text-blue-300'
                 }`}
               >
                 <span
                   className={`mr-1.5 h-1.5 w-1.5 rounded-full ${
-                    bot?.status === 'running' ? 'animate-pulse bg-magi-tertiary' : 'bg-magi-muted/50'
+                    bot?.status === 'running'
+                      ? botExecMode === 'live' ? 'animate-pulse bg-red-400' : 'animate-pulse bg-magi-tertiary'
+                      : 'bg-magi-muted/50'
                   }`}
                 />
                 {liveLabel}
@@ -489,6 +637,20 @@ export default function BotDetail() {
             </div>
           )}
 
+          {/* Portfolio distribution bar */}
+          {strategyHealth != null && (strategyHealth.base_alloc_pct != null || strategyHealth.open_base_position > 1e-12) && (
+            <PortfolioDistribution
+              baseSym={bot?.symbol?.split('/')[0] ?? 'BASE'}
+              quoteSym={qc}
+              baseValueQuote={strategyHealth.base_value_quote}
+              quoteRemaining={strategyHealth.quote_remaining}
+              baseAllocPct={strategyHealth.base_alloc_pct}
+              quoteAllocPct={strategyHealth.quote_alloc_pct}
+              openBasePosition={strategyHealth.open_base_position}
+              markPrice={strategyHealth.mark_price}
+            />
+          )}
+
           <div className="grid grid-cols-2 gap-px border-b border-magi-grid/15 bg-magi-grid/10 sm:grid-cols-4">
             <div className="flex flex-col gap-1 bg-magi-container-low px-4 py-3">
               <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">Fills</p>
@@ -558,56 +720,63 @@ export default function BotDetail() {
                 {orderStats?.total_orders ?? 0} fills
               </span>
             </div>
-            <div className="max-h-[240px] overflow-auto">
-              <table className="w-full min-w-[36rem] text-left font-label text-[10px] sm:text-[11px]">
+            <div className="max-h-[280px] overflow-auto">
+              <table className="w-full min-w-[42rem] text-left font-label text-[10px] sm:text-[11px]">
                 <thead className="sticky top-0 border-b border-magi-grid/10 bg-magi-bg uppercase text-magi-muted/40">
                   <tr>
-                    <th className="py-2 pr-2 font-normal">Timestamp</th>
-                    <th className="py-2 pr-2 font-normal">Action</th>
-                    <th className="py-2 pr-2 text-right font-normal">Price</th>
-                    <th className="py-2 pr-2 text-right font-normal">Size</th>
+                    <th className="py-2 pr-3 font-normal">Timestamp</th>
+                    <th className="py-2 pr-3 font-normal">Side</th>
+                    <th className="py-2 pr-3 text-right font-normal">Spent / Sold</th>
+                    <th className="py-2 pr-3 text-right font-normal">Received</th>
+                    <th className="py-2 pr-3 text-right font-normal">Avg Price</th>
                     <th className="py-2 text-right font-normal">Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-magi-grid/5">
                   {orders.length === 0 && (
                     <tr>
-                      <td colSpan={5} className="py-4 italic text-magi-muted/60">
+                      <td colSpan={6} className="py-4 italic text-magi-muted/60">
                         No fills yet — appears here after the first accepted buy/sell.
                       </td>
                     </tr>
                   )}
                   {orders.map((o) => {
-                    const action = o.side === 'buy' ? 'BUY_LONG' : 'SELL_SHORT';
-                    const px =
-                      o.display_price != null
-                        ? o.display_price
-                        : o.average != null
-                          ? o.average
-                          : null;
-                    const price = px != null ? formatExecPrice(px) : '—';
-                    const size =
-                      o.side === 'sell' && o.amount != null
-                        ? `${o.amount}`
-                        : o.side === 'buy' && o.cost != null
-                          ? `${o.cost} quote`
-                          : o.filled != null
-                            ? String(o.filled)
-                            : '—';
+                    const isBuy = o.side === 'buy';
+                    const avgPx =
+                      o.display_price != null ? o.display_price
+                      : o.average != null ? o.average
+                      : (o.cost != null && o.filled != null && o.filled > 0)
+                        ? o.cost / o.filled
+                        : null;
+
+                    // For BUY: spent = cost (USDT), received = filled (BTC)
+                    // For SELL: spent = filled (BTC), received = cost (USDT)
+                    const baseSym = o.symbol?.split('/')[0] ?? 'BASE';
+                    const quoteSym = o.symbol?.split('/')[1] ?? 'QUOTE';
+
+                    const spentLabel = isBuy
+                      ? o.cost != null ? `${formatQuoteAmount(o.cost, 4)} ${quoteSym}` : '—'
+                      : o.filled != null ? `${formatQuoteAmount(o.filled, 8)} ${baseSym}` : '—';
+
+                    const receivedLabel = isBuy
+                      ? o.filled != null ? `${formatQuoteAmount(o.filled, 8)} ${baseSym}` : '—'
+                      : o.cost != null ? `${formatQuoteAmount(o.cost, 4)} ${quoteSym}` : '—';
+
                     const st = (o.display_status ?? o.status ?? 'FILLED').toUpperCase();
                     return (
-                      <tr key={o.order_row_id} className="text-magi-on-bg/80">
-                        <td className="py-2 font-mono">{formatLogTimeExec(o.created_at)}</td>
-                        <td
-                          className={`py-2 font-bold ${
-                            o.side === 'buy' ? 'text-magi-tertiary' : 'text-magi-secondary'
-                          }`}
-                        >
-                          {action}
+                      <tr key={o.order_row_id} className="text-magi-on-bg/80 hover:bg-white/[0.02]">
+                        <td className="py-2 pr-3 font-mono text-magi-muted/60">{formatLogTimeExec(o.created_at)}</td>
+                        <td className={`py-2 pr-3 font-black tracking-wider ${isBuy ? 'text-magi-tertiary' : 'text-magi-secondary'}`}>
+                          {isBuy ? '▲ BUY' : '▼ SELL'}
                         </td>
-                        <td className="py-2 text-right font-mono">{price}</td>
-                        <td className="py-2 text-right font-mono">{size}</td>
-                        <td className="py-2 text-right text-magi-tertiary">[{st}]</td>
+                        <td className="py-2 pr-3 text-right font-mono">{spentLabel}</td>
+                        <td className={`py-2 pr-3 text-right font-mono font-bold ${isBuy ? 'text-magi-tertiary' : 'text-magi-secondary'}`}>
+                          {receivedLabel}
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono text-magi-muted/70">
+                          {avgPx != null ? `${formatExecPrice(avgPx)}` : '—'}
+                        </td>
+                        <td className="py-2 text-right text-magi-muted/50">{st}</td>
                       </tr>
                     );
                   })}
@@ -728,7 +897,7 @@ export default function BotDetail() {
               ))}
               {bot?.status === 'running' && (
                 <p className="mt-4 font-mono text-[10px] text-magi-tertiary/50">
-                  ● polling every 4s — {new Date().toISOString().slice(0, 19)}Z
+                  ● polling every 4s — {localDateTimeStr(new Date())}
                 </p>
               )}
             </div>
@@ -746,68 +915,136 @@ export default function BotDetail() {
         </aside>
       </main>
 
-      <footer className="flex shrink-0 flex-col items-stretch justify-between gap-3 border-t-2 border-green-900/30 bg-[#131313] px-2 py-2 shadow-[0_0_10px_rgba(0,231,58,0.08)] sm:h-12 sm:flex-row sm:items-center sm:px-4">
-        <div className="flex flex-wrap items-center gap-4 md:gap-6">
-          <span className="font-label font-mono text-[9px] font-semibold uppercase tracking-widest text-green-500">
-            MAGI_OS_CORE · SYSTEM_{bot?.status === 'running' ? 'STABLE' : 'IDLE'}
-          </span>
-          <div className="flex flex-wrap gap-3 md:gap-4">
-            <span className="font-label text-[9px] uppercase tracking-widest text-green-900">
-              NODE: {bot?.status === 'running' ? 'GREEN' : 'AMBER'}
-            </span>
-            <span className="font-label text-[9px] font-bold uppercase tracking-widest text-green-400">
-              BACKEND: {executionMode?.toUpperCase() ?? '—'}
+      <footer className="flex shrink-0 flex-col gap-0 border-t-2 border-green-900/30 bg-[#131313] shadow-[0_0_10px_rgba(0,231,58,0.08)]">
+        {/* Promote / Demote bar */}
+        <div className={`flex items-center justify-between gap-3 px-4 py-2 border-b ${
+          botExecMode === 'live'
+            ? 'border-red-900/40 bg-red-950/20'
+            : 'border-blue-900/30 bg-blue-950/10'
+        }`}>
+          <div className="flex items-center gap-2">
+            <span className={`h-2 w-2 rounded-full ${botExecMode === 'live' ? 'bg-red-400 animate-pulse' : 'bg-blue-400'}`} />
+            <span className={`font-label text-[10px] font-bold uppercase tracking-widest ${botExecMode === 'live' ? 'text-red-400' : 'text-blue-300'}`}>
+              {botExecMode === 'live' ? '⚠ LIVE SPOT TRADING — real funds at risk' : 'Testnet — virtual funds, safe to run'}
             </span>
           </div>
-        </div>
-        <div className="flex min-h-10 w-full flex-wrap gap-px sm:h-full sm:min-h-0 sm:w-auto sm:flex-nowrap">
-          {bot?.status !== 'running' ? (
+          {botExecMode !== 'live' ? (
             <button
               type="button"
-              disabled={busy}
-              onClick={() => setStatus('running')}
-              className="font-headline min-h-10 min-w-0 flex-1 bg-magi-tertiary px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]"
+              disabled={bot?.status === 'running' || promoteBusy}
+              onClick={() => setShowPromoteModal(true)}
+              title={bot?.status === 'running' ? 'Stop the bot first' : 'Promote to Live Spot trading'}
+              className="font-headline px-4 py-1.5 text-[9px] font-black uppercase tracking-widest bg-red-600/80 hover:bg-red-500 text-white rounded disabled:opacity-40 transition-colors"
             >
-              START
+              PROMOTE TO LIVE →
             </button>
           ) : (
             <button
               type="button"
-              disabled={busy}
-              onClick={() => setStatus('paused')}
-              className="font-headline min-h-10 min-w-0 flex-1 bg-yellow-500 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]"
+              disabled={bot?.status === 'running' || promoteBusy}
+              onClick={() => {
+                if (window.confirm('Demote this bot back to Testnet? It will stop trading real funds.'))
+                  void promoteBot('testnet');
+              }}
+              title={bot?.status === 'running' ? 'Stop the bot first' : 'Demote to Testnet'}
+              className="font-headline px-4 py-1.5 text-[9px] font-black uppercase tracking-widest bg-blue-700/60 hover:bg-blue-600 text-blue-200 rounded disabled:opacity-40 transition-colors"
             >
-              PAUSE
+              ← DEMOTE TO TESTNET
             </button>
           )}
-          {bot?.status === 'paused' && (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() => setStatus('running')}
-              className="font-headline min-h-10 min-w-0 flex-1 border-l border-black/20 bg-magi-tertiary/80 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]"
-            >
-              RESUME
+        </div>
+
+        {/* Bot controls */}
+        <div className="flex flex-col items-stretch justify-between gap-3 px-2 py-2 sm:h-12 sm:flex-row sm:items-center sm:px-4">
+          <div className="flex flex-wrap items-center gap-4 md:gap-6">
+            <span className="font-label font-mono text-[9px] font-semibold uppercase tracking-widest text-green-500">
+              MAGI_OS_CORE · SYSTEM_{bot?.status === 'running' ? 'STABLE' : 'IDLE'}
+            </span>
+            <div className="flex flex-wrap gap-3 md:gap-4">
+              <span className="font-label text-[9px] uppercase tracking-widest text-green-900">
+                NODE: {bot?.status === 'running' ? 'GREEN' : 'AMBER'}
+              </span>
+              <span className={`font-label text-[9px] font-bold uppercase tracking-widest ${botExecMode === 'live' ? 'text-red-400' : 'text-blue-300'}`}>
+                {botExecMode.toUpperCase()}
+              </span>
+            </div>
+          </div>
+          <div className="flex min-h-10 w-full flex-wrap gap-px sm:h-full sm:min-h-0 sm:w-auto sm:flex-nowrap">
+            {bot?.status !== 'running' ? (
+              <button type="button" disabled={busy} onClick={() => setStatus('running')}
+                className="font-headline min-h-10 min-w-0 flex-1 bg-magi-tertiary px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
+                START
+              </button>
+            ) : (
+              <button type="button" disabled={busy} onClick={() => setStatus('paused')}
+                className="font-headline min-h-10 min-w-0 flex-1 bg-yellow-500 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
+                PAUSE
+              </button>
+            )}
+            {bot?.status === 'paused' && (
+              <button type="button" disabled={busy} onClick={() => setStatus('running')}
+                className="font-headline min-h-10 min-w-0 flex-1 border-l border-black/20 bg-magi-tertiary/80 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
+                RESUME
+              </button>
+            )}
+            <button type="button" disabled={busy}
+              onClick={() => { if (window.confirm('Terminate this bot?')) void setStatus('stopped'); }}
+              className="font-headline min-h-10 min-w-0 flex-1 bg-magi-hot px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
+              TERMINATE
             </button>
-          )}
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              if (window.confirm('Terminate this bot?')) setStatus('stopped');
-            }}
-            className="font-headline min-h-10 min-w-0 flex-1 bg-magi-hot px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]"
-          >
-            TERMINATE
-          </button>
-          <Link
-            to="/bots"
-            className="font-headline flex min-h-10 min-w-0 flex-1 items-center justify-center border-l-2 border-black/20 px-3 text-center text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 sm:flex-none sm:px-6 sm:text-[10px] warning-stripe"
-          >
-            BOT_LIST
-          </Link>
+            <Link to="/bots"
+              className="font-headline flex min-h-10 min-w-0 flex-1 items-center justify-center border-l-2 border-black/20 px-3 text-center text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 sm:flex-none sm:px-6 sm:text-[10px] warning-stripe">
+              BOT_LIST
+            </Link>
+          </div>
         </div>
       </footer>
+
+      {/* ── PROMOTE TO LIVE MODAL ──────────────────────────────────────── */}
+      {showPromoteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+          <div className="bg-[#161616] border border-red-900/60 rounded-xl w-full max-w-lg shadow-2xl shadow-red-950/40">
+            <div className="px-6 py-5 border-b border-red-900/40">
+              <h2 className="text-sm font-black uppercase tracking-widest text-red-400">
+                ⚠ Promote to Live Spot Trading
+              </h2>
+            </div>
+            <div className="px-6 py-5 flex flex-col gap-4">
+              <div className="rounded-lg border border-red-900/40 bg-red-950/20 px-4 py-3 text-sm text-red-300 leading-relaxed">
+                <p className="font-bold mb-2">This will switch the bot to real Binance Spot orders.</p>
+                <ul className="list-disc list-inside space-y-1 text-[12px] text-red-300/80">
+                  <li>The exact same strategy runs — only the exchange endpoint changes</li>
+                  <li>Orders will use your <strong>real API keys</strong> on <code className="text-red-200">api.binance.com</code></li>
+                  <li>Real USDT/BTC from your live Spot wallet will be at risk</li>
+                  <li>You can demote back to Testnet at any time (bot must be stopped)</li>
+                </ul>
+              </div>
+              <div className="rounded-lg border border-border bg-black/20 px-4 py-3 text-[11px] text-gray-400">
+                <span className="font-bold text-white">Bot:</span> {bot?.name} · {bot?.symbol}<br />
+                <span className="font-bold text-white">Strategy:</span> {bot?.strategy?.toUpperCase()}<br />
+                <span className="font-bold text-white">Budget:</span>{' '}
+                {strategyHealth?.initial_budget_quote != null
+                  ? `${strategyHealth.initial_budget_quote.toLocaleString()} USDT`
+                  : 'not set — set a budget before going live'}
+              </div>
+              {error && (
+                <p className="text-red-400 text-xs border border-red-500/40 bg-red-950/20 rounded p-2">{error}</p>
+              )}
+              <div className="flex gap-2 pt-1">
+                <button type="button" disabled={promoteBusy}
+                  onClick={() => void promoteBot('live')}
+                  className="flex-1 py-3 bg-red-600 hover:bg-red-500 text-white text-[11px] font-black uppercase tracking-widest rounded disabled:opacity-40 transition-all">
+                  {promoteBusy ? 'Promoting…' : 'Yes, Go Live with Real Funds'}
+                </button>
+                <button type="button" onClick={() => { setShowPromoteModal(false); setError(null); }}
+                  className="px-4 py-3 border border-border text-gray-400 text-[11px] font-bold uppercase tracking-widest rounded hover:border-gray-500 transition-all">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

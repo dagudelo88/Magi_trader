@@ -21,6 +21,7 @@ from database import (
     sync_bot_orders_from_logs,
     refresh_stale_bot_orders_from_exchange,
     fork_bot,
+    set_bot_execution_mode,
     update_bot,
 )
 from tracked_markets import (
@@ -55,8 +56,25 @@ load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    import asyncio
+    from services.bot_runner import run_async as _bot_runner_async
     init_db()
-    yield
+    # Pause any bots that were left running — the user must explicitly start them.
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE bots SET status = 'paused' WHERE status = 'running'")
+        conn.commit()
+    finally:
+        conn.close()
+    task = asyncio.create_task(_bot_runner_async())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(title="MagiTrader API", lifespan=lifespan)
@@ -89,14 +107,6 @@ app.add_middleware(
 )
 
 collector_process = None
-bot_runner_process = None
-
-
-def ensure_bot_runner() -> None:
-    global bot_runner_process
-    script_path = os.path.join(_backend_dir, "services", "bot_runner.py")
-    if bot_runner_process is None or bot_runner_process.poll() is not None:
-        bot_runner_process = subprocess.Popen([sys.executable, script_path])
 
 
 def get_exchange_authenticated():
@@ -362,6 +372,26 @@ def delete_bot_endpoint(bot_id: str):
         raise HTTPException(status_code=code, detail=msg) from e
 
 
+class BotExecutionModeBody(BaseModel):
+    execution_mode: str  # "testnet" | "live"
+
+
+@app.put("/api/bots/{bot_id}/execution-mode")
+def put_bot_execution_mode(bot_id: str, body: BotExecutionModeBody):
+    """
+    Promote a bot from Testnet → Live Spot, or demote back to Testnet.
+    The bot must be stopped first. The exact same strategy code is used;
+    only the Binance endpoint changes (testnet.binance.vision vs api.binance.com).
+    """
+    try:
+        bot = set_bot_execution_mode(bot_id, body.execution_mode)
+    except ValueError as e:
+        msg = str(e)
+        code = 409 if "stop" in msg or "running" in msg else 404
+        raise HTTPException(status_code=code, detail=msg) from e
+    return {"bot": bot}
+
+
 @app.get("/api/bots/{bot_id}")
 def get_bot(bot_id: str):
     conn = get_db_connection()
@@ -381,9 +411,11 @@ def get_bot(bot_id: str):
         logs = [_row_to_bot(r) for r in cur.fetchall()]
         bot_row = _row_to_bot(row)
         sym = str(bot_row.get("symbol") or "")
+        # Use the bot's own execution_mode, not the global setting
+        bot_mode = str(bot_row.get("execution_mode") or "testnet")
         sync_bot_orders_from_logs(bot_id, sym)
         try:
-            refresh_stale_bot_orders_from_exchange(bot_id, build_binance_spot(get_execution_mode()))
+            refresh_stale_bot_orders_from_exchange(bot_id, build_binance_spot(bot_mode))
         except Exception:
             pass
         order_stats, orders = fetch_bot_orders_panel(bot_id, order_limit=50)
@@ -391,7 +423,7 @@ def get_bot(bot_id: str):
         mark_price: float | None = None
         if sym:
             try:
-                ex = build_binance_spot(get_execution_mode())
+                ex = build_binance_spot(bot_mode)
                 if not ex.markets:
                     ex.load_markets()
                 tk = ex.fetch_ticker(sym)
@@ -414,6 +446,42 @@ def get_bot(bot_id: str):
         current_capital: float | None = None
         if budget is not None and budget > 0:
             current_capital = round(budget + total_pnl, 8)
+
+        # Portfolio distribution: how much is in the base asset vs quote currency.
+        # quote_remaining is computed from cost-basis accounting (independent of
+        # mark-price), so it stays accurate even if the bot overspent its budget
+        # due to a bug in an older runner version.
+        #   quote_remaining = budget + realized_pnl - open_cost_basis
+        # This equals: money we started with, plus profits booked, minus what is
+        # currently locked in the open position.
+        open_base = perf["open_base_position"]
+        open_basis = perf["open_cost_basis_quote"]
+        realized_pnl = perf["realized_pnl_quote"]
+
+        base_value_quote: float | None = None
+        if open_base > 1e-12:
+            if mark_price is not None and mark_price > 0:
+                base_value_quote = round(open_base * mark_price, 8)
+            else:
+                base_value_quote = round(open_basis, 8)
+
+        quote_remaining: float | None = None
+        base_alloc_pct: float | None = None
+        quote_alloc_pct: float | None = None
+
+        if budget is not None and budget > 0:
+            # Actual USDT still available = budget + closed-trade profits - cost of open lots
+            qr = budget + realized_pnl - open_basis
+            quote_remaining = round(max(0.0, qr), 8)
+            bv = base_value_quote or 0.0
+            # Portfolio denominator: current value of open position + free quote
+            portfolio_total = bv + quote_remaining
+            if portfolio_total > 1e-12:
+                base_alloc_pct = round((bv / portfolio_total) * 100, 2)
+                quote_alloc_pct = round(100.0 - base_alloc_pct, 2)
+            else:
+                base_alloc_pct = 0.0
+                quote_alloc_pct = 100.0
 
         strategy_health = {
             "realized_pnl_quote": round(perf["realized_pnl_quote"], 8),
@@ -442,11 +510,15 @@ def get_bot(bot_id: str):
             "current_capital_quote": current_capital,
             "pnl_return_on_budget_pct": pnl_vs_budget_pct,
             "max_drawdown_vs_budget_pct": max_dd_vs_budget_pct,
+            "base_value_quote": base_value_quote,
+            "quote_remaining": quote_remaining,
+            "base_alloc_pct": base_alloc_pct,
+            "quote_alloc_pct": quote_alloc_pct,
         }
         return {
             "bot": bot_row,
             "logs": logs,
-            "execution_mode": get_execution_mode(),
+            "execution_mode": bot_mode,
             "order_stats": order_stats,
             "orders": orders,
             "strategy_health": strategy_health,
@@ -556,11 +628,7 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
     finally:
         conn.close()
 
-    if body.status == "running":
-        ensure_bot_runner()
-
     return {
         "bot_id": bot_id,
         "status": body.status,
-        "runner_ensured": body.status == "running",
     }

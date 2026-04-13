@@ -2,8 +2,8 @@
   "name": "magi-trader",
   "private": true,
   "scripts": {
-    "dev": "concurrently -n backend,frontend -c blue,magenta \"cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 8000\" \"cd frontend && npm run dev\"",
-    "dev:backend": "cd backend && uvicorn main:app --reload --host 0.0.0.0 --port 8000",
+    "dev": "concurrently -n backend,frontend -c blue,magenta \"cd backend && uvicorn main:app --host 0.0.0.0 --port 8000\" \"cd frontend && npm run dev\"",
+    "dev:backend": "cd backend && uvicorn main:app --host 0.0.0.0 --port 8000",
     "dev:frontend": "cd frontend && npm run dev"
   },
   "devDependencies": {
