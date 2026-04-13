@@ -8,6 +8,7 @@ for occasional standalone debugging.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import math
 import os
@@ -179,7 +180,12 @@ def _get_bot_position(bot_id: str, symbol: str) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
+def _process_bot(
+    ex,
+    bot: dict[str, Any],
+    execution_mode: str,
+    prefetched_ohlcv: list | None = None,
+) -> None:
     bot_id = bot["bot_id"]
     symbol = bot["symbol"]
     params = _merge_params(bot.get("strategy_params_json"))
@@ -196,27 +202,28 @@ def _process_bot(ex, bot: dict[str, Any], execution_mode: str) -> None:
             f"Cooldown: {left:.0f}s remaining before next market check "
             f"(interval={interval_key:.0f}s).",
         )
-        # No per-cycle debug countdown — it floods the log with no value.
         return
 
     timeframe = str(params.get("ohlcv_timeframe", "5m"))
     limit = int(params.get("ohlcv_limit", 50))
 
-    _log(
-        bot_id,
-        "info",
-        execution_mode,
-        f"Cycle: {symbol} {timeframe} — fetching {limit} candles…",
-    )
-
-    try:
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception as e:
-        _log(bot_id, "error", execution_mode, f"fetch_ohlcv failed: {e}")
-        return
+    if prefetched_ohlcv is not None:
+        # Shared candle data fetched once for all bots on this symbol/timeframe.
+        ohlcv = prefetched_ohlcv
+        _log(bot_id, "info", execution_mode,
+             f"Cycle: {symbol} {timeframe} — {len(ohlcv)} candles (shared fetch)")
+    else:
+        _log(bot_id, "info", execution_mode,
+             f"Cycle: {symbol} {timeframe} — fetching {limit} candles…")
+        try:
+            ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except Exception as e:
+            _log(bot_id, "error", execution_mode, f"fetch_ohlcv failed: {e}")
+            return
 
     if not ohlcv:
-        _log(bot_id, "warn", execution_mode, f"OHLCV empty for {symbol} {timeframe} — retrying next poll.")
+        _log(bot_id, "warn", execution_mode,
+             f"OHLCV empty for {symbol} {timeframe} — retrying next poll.")
         return
 
     last_close = float(ohlcv[-1][4])
@@ -520,26 +527,63 @@ def _run_one_cycle():
 
     exchanges = _build_exchanges_for_bots(bots)
 
+    # ── Pre-fetch OHLCV once per unique (mode, symbol, timeframe, limit) ──────
+    # Bots sharing the same market data key reuse the same candles, cutting
+    # redundant exchange API calls from N-bots down to N-unique-symbols.
+    ohlcv_cache: dict[tuple, list | None] = {}
     for bot in bots:
-        bot_mode = bot.get("execution_mode", "testnet")
-        ex = exchanges.get(bot_mode)
+        mode = bot.get("execution_mode", "testnet")
+        ex = exchanges.get(mode)
         if ex is None:
-            _log(
-                bot["bot_id"],
-                "error",
-                bot_mode,
-                f"No exchange available for execution_mode={bot_mode!r} — check API keys in .env.",
-            )
             continue
+        params = _merge_params(bot.get("strategy_params_json"))
+        # Skip pre-fetch for bots still in cooldown — they won't use the data.
+        interval_key = float(params["min_trade_interval_sec"])
+        if time.monotonic() - _last_trade_monotonic.get(bot["bot_id"], 0.0) < interval_key:
+            continue
+        symbol = bot["symbol"]
+        timeframe = str(params.get("ohlcv_timeframe", "5m"))
+        limit = int(params.get("ohlcv_limit", 50))
+        cache_key = (mode, symbol, timeframe, limit)
+        if cache_key not in ohlcv_cache:
+            try:
+                if not ex.markets:
+                    ex.load_markets()
+                ohlcv_cache[cache_key] = ex.fetch_ohlcv(
+                    symbol, timeframe=timeframe, limit=limit
+                )
+            except Exception as e:
+                print(f"[bot_runner] pre-fetch OHLCV failed {symbol} {timeframe}: {e}")
+                ohlcv_cache[cache_key] = None  # bot will fall back to its own fetch
+
+    # ── Dispatch all bots in parallel threads ─────────────────────────────────
+    # Each bot thread computes its signal and, only when it needs to trade,
+    # fetches a fresh balance and places the order independently.
+    def _run_bot(bot: dict[str, Any]) -> None:
+        mode = bot.get("execution_mode", "testnet")
+        ex = exchanges.get(mode)
+        if ex is None:
+            _log(bot["bot_id"], "error", mode,
+                 f"No exchange for execution_mode={mode!r} — check API keys in .env.")
+            return
+        params = _merge_params(bot.get("strategy_params_json"))
+        symbol = bot["symbol"]
+        timeframe = str(params.get("ohlcv_timeframe", "5m"))
+        limit = int(params.get("ohlcv_limit", 50))
+        prefetched = ohlcv_cache.get((mode, symbol, timeframe, limit))
         try:
-            _process_bot(ex, bot, bot_mode)
+            _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched)
         except Exception:
-            _log(
-                bot["bot_id"],
-                "error",
-                bot_mode,
-                f"Unhandled: {traceback.format_exc()}",
-            )
+            _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
+
+    max_workers = min(len(bots), 32)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_run_bot, bot): bot["bot_id"] for bot in bots}
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except Exception:
+                pass
 
 
 def main():

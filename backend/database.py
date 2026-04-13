@@ -249,6 +249,11 @@ def init_db():
         cursor.execute("ALTER TABLE bots ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'testnet'")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # Migration: track when a bot was last set to running
+    try:
+        cursor.execute("ALTER TABLE bots ADD COLUMN started_at INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_logs (

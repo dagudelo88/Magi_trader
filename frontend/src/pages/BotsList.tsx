@@ -11,6 +11,9 @@ interface BotRow {
   status: string;
   execution_mode: string;
   initial_budget_quote: number | null;
+  realized_pnl_quote: number | null;
+  win_rate_pct: number | null;
+  closed_trades: number | null;
 }
 
 const STATUS_BADGE: Record<string, string> = {
@@ -281,14 +284,30 @@ export default function BotsList() {
                     {bot.name}
                   </h3>
                 </div>
-                <p className="text-xs text-gray-400">
-                  {bot.strategy.toUpperCase()} · {bot.symbol}
-                  {bot.initial_budget_quote != null && (
-                    <span className="ml-2 text-gray-500">
-                      Budget: {bot.initial_budget_quote.toLocaleString()} USDT
+                <div className="flex items-center gap-3 flex-wrap">
+                  <p className="text-xs text-gray-400">
+                    {bot.strategy.toUpperCase()} · {bot.symbol}
+                    {bot.initial_budget_quote != null && (
+                      <span className="ml-2 text-gray-500">
+                        Budget: {bot.initial_budget_quote.toLocaleString()} USDT
+                      </span>
+                    )}
+                  </p>
+                  {/* P&L summary */}
+                  {bot.realized_pnl_quote != null && (
+                    <span className={`text-[11px] font-mono font-bold ${bot.realized_pnl_quote >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {bot.realized_pnl_quote >= 0 ? '+' : ''}{bot.realized_pnl_quote.toFixed(4)} USDT
                     </span>
                   )}
-                </p>
+                  {bot.win_rate_pct != null && bot.closed_trades != null && bot.closed_trades > 0 && (
+                    <span className="text-[10px] text-gray-500">
+                      {bot.win_rate_pct.toFixed(1)}% WR · {bot.closed_trades} trades
+                    </span>
+                  )}
+                  {(bot.closed_trades === 0 || bot.closed_trades == null) && (
+                    <span className="text-[10px] text-gray-600">No closed trades yet</span>
+                  )}
+                </div>
               </Link>
 
               <div className="flex items-center gap-1.5 shrink-0 flex-wrap">

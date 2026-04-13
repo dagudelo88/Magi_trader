@@ -2,6 +2,7 @@ import json
 import sys
 import os
 import subprocess
+import time
 from contextlib import asynccontextmanager
 
 from typing import Any
@@ -306,6 +307,19 @@ def list_bots():
             row["initial_budget_quote"] = initial_budget_from_strategy_params_json(
                 raw_params if isinstance(raw_params, str) else None
             )
+            # Compute lightweight P&L from stored orders (no exchange call)
+            bot_id = row.get("bot_id", "")
+            sym = str(row.get("symbol") or "")
+            try:
+                orders_asc = fetch_bot_orders_chronological(bot_id)
+                perf = compute_strategy_performance(orders_asc, sym)
+                row["realized_pnl_quote"] = round(perf["realized_pnl_quote"], 4)
+                row["win_rate_pct"] = perf["win_rate_pct"]
+                row["closed_trades"] = perf["closed_trades"]
+            except Exception:
+                row["realized_pnl_quote"] = None
+                row["win_rate_pct"] = None
+                row["closed_trades"] = None
         return {"bots": rows}
     finally:
         conn.close()
@@ -620,10 +634,22 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
         cur.execute("SELECT bot_id FROM bots WHERE bot_id = ?", (bot_id,))
         if cur.fetchone() is None:
             raise HTTPException(status_code=404, detail="Bot not found")
-        cur.execute(
-            "UPDATE bots SET status = ? WHERE bot_id = ?",
-            (body.status, bot_id),
-        )
+        if body.status == "running":
+            cur.execute(
+                "UPDATE bots SET status = ?, started_at = ? WHERE bot_id = ?",
+                (body.status, int(time.time()), bot_id),
+            )
+        elif body.status == "stopped":
+            # Clear started_at when fully stopped
+            cur.execute(
+                "UPDATE bots SET status = ?, started_at = NULL WHERE bot_id = ?",
+                (body.status, bot_id),
+            )
+        else:
+            cur.execute(
+                "UPDATE bots SET status = ? WHERE bot_id = ?",
+                (body.status, bot_id),
+            )
         conn.commit()
     finally:
         conn.close()

@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { API_BASE } from '../config';
 import { TRACKED_TICKER_SYMBOLS_FALLBACK } from '../trackedMarketsFallback';
 
@@ -17,6 +18,56 @@ interface WalletItem {
   value?: number;
 }
 
+interface BotRow {
+  bot_id: string;
+  name: string;
+  symbol: string;
+  strategy: string;
+  strategy_params_json: string | null;
+  status: string;
+  execution_mode: string;
+  started_at: number | null;
+  initial_budget_quote: number | null;
+  realized_pnl_quote: number | null;
+  win_rate_pct: number | null;
+  closed_trades: number | null;
+}
+
+function formatUptime(startedAtSec: number | null, status: string): string {
+  if (status !== 'running' || startedAtSec == null) return '—';
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - startedAtSec);
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${secs}s`;
+}
+
+interface SmaParams {
+  fast_period?: number;
+  slow_period?: number;
+  quote_fraction?: number;
+  ohlcv_timeframe?: string;
+}
+
+function parseStrategyLabel(strategy: string, paramsJson: string | null): string {
+  if (strategy === 'sma_cross') {
+    try {
+      const p: SmaParams = paramsJson ? JSON.parse(paramsJson) : {};
+      const fast = p.fast_period ?? '?';
+      const slow = p.slow_period ?? '?';
+      const tf   = p.ohlcv_timeframe ?? '';
+      const frac = p.quote_fraction != null ? ` ${(p.quote_fraction * 100).toFixed(0)}%` : '';
+      return `SMA ${fast}/${slow}${tf ? ' · ' + tf : ''}${frac}`;
+    } catch {
+      return 'SMA Cross';
+    }
+  }
+  return strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 type NetworkView = 'testnet' | 'live';
 
 const MINI_TICKER_WS: Record<NetworkView, string> = {
@@ -28,14 +79,25 @@ export default function Dashboard() {
   const [tickers, setTickers] = useState<Record<string, Ticker>>({});
   const [wallet, setWallet] = useState<WalletItem[]>([]);
   const [trackedTickers, setTrackedTickers] = useState<string[]>([]);
-  /** Which network the dashboard wallet + spot table use (independent toggle). */
   const [walletView, setWalletView] = useState<NetworkView | null>(null);
-  /** Global Settings mode used for bots (returned with wallet for context). */
   const [botExecutionMode, setBotExecutionMode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [bots, setBots] = useState<BotRow[]>([]);
   const walletRef = useRef<WalletItem[]>([]);
   walletRef.current = wallet;
+
+  // Load bots with P&L
+  useEffect(() => {
+    const load = () =>
+      fetch(`${API_BASE}/api/bots`)
+        .then((r) => r.json())
+        .then((d: { bots?: BotRow[] }) => setBots(d.bots ?? []))
+        .catch(() => {});
+    void load();
+    const id = setInterval(load, 15_000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     fetch(`${API_BASE}/api/market/tracked`)
@@ -153,35 +215,156 @@ export default function Dashboard() {
 
   const viewLabel = walletView === 'live' ? 'Mainnet' : walletView === 'testnet' ? 'Testnet' : '…';
 
+  // Bot aggregates
+  const runningBots   = bots.filter((b) => b.status === 'running');
+  const liveBots      = runningBots.filter((b) => b.execution_mode === 'live').length;
+  const simBots       = runningBots.filter((b) => b.execution_mode !== 'live').length;
+  const totalPnl      = bots.reduce((s, b) => s + (b.realized_pnl_quote ?? 0), 0);
+  const totalBudget   = bots.reduce((s, b) => s + (b.initial_budget_quote ?? 0), 0);
+  const totalTrades   = bots.reduce((s, b) => s + (b.closed_trades ?? 0), 0);
+  const botsWithWR    = bots.filter((b) => b.win_rate_pct != null && (b.closed_trades ?? 0) > 0);
+  const avgWR         = botsWithWR.length > 0
+    ? botsWithWR.reduce((s, b) => s + (b.win_rate_pct ?? 0), 0) / botsWithWR.length
+    : null;
+  const pnlPositive   = totalPnl >= 0;
+
   return (
-    <main className="flex-1 flex overflow-hidden p-6 bg-background text-white">
-      <div className="w-full h-full flex flex-col">
+    <main className="flex-1 overflow-y-auto p-6 bg-background text-white">
+      <div className="w-full flex flex-col">
         <h1 className="text-2xl font-bold mb-6">Dashboard</h1>
 
         {/* Top Stats */}
-        <div className="grid grid-cols-3 gap-6 mb-8">
-          <div className="bg-panel border border-border p-6 rounded-custom shadow-md">
-            <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-2">Total Value (Est)</h3>
-            <div className="text-3xl font-mono font-bold">
+        <div className="grid grid-cols-4 gap-4 mb-6">
+          {/* Wallet value */}
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Total Value (Est)</h3>
+            <div className="text-2xl font-mono font-bold">
               {error || walletView === null
                 ? '---'
                 : `$${totalWalletValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </div>
             {walletView && (
-              <p className="text-xs text-gray-500 mt-2">Based on {viewLabel} wallet & matching spot prices</p>
+              <p className="text-xs text-gray-500 mt-1">Based on {viewLabel} wallet & matching spot prices</p>
             )}
           </div>
-          <div className="bg-panel border border-border p-6 rounded-custom shadow-md">
-            <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-2">Active Bots</h3>
-            <div className="text-3xl font-mono font-bold">4 <span className="text-sm text-green-500 font-sans ml-2">2 Live / 2 Sim</span></div>
+
+          {/* Active bots (live) */}
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Active Bots</h3>
+            <div className="text-2xl font-mono font-bold">
+              {runningBots.length}
+              <span className="text-sm font-sans ml-2 text-gray-400">/ {bots.length} total</span>
+            </div>
+            <p className="text-xs mt-1 text-gray-500">
+              {liveBots > 0 && <span className="text-red-400 font-semibold">{liveBots} Live </span>}
+              {simBots > 0 && <span className="text-blue-400 font-semibold">{simBots} Testnet</span>}
+              {runningBots.length === 0 && 'None running'}
+            </p>
           </div>
-          <div className="bg-panel border border-border p-6 rounded-custom shadow-md">
-            <h3 className="text-sm font-semibold uppercase tracking-wider text-gray-400 mb-2">24h PnL</h3>
-            <div className="text-3xl font-mono font-bold text-green-400">+$412.50</div>
+
+          {/* Realized P&L across all bots */}
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Bot Realized P&L</h3>
+            <div className={`text-2xl font-mono font-bold ${pnlPositive ? 'text-green-400' : 'text-red-400'}`}>
+              {bots.length === 0
+                ? '---'
+                : `${pnlPositive ? '+' : ''}${totalPnl.toFixed(4)} USDT`}
+            </div>
+            <p className="text-xs mt-1 text-gray-500">
+              {totalTrades} closed trades · budget {totalBudget.toLocaleString()} USDT
+            </p>
+          </div>
+
+          {/* Win rate */}
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Avg Win Rate</h3>
+            <div className="text-2xl font-mono font-bold">
+              {avgWR != null ? `${avgWR.toFixed(1)}%` : '—'}
+            </div>
+            <p className="text-xs mt-1 text-gray-500">
+              across {botsWithWR.length} bot{botsWithWR.length !== 1 ? 's' : ''} with trades
+            </p>
           </div>
         </div>
 
-        <div className="flex-1 grid grid-cols-2 gap-6 min-h-0">
+        {/* Bot Performance Table */}
+        {bots.length > 0 && (
+          <div className="bg-panel border border-border rounded-custom shadow-md mb-6 overflow-hidden">
+            <div className="px-5 py-3 border-b border-border flex items-center justify-between">
+              <h2 className="text-sm font-bold uppercase tracking-wider text-gray-300">Bot Performance</h2>
+              <Link to="/bots" className="text-xs text-primary hover:underline">Manage →</Link>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border text-gray-500 text-xs uppercase">
+                    <th className="px-5 py-2 text-left font-semibold">Bot</th>
+                    <th className="px-4 py-2 text-left font-semibold">Pair</th>
+                    <th className="px-4 py-2 text-left font-semibold">Strategy</th>
+                    <th className="px-4 py-2 text-left font-semibold">Status</th>
+                    <th className="px-4 py-2 text-right font-semibold">Budget</th>
+                    <th className="px-4 py-2 text-right font-semibold">Realized P&L</th>
+                    <th className="px-4 py-2 text-right font-semibold">Win Rate</th>
+                    <th className="px-4 py-2 text-right font-semibold">Trades</th>
+                    <th className="px-4 py-2 text-right font-semibold">Uptime</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bots.map((bot) => {
+                    const pnl = bot.realized_pnl_quote ?? 0;
+                    const positive = pnl >= 0;
+                    return (
+                      <tr key={bot.bot_id} className="border-b border-border/40 hover:bg-border/20 transition-colors">
+                        <td className="px-5 py-2.5">
+                          <Link to={`/bots/${bot.bot_id}`} className="font-semibold text-white hover:text-primary transition-colors">
+                            {bot.name}
+                          </Link>
+                        </td>
+                        <td className="px-4 py-2.5 text-gray-400 font-mono text-xs">{bot.symbol}</td>
+                        <td className="px-4 py-2.5">
+                          <span className="text-xs font-mono text-primary/90 bg-primary/10 border border-primary/20 px-2 py-0.5 rounded">
+                            {parseStrategyLabel(bot.strategy, bot.strategy_params_json)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2.5">
+                          <span className={`text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${
+                            bot.status === 'running' ? 'bg-green-500/20 text-green-400 border border-green-500/30'
+                            : bot.status === 'paused' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
+                            : 'bg-gray-500/20 text-gray-400 border border-gray-500/30'
+                          }`}>
+                            {bot.status}
+                          </span>
+                          {bot.execution_mode === 'live' && (
+                            <span className="ml-1.5 text-[9px] font-black uppercase px-1.5 py-0.5 rounded bg-red-500/20 text-red-400 border border-red-500/30">LIVE</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2.5 text-right font-mono text-gray-300 text-xs">
+                          {bot.initial_budget_quote != null ? `${bot.initial_budget_quote.toLocaleString()} USDT` : '—'}
+                        </td>
+                        <td className={`px-4 py-2.5 text-right font-mono text-xs font-bold ${positive ? 'text-green-400' : 'text-red-400'}`}>
+                          {bot.realized_pnl_quote != null
+                            ? `${positive ? '+' : ''}${pnl.toFixed(4)} USDT`
+                            : '—'}
+                        </td>
+                        <td className="px-4 py-2.5 text-right font-mono text-xs text-gray-300">
+                          {bot.win_rate_pct != null ? `${bot.win_rate_pct.toFixed(1)}%` : '—'}
+                        </td>
+                        <td className="px-4 py-2.5 text-right font-mono text-xs text-gray-400">
+                          {bot.closed_trades ?? 0}
+                        </td>
+                        <td className="px-4 py-2.5 text-right font-mono text-xs text-gray-400">
+                          {formatUptime(bot.started_at, bot.status)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-6 min-h-0" style={{ minHeight: '320px' }}>
           {/* Wallet Data Section */}
           <div className="bg-panel border border-border p-6 rounded-custom overflow-y-auto shadow-md flex flex-col">
             <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
