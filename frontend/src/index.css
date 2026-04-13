@@ -1,40 +1,88 @@
 @import "tailwindcss";
 
 @theme {
-  --color-primary: #1152d4;
-  --color-surface: #0a0a0a;
-  --color-panel: #161616;
-  --color-border: #262626;
-  
-  --radius-custom: 8px;
-  
-  --font-sans: "Inter", sans-serif;
-  --font-mono: "JetBrains Mono", monospace;
+  /* Legacy app tokens (dashboard pages) */
+  --color-primary: #ff9100;
+  --color-surface: #131313;
+  --color-panel: #201f1f;
+  --color-border: #564334;
+
+  --radius-custom: 0px;
+
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  --font-headline: "Space Grotesk", system-ui, sans-serif;
+  --font-label: "Space Grotesk", system-ui, sans-serif;
+
+  /* MAGI terminal palette (reference UI) */
+  --color-magi-bg: #131313;
+  --color-magi-surface: #131313;
+  --color-magi-surface-dim: #131313;
+  --color-magi-container: #201f1f;
+  --color-magi-container-low: #1c1b1b;
+  --color-magi-primary: #ffb97c;
+  --color-magi-primary-bright: #ff9100;
+  --color-magi-secondary: #ffb4a8;
+  --color-magi-hot: #ff5540;
+  --color-magi-tertiary: #00e73a;
+  --color-magi-on-bg: #e5e2e1;
+  --color-magi-muted: #dcc2ae;
+  --color-magi-grid: #564334;
 }
 
 @layer base {
   body {
-    @apply bg-surface text-gray-200 font-sans h-screen overflow-hidden flex flex-col;
+    @apply bg-magi-bg text-magi-on-bg font-sans h-screen overflow-hidden flex flex-col antialiased;
+  }
+
+  .material-symbols-outlined {
+    font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 24;
+    display: inline-block;
+    line-height: 1;
+    font-size: 1.25rem;
   }
 }
 
 @layer utilities {
-  /* Terminal-style scrollbar for logs */
   ::-webkit-scrollbar {
     width: 6px;
+    height: 6px;
   }
   ::-webkit-scrollbar-track {
-    background: #0a0a0a;
+    background: #0e0e0e;
   }
   ::-webkit-scrollbar-thumb {
-    background: #333;
-    border-radius: 3px;
+    background: #3a3939;
+    border-radius: 0;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #444;
+    background: #564334;
   }
-  
+
+  .phosphor-amber {
+    text-shadow: 0 0 8px rgba(255, 185, 124, 0.4);
+  }
+  .phosphor-green {
+    text-shadow: 0 0 8px rgba(0, 231, 58, 0.35);
+  }
+  .phosphor-red {
+    text-shadow: 0 0 8px rgba(255, 85, 64, 0.35);
+  }
+  .warning-stripe {
+    background: repeating-linear-gradient(
+      45deg,
+      #ff9100,
+      #ff9100 10px,
+      #131313 10px,
+      #131313 20px
+    );
+  }
+  .scanline {
+    background: linear-gradient(to bottom, transparent 50%, rgba(0, 0, 0, 0.12) 51%);
+    background-size: 100% 4px;
+  }
+
   .custom-glow {
-    box-shadow: 0 0 15px rgba(17, 82, 212, 0.1);
+    box-shadow: 0 0 15px rgba(255, 145, 0, 0.12);
   }
 }

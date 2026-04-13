@@ -68,4 +68,6 @@ def default_strategy_params() -> dict[str, Any]:
         "min_trade_interval_sec": 300,
         "ohlcv_timeframe": "5m",
         "ohlcv_limit": 50,
+        # Allocated quote (e.g. USDT) for ROI / drawdown-vs-budget; set via UI or JSON.
+        "initial_budget_quote": None,
     }

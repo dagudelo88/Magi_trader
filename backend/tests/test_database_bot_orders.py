@@ -96,6 +96,68 @@ class TestDatabaseBotOrders(unittest.TestCase):
         self.assertEqual(len(orders), 1)
         self.assertEqual(orders[0]["exchange_order_id"], "99001")
         self.assertEqual(orders[0]["side"], "buy")
+        self.assertEqual(orders[0]["display_price"], 50_000.0)
+        self.assertEqual(orders[0]["display_status"], "CLOSED")
+
+    def test_fork_bot_preserves_source_history(self) -> None:
+        conn = db.get_db_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO bot_logs (bot_id, created_at, level, execution_mode, message)
+                VALUES ('1', 1, 'info', 'testnet', 'hello')
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        db.record_bot_order(
+            "1",
+            "testnet",
+            {
+                "id": "991",
+                "symbol": "BTC/USDT",
+                "side": "buy",
+                "type": "market",
+                "amount": 0.001,
+                "cost": 40.0,
+                "filled": 0.001,
+                "status": "closed",
+            },
+        )
+        r = db.fork_bot("1", name="Fresh runner")
+        new_id = r["new_bot_id"]
+        self.assertNotEqual(new_id, "1")
+        self.assertEqual(r["name"], "Fresh runner")
+
+        stats_old, _ = db.fetch_bot_orders_panel("1")
+        self.assertEqual(stats_old["total_orders"], 1)
+        conn = db.get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) AS c FROM bot_logs WHERE bot_id = ?", ("1",))
+            self.assertEqual(cur.fetchone()["c"], 1)
+        finally:
+            conn.close()
+
+        stats_new, orders_new = db.fetch_bot_orders_panel(new_id)
+        self.assertEqual(stats_new["total_orders"], 0)
+        self.assertEqual(orders_new, [])
+
+    def test_fork_bot_custom_params_json(self) -> None:
+        custom = '{"fast_period": 5, "initial_budget_quote": 888}'
+        r = db.fork_bot("1", strategy_params_json=custom)
+        conn = db.get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT strategy_params_json FROM bots WHERE bot_id = ?",
+                (r["new_bot_id"],),
+            )
+            self.assertEqual(cur.fetchone()["strategy_params_json"], custom)
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

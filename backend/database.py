@@ -1,5 +1,6 @@
 import json
 import re
+import secrets
 import sqlite3
 import os
 import sys
@@ -16,6 +17,150 @@ _RE_SELL_FROM_LOG = re.compile(
     r"SELL (?:market order placed|filled/accepted) id=(\S+)\s+amount=([\d.eE+-]+)"
     r"(?:\s+status=(\S+))?",
 )
+
+_last_exchange_refresh_mono: dict[str, float] = {}
+
+
+def _f(x: Any) -> float | None:
+    if x is None or x == "":
+        return None
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _derive_execution_average(fo: dict[str, Any]) -> float | None:
+    avg = _f(fo.get("average"))
+    if avg is not None:
+        return avg
+    filled = _f(fo.get("filled"))
+    cost = _f(fo.get("cost"))
+    if filled is not None and cost is not None and filled > 0:
+        return cost / filled
+    info = fo.get("info") or {}
+    for key in ("avgPrice", "avg_price", "price"):
+        v = info.get(key)
+        a = _f(v)
+        if a is not None and a > 0:
+            return a
+    exq = _f(info.get("executedQty") or info.get("executed_qty"))
+    cq = _f(info.get("cummulativeQuoteQty") or info.get("cummulative_quote_qty"))
+    if exq is not None and cq is not None and exq > 0:
+        return cq / exq
+    return None
+
+
+def _display_price_for_order(row: dict[str, Any], raw_str: str | None) -> float | None:
+    avg = _f(row.get("average"))
+    if avg is not None:
+        return avg
+    filled = _f(row.get("filled"))
+    cost = _f(row.get("cost"))
+    if filled is not None and cost is not None and filled > 0:
+        return cost / filled
+    if not raw_str:
+        return None
+    try:
+        raw = json.loads(raw_str)
+        return _derive_execution_average(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _display_status_for_order(row: dict[str, Any], raw_str: str | None) -> str:
+    s = (row.get("status") or "").strip()
+    if s and s.lower() != "unknown":
+        return s.upper()
+    if raw_str:
+        try:
+            raw = json.loads(raw_str)
+            st = raw.get("status")
+            if st:
+                return str(st).upper()
+            info = raw.get("info") or {}
+            if isinstance(info, dict) and info.get("status"):
+                return str(info["status"]).upper()
+        except json.JSONDecodeError:
+            pass
+    return "FILLED"
+
+
+def refresh_stale_bot_orders_from_exchange(bot_id: str, ex: Any, cooldown_sec: float = 45.0) -> None:
+    """
+    For rows missing avg/status, pull the latest order snapshot from the exchange (CCXT).
+    Throttled per bot_id to avoid rate limits when the UI polls.
+    """
+    now = time.monotonic()
+    if now - _last_exchange_refresh_mono.get(bot_id, 0) < cooldown_sec:
+        return
+
+    conn = get_db_connection()
+    touched = False
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT order_row_id, exchange_order_id, symbol
+            FROM bot_orders
+            WHERE bot_id = ?
+              AND exchange_order_id IS NOT NULL
+              AND (
+                    average IS NULL
+                 OR TRIM(COALESCE(status, '')) = ''
+                 OR LOWER(TRIM(status)) = 'unknown'
+              )
+            ORDER BY created_at DESC
+            LIMIT 12
+            """,
+            (bot_id,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            _last_exchange_refresh_mono[bot_id] = now
+            return
+
+        if not getattr(ex, "markets", None):
+            ex.load_markets()
+
+        for r in rows:
+            try:
+                fo = ex.fetch_order(str(r["exchange_order_id"]), r["symbol"])
+            except Exception:
+                continue
+            avg = _derive_execution_average(fo)
+            st = str(fo.get("status") or "").strip().upper() or "FILLED"
+            raw = json.dumps(fo, default=str)
+            if len(raw) > 32000:
+                raw = raw[:32000] + "…"
+            cur.execute(
+                """
+                UPDATE bot_orders
+                SET average = COALESCE(?, average),
+                    filled = COALESCE(?, filled),
+                    cost = COALESCE(?, cost),
+                    amount = COALESCE(?, amount),
+                    status = ?,
+                    raw_response_json = ?
+                WHERE order_row_id = ?
+                """,
+                (
+                    avg,
+                    fo.get("filled"),
+                    fo.get("cost"),
+                    fo.get("amount"),
+                    st,
+                    raw,
+                    r["order_row_id"],
+                ),
+            )
+            touched = True
+        if touched:
+            conn.commit()
+        _last_exchange_refresh_mono[bot_id] = now
+    finally:
+        conn.close()
+
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
 
@@ -187,6 +332,12 @@ def record_bot_order(bot_id: str, execution_mode: str, order: dict[str, Any]) ->
     if len(raw) > 32000:
         raw = raw[:32000] + "…"
 
+    avg = _f(order.get("average"))
+    if avg is None:
+        avg = _derive_execution_average(order)
+    st = order.get("status")
+    st_str = str(st).strip() if st is not None else ""
+
     conn = get_db_connection()
     try:
         conn.execute(
@@ -205,9 +356,9 @@ def record_bot_order(bot_id: str, execution_mode: str, order: dict[str, Any]) ->
                 str(order.get("type") or ""),
                 order.get("amount"),
                 order.get("cost"),
-                order.get("average"),
+                avg,
                 order.get("filled"),
-                str(order.get("status") or "") if order.get("status") is not None else None,
+                st_str if st_str else None,
                 raw,
                 now,
             ),
@@ -290,7 +441,7 @@ def sync_bot_orders_from_logs(bot_id: str, symbol: str) -> int:
                         cost_v,
                         None,
                         None,
-                        (st or "unknown"),
+                        (st or "FILLED"),
                         raw,
                         ts,
                     ),
@@ -336,7 +487,7 @@ def sync_bot_orders_from_logs(bot_id: str, symbol: str) -> int:
                         None,
                         None,
                         amt_v,
-                        (st or "unknown"),
+                        (st or "FILLED"),
                         raw,
                         ts,
                     ),
@@ -377,7 +528,8 @@ def fetch_bot_orders_panel(bot_id: str, order_limit: int = 50) -> tuple[dict[str
         cur.execute(
             """
             SELECT order_row_id, bot_id, execution_mode, exchange_order_id, symbol, side,
-                   order_type, amount, cost, average, filled, status, created_at
+                   order_type, amount, cost, average, filled, status, created_at,
+                   raw_response_json
             FROM bot_orders
             WHERE bot_id = ?
             ORDER BY created_at DESC
@@ -385,8 +537,172 @@ def fetch_bot_orders_panel(bot_id: str, order_limit: int = 50) -> tuple[dict[str
             """,
             (bot_id, order_limit),
         )
-        orders = [_row_to_dict(r) for r in cur.fetchall()]
+        orders = []
+        for r in cur.fetchall():
+            d = _row_to_dict(r)
+            raw = d.pop("raw_response_json", None)
+            d["display_price"] = _display_price_for_order(d, raw)
+            d["display_status"] = _display_status_for_order(d, raw)
+            orders.append(d)
         return stats, orders
+    finally:
+        conn.close()
+
+
+def fork_bot(
+    source_bot_id: str,
+    *,
+    name: str | None = None,
+    strategy_params_json: str | None = None,
+) -> dict[str, Any]:
+    """
+    Insert a new bot row cloned from source (same symbol/strategy by default).
+    Does not copy bot_orders, bot_logs, or bot_decisions — the new id starts with empty history.
+    Source bot and its data are unchanged.
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (source_bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"bot not found: {source_bot_id!r}")
+        src = _row_to_dict(row)
+        new_id = secrets.token_hex(8)
+        while True:
+            cur.execute("SELECT 1 FROM bots WHERE bot_id = ?", (new_id,))
+            if cur.fetchone() is None:
+                break
+            new_id = secrets.token_hex(8)
+        now = int(time.time() * 1000)
+        new_name = (name.strip() if isinstance(name, str) and name.strip() else None) or (
+            f"{src['name']} (copy)"
+        )
+        params = (
+            strategy_params_json
+            if strategy_params_json is not None
+            else src.get("strategy_params_json")
+        )
+        cur.execute(
+            """
+            INSERT INTO bots (bot_id, name, symbol, strategy, strategy_params_json, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'stopped', ?)
+            """,
+            (
+                new_id,
+                new_name,
+                src["symbol"],
+                src["strategy"],
+                params,
+                now,
+            ),
+        )
+        conn.commit()
+        return {
+            "new_bot_id": new_id,
+            "source_bot_id": source_bot_id,
+            "name": new_name,
+            "symbol": src["symbol"],
+            "strategy": src["strategy"],
+        }
+    finally:
+        conn.close()
+
+
+def fetch_bot_orders_chronological(bot_id: str) -> list[dict[str, Any]]:
+    """All orders for FIFO PnL (oldest first)."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT side, amount, cost, average, filled, created_at, symbol
+            FROM bot_orders
+            WHERE bot_id = ?
+            ORDER BY created_at ASC, order_row_id ASC
+            """,
+            (bot_id,),
+        )
+        return [_row_to_dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def create_bot(
+    name: str,
+    symbol: str,
+    strategy: str = "sma_cross",
+    strategy_params_json: str | None = None,
+) -> dict[str, Any]:
+    """Create a new bot and return its full record."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        new_id = secrets.token_hex(8)
+        while True:
+            cur.execute("SELECT 1 FROM bots WHERE bot_id = ?", (new_id,))
+            if cur.fetchone() is None:
+                break
+            new_id = secrets.token_hex(8)
+        now = int(time.time() * 1000)
+        cur.execute(
+            """
+            INSERT INTO bots (bot_id, name, symbol, strategy, strategy_params_json, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'stopped', ?)
+            """,
+            (new_id, name.strip(), symbol.upper().strip(), strategy, strategy_params_json, now),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (new_id,))
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def update_bot(bot_id: str, name: str | None, symbol: str | None) -> dict[str, Any]:
+    """Update editable bot fields (name, symbol). Bot must not be running."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"bot not found: {bot_id!r}")
+        if row["status"] == "running":
+            raise ValueError("stop the bot before editing it")
+        updates: list[str] = []
+        values: list[Any] = []
+        if name is not None and name.strip():
+            updates.append("name = ?")
+            values.append(name.strip())
+        if symbol is not None and symbol.strip():
+            updates.append("symbol = ?")
+            values.append(symbol.upper().strip())
+        if updates:
+            values.append(bot_id)
+            cur.execute(f"UPDATE bots SET {', '.join(updates)} WHERE bot_id = ?", values)
+            conn.commit()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def delete_bot(bot_id: str) -> None:
+    """Delete a bot and all its orders/logs. Raises ValueError if not found or running."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"bot not found: {bot_id!r}")
+        if row["status"] == "running":
+            raise ValueError("stop the bot before deleting it")
+        cur.execute("DELETE FROM bot_logs WHERE bot_id = ?", (bot_id,))
+        cur.execute("DELETE FROM bot_orders WHERE bot_id = ?", (bot_id,))
+        cur.execute("DELETE FROM bots WHERE bot_id = ?", (bot_id,))
+        conn.commit()
     finally:
         conn.close()
 

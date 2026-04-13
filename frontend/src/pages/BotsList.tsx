@@ -1,6 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { API_BASE } from '../config';
+import { BOT_TEMPLATES, SUPPORTED_SYMBOLS, type BotTemplate } from '../botTemplates';
 
 interface BotRow {
   bot_id: string;
@@ -8,36 +9,218 @@ interface BotRow {
   symbol: string;
   strategy: string;
   status: string;
+  initial_budget_quote: number | null;
 }
+
+const STATUS_BADGE: Record<string, string> = {
+  running: 'bg-green-500/20 text-green-400 border border-green-500/30',
+  paused: 'bg-amber-500/20 text-amber-400 border border-amber-500/30',
+  stopped: 'bg-gray-500/20 text-gray-400 border border-gray-500/30',
+};
+
+function statusBadge(s: string) {
+  return STATUS_BADGE[s] ?? STATUS_BADGE.stopped;
+}
+
+// ── Create modal state ──────────────────────────────────────────────────────
+
+type CreateStep = 'pick-template' | 'configure';
+
+interface CreateConfig {
+  template: BotTemplate;
+  name: string;
+  symbol: string;
+  budget: string;
+}
+
+// ── Edit modal state ────────────────────────────────────────────────────────
+
+interface EditForm {
+  name: string;
+  symbol: string;
+}
+
+// ── Component ───────────────────────────────────────────────────────────────
 
 export default function BotsList() {
   const [bots, setBots] = useState<BotRow[]>([]);
   const [executionMode, setExecutionMode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busyBotId, setBusyBotId] = useState<string | null>(null);
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const [botsRes, settingsRes] = await Promise.all([
-          fetch(`${API_BASE}/api/bots`),
-          fetch(`${API_BASE}/api/settings/trading`),
-        ]);
-        if (!botsRes.ok) throw new Error('Failed to load bots');
-        const b = await botsRes.json();
-        setBots(b.bots || []);
-        if (settingsRes.ok) {
-          const s = await settingsRes.json();
-          setExecutionMode(s.execution_mode);
-        }
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Failed to load');
+  // create modal
+  const [createStep, setCreateStep] = useState<CreateStep | null>(null);
+  const [createConfig, setCreateConfig] = useState<CreateConfig | null>(null);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const budgetRef = useRef<HTMLInputElement>(null);
+
+  // edit modal
+  const [editBotId, setEditBotId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<EditForm>({ name: '', symbol: '' });
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  const load = async () => {
+    try {
+      const [botsRes, settingsRes] = await Promise.all([
+        fetch(`${API_BASE}/api/bots`),
+        fetch(`${API_BASE}/api/settings/trading`),
+      ]);
+      if (!botsRes.ok) throw new Error('Failed to load bots');
+      const b = await botsRes.json();
+      setBots(b.bots ?? []);
+      if (settingsRes.ok) {
+        const s = await settingsRes.json();
+        setExecutionMode(s.execution_mode);
       }
-    };
-    load();
-  }, []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load');
+    }
+  };
+
+  useEffect(() => { void load(); }, []);
+
+  // Focus budget field when configure step opens
+  useEffect(() => {
+    if (createStep === 'configure') setTimeout(() => budgetRef.current?.focus(), 60);
+  }, [createStep]);
+
+  const openCreate = () => {
+    setCreateStep('pick-template');
+    setCreateConfig(null);
+    setCreateError(null);
+  };
+
+  const closeCreate = () => {
+    setCreateStep(null);
+    setCreateConfig(null);
+    setCreateError(null);
+  };
+
+  const pickTemplate = (tpl: BotTemplate) => {
+    setCreateConfig({
+      template: tpl,
+      name: '',
+      symbol: tpl.defaultSymbol,
+      budget: '',
+    });
+    setCreateError(null);
+    setCreateStep('configure');
+  };
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!createConfig) return;
+    setCreateError(null);
+
+    const name = createConfig.name.trim() ||
+      `${createConfig.template.name} · ${createConfig.symbol.replace('/', '_')}`;
+    const budget = Number.parseFloat(createConfig.budget.trim());
+    if (!Number.isFinite(budget) || budget <= 0) {
+      setCreateError('Budget is required and must be a positive number.');
+      budgetRef.current?.focus();
+      return;
+    }
+
+    setCreateBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          symbol: createConfig.symbol,
+          strategy: 'sma_cross',
+          initial_budget_quote: budget,
+          strategy_params: createConfig.template.params,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Create failed');
+      closeCreate();
+      await load();
+    } catch (e) {
+      setCreateError(e instanceof Error ? e.message : 'Create failed');
+    } finally {
+      setCreateBusy(false);
+    }
+  };
+
+  const setStatus = async (botId: string, status: 'running' | 'stopped' | 'paused') => {
+    setBusyBotId(botId);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${botId}/status`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Update failed');
+    } finally {
+      setBusyBotId(null);
+    }
+  };
+
+  const handleDelete = async (bot: BotRow) => {
+    if (!window.confirm(`Delete "${bot.name}"? This permanently removes all its orders and logs.`))
+      return;
+    setBusyBotId(bot.bot_id);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${bot.bot_id}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(typeof data.detail === 'string' ? data.detail : 'Delete failed');
+      }
+      setBots((prev) => prev.filter((b) => b.bot_id !== bot.bot_id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Delete failed');
+    } finally {
+      setBusyBotId(null);
+    }
+  };
+
+  const openEdit = (bot: BotRow) => {
+    setEditBotId(bot.bot_id);
+    setEditForm({ name: bot.name, symbol: bot.symbol });
+    setEditError(null);
+  };
+
+  const handleEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editBotId) return;
+    setEditError(null);
+    setEditBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${editBotId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: editForm.name.trim() || undefined,
+          symbol: editForm.symbol.trim() || undefined,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
+      setEditBotId(null);
+      await load();
+    } catch (e) {
+      setEditError(e instanceof Error ? e.message : 'Update failed');
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  // ── Render ───────────────────────────────────────────────────────────────
 
   return (
     <main className="flex-1 flex flex-col overflow-hidden p-6">
+      {/* Page header */}
       <div className="flex justify-between items-center mb-6">
         <div>
           <h1 className="text-2xl font-bold text-white">Your Bots</h1>
@@ -52,50 +235,295 @@ export default function BotsList() {
         </div>
         <button
           type="button"
-          className="px-4 py-2 bg-primary text-white rounded-custom text-sm font-bold hover:bg-primary/90 transition-all opacity-60 cursor-not-allowed"
-          title="Create flow not wired yet — use seeded bots 1 and 2"
+          onClick={openCreate}
+          className="px-4 py-2 bg-primary text-black rounded text-sm font-bold hover:brightness-110 transition-all"
         >
           + Create New Bot
         </button>
       </div>
 
       {error && (
-        <div className="mb-4 p-3 rounded border border-red-500/40 text-red-300 text-sm">{error}</div>
+        <div className="mb-4 p-3 rounded border border-red-500/40 bg-red-950/20 text-red-300 text-sm">
+          {error}
+        </div>
       )}
 
-      <div className="grid grid-cols-1 gap-4">
+      {/* Bot list */}
+      <div className="grid grid-cols-1 gap-3">
         {bots.length === 0 && !error && (
-          <p className="text-gray-500 text-sm">No bots in database — restart backend to run migrations/seed.</p>
+          <p className="text-gray-500 text-sm">No bots yet — create one with the button above.</p>
         )}
-        {bots.map((bot) => (
-          <Link
-            key={bot.bot_id}
-            to={`/bots/${bot.bot_id}`}
-            className="bg-panel border border-border p-4 rounded-custom hover:border-primary transition-colors flex justify-between items-center group"
-          >
-            <div>
-              <div className="flex items-center gap-3 mb-1">
-                <h3 className="text-lg font-bold text-white">{bot.name}</h3>
-                <span
-                  className={`text-[10px] font-bold tracking-widest uppercase px-2 py-0.5 rounded ${
-                    bot.status === 'running'
-                      ? 'bg-green-500/20 text-green-400'
-                      : bot.status === 'paused'
-                        ? 'bg-amber-500/20 text-amber-400'
-                        : 'bg-gray-500/20 text-gray-400'
-                  }`}
-                >
-                  {bot.status}
-                </span>
+        {bots.map((bot) => {
+          const isBusy = busyBotId === bot.bot_id;
+          const isRunning = bot.status === 'running';
+          const isPaused = bot.status === 'paused';
+          return (
+            <div
+              key={bot.bot_id}
+              className="bg-panel border border-border rounded p-4 flex flex-col sm:flex-row sm:items-center gap-3"
+            >
+              <Link to={`/bots/${bot.bot_id}`} className="flex-1 min-w-0 group">
+                <div className="flex items-center gap-2 mb-1">
+                  <span className={`text-[9px] font-bold tracking-widest uppercase px-2 py-0.5 rounded ${statusBadge(bot.status)}`}>
+                    {bot.status}
+                  </span>
+                  <h3 className="text-base font-bold text-white group-hover:text-primary truncate transition-colors">
+                    {bot.name}
+                  </h3>
+                </div>
+                <p className="text-xs text-gray-400">
+                  {bot.strategy.toUpperCase()} · {bot.symbol}
+                  {bot.initial_budget_quote != null && (
+                    <span className="ml-2 text-gray-500">
+                      Budget: {bot.initial_budget_quote.toLocaleString()} USDT
+                    </span>
+                  )}
+                </p>
+              </Link>
+
+              <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                {!isRunning && (
+                  <button type="button" disabled={isBusy}
+                    onClick={() => void setStatus(bot.bot_id, 'running')}
+                    className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-green-600/80 hover:bg-green-500 text-white rounded disabled:opacity-40 transition-colors">
+                    START
+                  </button>
+                )}
+                {isRunning && (
+                  <button type="button" disabled={isBusy}
+                    onClick={() => void setStatus(bot.bot_id, 'paused')}
+                    className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-amber-500/80 hover:bg-amber-400 text-black rounded disabled:opacity-40 transition-colors">
+                    PAUSE
+                  </button>
+                )}
+                {isPaused && (
+                  <button type="button" disabled={isBusy}
+                    onClick={() => void setStatus(bot.bot_id, 'running')}
+                    className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-green-600/80 hover:bg-green-500 text-white rounded disabled:opacity-40 transition-colors">
+                    RESUME
+                  </button>
+                )}
+                {(isRunning || isPaused) && (
+                  <button type="button" disabled={isBusy}
+                    onClick={() => void setStatus(bot.bot_id, 'stopped')}
+                    className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-red-700/70 hover:bg-red-600 text-white rounded disabled:opacity-40 transition-colors">
+                    STOP
+                  </button>
+                )}
+                <button type="button" disabled={isBusy}
+                  onClick={() => openEdit(bot)}
+                  className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-gray-700/60 hover:bg-gray-600 text-gray-200 rounded disabled:opacity-40 transition-colors">
+                  EDIT
+                </button>
+                <button type="button" disabled={isBusy || isRunning}
+                  onClick={() => void handleDelete(bot)}
+                  title={isRunning ? 'Stop bot first' : 'Delete bot'}
+                  className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-red-950/60 hover:bg-red-900/80 text-red-400 rounded disabled:opacity-40 transition-colors">
+                  DELETE
+                </button>
+                <Link to={`/bots/${bot.bot_id}`}
+                  className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-primary/20 hover:bg-primary/30 text-primary rounded transition-colors">
+                  MANAGE →
+                </Link>
               </div>
-              <p className="text-sm text-gray-400">
-                Strategy: {bot.strategy} | Pair: {bot.symbol}
-              </p>
             </div>
-            <div className="text-right text-gray-500 text-xs uppercase">Manage →</div>
-          </Link>
-        ))}
+          );
+        })}
       </div>
+
+      {/* ── CREATE BOT MODAL ─────────────────────────────────────────────── */}
+      {createStep !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="bg-[#161616] border border-[#2a2a2a] rounded-xl w-full shadow-2xl"
+            style={{ maxWidth: createStep === 'pick-template' ? 680 : 460 }}>
+
+            {/* Modal header */}
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#2a2a2a]">
+              {createStep === 'configure' && (
+                <button type="button" onClick={() => setCreateStep('pick-template')}
+                  className="text-gray-500 hover:text-white text-lg leading-none mr-3 transition-colors"
+                  title="Back to templates">
+                  ←
+                </button>
+              )}
+              <h2 className="text-sm font-black uppercase tracking-widest text-white flex-1">
+                {createStep === 'pick-template' ? 'Choose a Bot Template' : (
+                  <span>
+                    Configure{' '}
+                    <span className="text-primary">{createConfig?.template.name}</span>
+                  </span>
+                )}
+              </h2>
+              <button type="button" onClick={closeCreate}
+                className="text-gray-500 hover:text-white text-xl leading-none ml-2 transition-colors">
+                ×
+              </button>
+            </div>
+
+            {/* Step 1: Template picker */}
+            {createStep === 'pick-template' && (
+              <div className="p-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {BOT_TEMPLATES.map((tpl) => (
+                  <button
+                    key={tpl.id}
+                    type="button"
+                    onClick={() => pickTemplate(tpl)}
+                    className="text-left rounded-lg border border-[#2a2a2a] bg-[#1c1c1c] p-4 hover:border-primary/60 hover:bg-primary/5 transition-all group"
+                  >
+                    <div className="flex items-start justify-between gap-2 mb-2">
+                      <p className="text-sm font-black text-white group-hover:text-primary transition-colors">
+                        {tpl.name}
+                      </p>
+                      <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider text-primary/70 bg-primary/10 border border-primary/20 px-2 py-0.5 rounded whitespace-nowrap">
+                        {tpl.params.ohlcv_timeframe}
+                      </span>
+                    </div>
+                    <p className="text-[10px] font-semibold text-amber-400/80 uppercase tracking-wider mb-1.5">
+                      {tpl.tagline}
+                    </p>
+                    <p className="text-[11px] text-gray-400 leading-snug">{tpl.description}</p>
+                    <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-gray-600 font-mono">
+                      <span>fast={tpl.params.fast_period}</span>
+                      <span>slow={tpl.params.slow_period}</span>
+                      <span>buy={tpl.params.quote_fraction * 100}%</span>
+                      <span>sell={tpl.params.base_fraction * 100}%</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Step 2: Configure */}
+            {createStep === 'configure' && createConfig && (
+              <form onSubmit={(e) => void handleCreate(e)} className="px-6 py-5 flex flex-col gap-4">
+                {createError && (
+                  <p className="text-red-400 text-xs border border-red-500/40 bg-red-950/20 rounded p-2">
+                    {createError}
+                  </p>
+                )}
+
+                {/* Template summary */}
+                <div className="rounded-lg border border-primary/20 bg-primary/5 px-4 py-3 flex flex-wrap items-center gap-x-4 gap-y-1">
+                  <span className="text-xs font-black text-primary uppercase tracking-widest">
+                    {createConfig.template.name}
+                  </span>
+                  <span className="text-[10px] text-gray-500 font-mono">
+                    {createConfig.template.params.ohlcv_timeframe} ·
+                    fast={createConfig.template.params.fast_period} /
+                    slow={createConfig.template.params.slow_period} ·
+                    buy {createConfig.template.params.quote_fraction * 100}% ·
+                    sell {createConfig.template.params.base_fraction * 100}%
+                  </span>
+                </div>
+
+                <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
+                  Bot Name
+                  <input
+                    type="text"
+                    placeholder={`${createConfig.template.name} · ${createConfig.symbol.replace('/', '_')}`}
+                    value={createConfig.name}
+                    onChange={(e) => setCreateConfig((c) => c && ({ ...c, name: e.target.value }))}
+                    className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                  />
+                  <span className="text-[10px] text-gray-600 normal-case -mt-0.5">
+                    Leave blank to auto-generate from template + pair.
+                  </span>
+                </label>
+
+                <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
+                  Trading Pair
+                  <select
+                    value={createConfig.symbol}
+                    onChange={(e) => setCreateConfig((c) => c && ({ ...c, symbol: e.target.value }))}
+                    className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                  >
+                    {SUPPORTED_SYMBOLS.map((s) => <option key={s} value={s}>{s}</option>)}
+                  </select>
+                </label>
+
+                <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
+                  <span>
+                    Initial Budget (USDT)
+                    <span className="ml-1 text-red-400">*</span>
+                  </span>
+                  <input
+                    ref={budgetRef}
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="e.g. 1000"
+                    value={createConfig.budget}
+                    onChange={(e) => setCreateConfig((c) => c && ({ ...c, budget: e.target.value }))}
+                    className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                  />
+                  <span className="text-[10px] text-gray-600 normal-case -mt-0.5">
+                    Capital allocated to this bot. Used to track ROI and max drawdown.
+                  </span>
+                </label>
+
+                <div className="flex gap-2 pt-1">
+                  <button type="submit" disabled={createBusy}
+                    className="flex-1 py-2.5 bg-primary text-black text-[11px] font-black uppercase tracking-widest rounded hover:brightness-110 disabled:opacity-40 transition-all">
+                    {createBusy ? 'Creating…' : 'Create Bot'}
+                  </button>
+                  <button type="button" onClick={closeCreate}
+                    className="px-4 py-2.5 border border-[#2a2a2a] text-gray-400 text-[11px] font-bold uppercase tracking-widest rounded hover:border-gray-500 transition-all">
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── EDIT BOT MODAL ───────────────────────────────────────────────── */}
+      {editBotId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="bg-[#161616] border border-[#2a2a2a] rounded-xl w-full max-w-md shadow-2xl">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-[#2a2a2a]">
+              <h2 className="text-sm font-black uppercase tracking-widest text-white">Edit Bot</h2>
+              <button type="button" onClick={() => setEditBotId(null)}
+                className="text-gray-500 hover:text-white text-xl leading-none transition-colors">
+                ×
+              </button>
+            </div>
+            <form onSubmit={(e) => void handleEdit(e)} className="px-6 py-5 flex flex-col gap-4">
+              {editError && (
+                <p className="text-red-400 text-xs border border-red-500/40 bg-red-950/20 rounded p-2">
+                  {editError}
+                </p>
+              )}
+              <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
+                Bot Name
+                <input type="text" value={editForm.name}
+                  onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
+                  className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none" />
+              </label>
+              <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
+                Trading Pair
+                <select value={editForm.symbol}
+                  onChange={(e) => setEditForm((f) => ({ ...f, symbol: e.target.value }))}
+                  className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none">
+                  {SUPPORTED_SYMBOLS.map((s) => <option key={s} value={s}>{s}</option>)}
+                </select>
+              </label>
+              <p className="text-[10px] text-gray-600">
+                To change the budget, open the bot detail → Capital &amp; New Instance.
+              </p>
+              <div className="flex gap-2 pt-1">
+                <button type="submit" disabled={editBusy}
+                  className="flex-1 py-2.5 bg-primary text-black text-[11px] font-black uppercase tracking-widest rounded hover:brightness-110 disabled:opacity-40 transition-all">
+                  {editBusy ? 'Saving…' : 'Save Changes'}
+                </button>
+                <button type="button" onClick={() => setEditBotId(null)}
+                  className="px-4 py-2.5 border border-[#2a2a2a] text-gray-400 text-[11px] font-bold uppercase tracking-widest rounded hover:border-gray-500 transition-all">
+                  Cancel
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
