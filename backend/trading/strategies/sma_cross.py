@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from trading.strategies.base import SignalResult
+
 
 def _sma(values: list[float], period: int) -> float | None:
     if len(values) < period or period < 1:
@@ -12,7 +14,7 @@ def _sma(values: list[float], period: int) -> float | None:
 
 @dataclass(frozen=True)
 class SignalDetails:
-    """Latest crossover evaluation on close prices (for logging / UI)."""
+    """Legacy crossover evaluation — kept for backward compatibility."""
 
     signal: Literal["buy", "sell", "hold"]
     fast_sma: float | None
@@ -28,8 +30,8 @@ def evaluate_signal_details(
     slow_period: int,
 ) -> SignalDetails:
     """
-    Same rules as evaluate_signal, plus SMA values for debugging.
-    Buy when fast crosses above slow; sell when fast crosses below slow.
+    Buy when fast SMA crosses above slow SMA; sell when crosses below.
+    Returns SMA values for logging.
     """
     n = len(closes)
     if n < slow_period + 2:
@@ -59,7 +61,9 @@ def evaluate_signal(
     return evaluate_signal_details(closes, fast_period, slow_period).signal
 
 
-def default_strategy_params() -> dict[str, Any]:
+# ── Registry-compatible interface ─────────────────────────────────────────────
+
+def default_params() -> dict[str, Any]:
     return {
         "fast_period": 5,
         "slow_period": 15,
@@ -68,6 +72,40 @@ def default_strategy_params() -> dict[str, Any]:
         "min_trade_interval_sec": 300,
         "ohlcv_timeframe": "5m",
         "ohlcv_limit": 50,
-        # Allocated quote (e.g. USDT) for ROI / drawdown-vs-budget; set via UI or JSON.
         "initial_budget_quote": None,
     }
+
+
+def evaluate(ohlcv: list[list], params: dict[str, Any]) -> SignalResult:
+    """Standard evaluate() used by the registry-based bot runner."""
+    closes = [float(x[4]) for x in ohlcv]
+    fast = int(params.get("fast_period", 5))
+    slow = int(params.get("slow_period", 15))
+    details = evaluate_signal_details(closes, fast, slow)
+
+    warmup = details.fast_sma is None or details.slow_sma is None
+    confidence: float | None = None
+    if details.slow_sma is not None and details.slow_sma > 0 and details.fast_sma is not None:
+        confidence = round(
+            min(1.0, abs(details.fast_sma - details.slow_sma) / details.slow_sma * 20), 4
+        )
+
+    return SignalResult(
+        details.signal,
+        {
+            "fast_sma": round(details.fast_sma, 4) if details.fast_sma is not None else None,
+            "slow_sma": round(details.slow_sma, 4) if details.slow_sma is not None else None,
+            "prev_fast_sma": round(details.prev_fast_sma, 4) if details.prev_fast_sma is not None else None,
+            "prev_slow_sma": round(details.prev_slow_sma, 4) if details.prev_slow_sma is not None else None,
+            "gap": round(details.fast_sma - details.slow_sma, 4)
+            if details.fast_sma is not None and details.slow_sma is not None
+            else None,
+        },
+        close_count=details.close_count,
+        warmup=warmup,
+        confidence=confidence,
+    )
+
+
+# Legacy alias kept for code that imports default_strategy_params directly.
+default_strategy_params = default_params

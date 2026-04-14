@@ -46,7 +46,8 @@ def build_binance_spot(
     execution_mode: Literal["testnet", "live"],
 ) -> ccxt.binance:
     """
-    Spot exchange instance. Testnet uses Binance Spot Testnet (virtual funds).
+    Authenticated spot exchange instance for balance checks and order execution.
+    Testnet uses Binance Spot Testnet (virtual funds).
     Live uses mainnet — only after user confirmation in app_settings.
     """
     api_key, api_secret = _spot_credentials(execution_mode)
@@ -66,3 +67,19 @@ def build_binance_spot(
         exchange.set_sandbox_mode(False)
 
     return exchange
+
+
+def build_binance_public() -> ccxt.binance:
+    """
+    Unauthenticated mainnet exchange for read-only public data (OHLCV, market
+    metadata).  No API key required — Binance public REST endpoints are open.
+
+    Use this for signal generation so strategy decisions are based on real
+    market prices regardless of the bot's execution_mode (testnet vs live).
+    """
+    return ccxt.binance(
+        {
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        }
+    )

@@ -38,7 +38,8 @@ from tracked_markets import (
     alt_stream_ids,
     stream_id_to_ccxt,
 )
-from trading.app_settings import get_execution_mode
+# execution_mode is intentionally NOT used for data collection —
+# we always stream from mainnet for real market microstructure.
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -99,15 +100,13 @@ async def _binance_ws_listener() -> None:
     stream_path = "/".join(streams)
     reconnect_delay = WS_RECONNECT_BASE_SEC
 
+    # Always use mainnet for price data — public streams need no API key and
+    # provide real market microstructure regardless of bot execution_mode.
+    base_url = "wss://stream.binance.com:9443"
+    ws_url = f"{base_url}/stream?streams={stream_path}"
+
     while True:
-        mode = get_execution_mode()
-        base_url = (
-            "wss://stream.testnet.binance.vision"
-            if mode != "live"
-            else "wss://stream.binance.com:9443"
-        )
-        ws_url = f"{base_url}/stream?streams={stream_path}"
-        print(f"[data_collector] Connecting to {base_url} (mode={mode})")
+        print(f"[data_collector] Connecting to {base_url} (mainnet — real prices)")
 
         try:
             async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
@@ -252,9 +251,9 @@ async def _data_logger() -> None:
         await asyncio.sleep(1.0)
 
 
-# ── Entry point ─────────────────────────────────────────────────────────────
+# ── Entry points ────────────────────────────────────────────────────────────
 
-async def main() -> None:
+async def _main_coro() -> None:
     print(
         f"[data_collector] Starting — tracking {len(TRACKED_USDT_STREAM_IDS)} pairs: "
         + ", ".join(TRACKED_USDT_STREAM_IDS)
@@ -265,8 +264,20 @@ async def main() -> None:
     )
 
 
+async def run_async() -> None:
+    """
+    Asyncio entry-point for use as a long-running asyncio.Task inside the
+    FastAPI lifespan.  Should NOT be executed via subprocess or asyncio.run().
+    """
+    try:
+        await _main_coro()
+    except asyncio.CancelledError:
+        print("[data_collector] Task cancelled — shutting down.")
+        raise
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(_main_coro())
     except KeyboardInterrupt:
         print("[data_collector] Stopped.")

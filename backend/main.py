@@ -48,6 +48,11 @@ from trading.strategy_budget import (
     merge_strategy_params_json,
     parse_initial_budget_api_value,
 )
+from trading.strategies.registry import (
+    get_strategy,
+    strategy_names,
+    strategy_catalog,
+)
 
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_backend_dir, ".."))
@@ -59,6 +64,7 @@ load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
 async def lifespan(_app: FastAPI):
     import asyncio
     from services.bot_runner import run_async as _bot_runner_async
+    from services.data_collector import run_async as _data_collector_async
     init_db()
     # Pause any bots that were left running — the user must explicitly start them.
     conn = get_db_connection()
@@ -67,15 +73,17 @@ async def lifespan(_app: FastAPI):
         conn.commit()
     finally:
         conn.close()
-    task = asyncio.create_task(_bot_runner_async())
+    bot_task = asyncio.create_task(_bot_runner_async())
+    collector_task = asyncio.create_task(_data_collector_async())
     try:
         yield
     finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        for t in (bot_task, collector_task):
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="MagiTrader API", lifespan=lifespan)
@@ -107,7 +115,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-collector_process = None
+# Data collector runs as an asyncio.Task inside lifespan — always active.
+_DATA_COLLECTOR_MANAGED = True
 
 
 def get_exchange_authenticated():
@@ -226,29 +235,86 @@ def get_tracked_markets():
 
 
 @app.get("/api/data/status")
-def get_status():
-    global collector_process
-    is_active = collector_process is not None and collector_process.poll() is None
-    return {"active": is_active}
+def get_data_status():
+    """Data collector is always active as a managed asyncio task."""
+    return {"active": _DATA_COLLECTOR_MANAGED, "managed": True}
 
 
-@app.post("/api/data/start")
-def start_collection():
-    global collector_process
-    if collector_process is None or collector_process.poll() is not None:
-        script_path = os.path.join(os.path.dirname(__file__), "services", "data_collector.py")
-        collector_process = subprocess.Popen([sys.executable, script_path])
-    return {"active": True}
+@app.get("/api/db/stats")
+def get_db_stats():
+    """Return real DB file size and per-table row counts for the Data page."""
+    db_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
+    )
+    file_size_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+
+    tables = [
+        "market_ticks",
+        "bot_orders",
+        "bot_logs",
+        "bot_decisions",
+        "market_depth",
+        "bots",
+    ]
+    table_counts: dict[str, int] = {}
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        for tbl in tables:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {tbl}")  # noqa: S608 – table names are hard-coded
+                table_counts[tbl] = cur.fetchone()[0]
+            except Exception:
+                table_counts[tbl] = 0
+    finally:
+        conn.close()
+
+    total = max(sum(table_counts.values()), 1)
+    distribution = [
+        {
+            "table": tbl,
+            "rows": table_counts[tbl],
+            "pct": round(table_counts[tbl] / total * 100, 1),
+        }
+        for tbl in tables
+        if table_counts[tbl] > 0
+    ]
+    distribution.sort(key=lambda x: x["rows"], reverse=True)
+
+    return {
+        "file_size_bytes": file_size_bytes,
+        "file_size_mb": round(file_size_bytes / 1_048_576, 1),
+        "table_counts": table_counts,
+        "total_ticks": table_counts.get("market_ticks", 0),
+        "total_orders": table_counts.get("bot_orders", 0),
+        "distribution": distribution,
+    }
 
 
-@app.post("/api/data/stop")
-def stop_collection():
-    global collector_process
-    if collector_process and collector_process.poll() is None:
-        collector_process.terminate()
-        collector_process.wait()
-        collector_process = None
-    return {"active": False}
+@app.post("/api/data/purge-sim-logs")
+def purge_sim_logs():
+    """Delete bot_logs and bot_orders rows for all testnet bots."""
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT bot_id FROM bots WHERE execution_mode != 'live'"
+        )
+        testnet_ids = [r["bot_id"] for r in cur.fetchall()]
+        deleted_logs = deleted_orders = 0
+        for bid in testnet_ids:
+            cur.execute("DELETE FROM bot_logs WHERE bot_id = ?", (bid,))
+            deleted_logs += cur.rowcount
+            cur.execute("DELETE FROM bot_orders WHERE bot_id = ?", (bid,))
+            deleted_orders += cur.rowcount
+        conn.commit()
+        return {
+            "deleted_logs": deleted_logs,
+            "deleted_orders": deleted_orders,
+            "bots_affected": len(testnet_ids),
+        }
+    finally:
+        conn.close()
 
 
 # --- Trading settings ---
@@ -328,9 +394,15 @@ def list_bots():
 class CreateBotBody(BaseModel):
     name: str
     symbol: str
-    strategy: str = "sma_cross"
+    strategy: str = "sma_cross"  # defaults to original strategy for backward compat
     initial_budget_quote: float
     strategy_params: dict[str, Any] | None = None
+
+
+@app.get("/api/strategies")
+def list_strategies():
+    """Return all available strategy names, display names, and their default params."""
+    return {"strategies": strategy_catalog()}
 
 
 @app.post("/api/bots", status_code=201)
@@ -339,17 +411,21 @@ def post_create_bot(body: CreateBotBody):
         raise HTTPException(status_code=400, detail="name must not be empty")
     if not body.symbol.strip():
         raise HTTPException(status_code=400, detail="symbol must not be empty")
-    if body.strategy != "sma_cross":
-        raise HTTPException(status_code=400, detail="only sma_cross strategy is supported")
     if body.initial_budget_quote <= 0:
         raise HTTPException(status_code=400, detail="initial_budget_quote must be positive")
-    from trading.strategies.sma_cross import default_strategy_params
-    params = default_strategy_params()
+    try:
+        strategy_mod = get_strategy(body.strategy)
+    except ValueError:
+        available = strategy_names()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown strategy {body.strategy!r}. Available: {available}",
+        )
+    params = strategy_mod.default_params()
     if body.strategy_params:
-        safe_keys = {
-            "fast_period", "slow_period", "quote_fraction", "base_fraction",
-            "min_trade_interval_sec", "ohlcv_timeframe", "ohlcv_limit",
-        }
+        # Accept all keys declared by the strategy's default_params, plus universal trading keys.
+        universal_keys = {"quote_fraction", "base_fraction", "min_trade_interval_sec", "ohlcv_timeframe", "ohlcv_limit"}
+        safe_keys = set(params.keys()) | universal_keys
         params.update({k: v for k, v in body.strategy_params.items() if k in safe_keys})
     params["initial_budget_quote"] = body.initial_budget_quote
     params_json = json.dumps(params, default=str)

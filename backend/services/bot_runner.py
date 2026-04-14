@@ -43,8 +43,8 @@ load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
 from database import get_db_connection, record_bot_order, record_bot_decision, fetch_bot_orders_chronological
 from trading.app_settings import get_execution_mode, is_global_halt
 from trading.bot_performance import compute_strategy_performance
-from trading.exchange_factory import build_binance_spot
-from trading.strategies.sma_cross import default_strategy_params, evaluate_signal_details
+from trading.exchange_factory import build_binance_spot, build_binance_public
+from trading.strategies.registry import get_strategy, default_params_for
 
 _last_trade_monotonic: dict[str, float] = {}
 
@@ -52,6 +52,19 @@ POLL_SEC = 5
 
 _last_throttled_bot_info: dict[str, float] = {}
 _last_throttled_print: dict[str, float] = {}
+
+
+def _format_meta(meta: dict) -> str:
+    """Render strategy meta-dict as a compact key=value string for log messages."""
+    parts = []
+    for k, v in meta.items():
+        if isinstance(v, float):
+            parts.append(f"{k}={v:.4f}")
+        elif v is None:
+            pass
+        else:
+            parts.append(f"{k}={v}")
+    return "  ".join(parts) if parts else "(no meta)"
 
 
 def _idle_log_interval_sec() -> float:
@@ -124,13 +137,12 @@ def _load_running_bots():
         conn.close()
 
 
-def _merge_params(raw: str | None) -> dict[str, Any]:
-    base = default_strategy_params()
+def _merge_params(strategy_name: str, raw: str | None) -> dict[str, Any]:
+    base = default_params_for(strategy_name)
     if not raw:
         return base
     try:
-        merged = {**base, **json.loads(raw)}
-        return merged
+        return {**base, **json.loads(raw)}
     except json.JSONDecodeError:
         return base
 
@@ -185,10 +197,18 @@ def _process_bot(
     bot: dict[str, Any],
     execution_mode: str,
     prefetched_ohlcv: list | None = None,
+    public_ex=None,
 ) -> None:
+    """
+    ex         – authenticated exchange (testnet/live) for balance + orders.
+    public_ex  – unauthenticated mainnet exchange for OHLCV + market metadata.
+                 Falls back to `ex` when not provided (legacy path).
+    """
     bot_id = bot["bot_id"]
     symbol = bot["symbol"]
-    params = _merge_params(bot.get("strategy_params_json"))
+    strategy_name = bot.get("strategy") or "sma_cross"
+    params = _merge_params(strategy_name, bot.get("strategy_params_json"))
+    data_ex = public_ex if public_ex is not None else ex  # real prices for signals
 
     interval_key = float(params["min_trade_interval_sec"])
     last = _last_trade_monotonic.get(bot_id, 0.0)
@@ -211,12 +231,12 @@ def _process_bot(
         # Shared candle data fetched once for all bots on this symbol/timeframe.
         ohlcv = prefetched_ohlcv
         _log(bot_id, "info", execution_mode,
-             f"Cycle: {symbol} {timeframe} — {len(ohlcv)} candles (shared fetch)")
+             f"Cycle: {symbol} {timeframe} — {len(ohlcv)} candles (shared fetch, mainnet)")
     else:
         _log(bot_id, "info", execution_mode,
-             f"Cycle: {symbol} {timeframe} — fetching {limit} candles…")
+             f"Cycle: {symbol} {timeframe} — fetching {limit} candles from mainnet…")
         try:
-            ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            ohlcv = data_ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
             _log(bot_id, "error", execution_mode, f"fetch_ohlcv failed: {e}")
             return
@@ -234,64 +254,40 @@ def _process_bot(
         f"Market: last_close={last_close:.4f}  candles={len(ohlcv)}",
     )
 
-    closes = [float(x[4]) for x in ohlcv]
-    details = evaluate_signal_details(
-        closes,
-        int(params["fast_period"]),
-        int(params["slow_period"]),
-    )
+    try:
+        strategy = get_strategy(strategy_name)
+    except ValueError as e:
+        _log(bot_id, "error", execution_mode, f"Unknown strategy {strategy_name!r}: {e}")
+        return
 
-    if details.signal == "hold":
-        if (
-            details.fast_sma is not None
-            and details.slow_sma is not None
-            and details.prev_fast_sma is not None
-            and details.prev_slow_sma is not None
-        ):
+    result = strategy.evaluate(ohlcv, params)
+
+    if result.signal == "hold":
+        if result.warmup:
             _log(
                 bot_id,
                 "info",
                 execution_mode,
-                f"Signal: HOLD — fast_sma={details.fast_sma:.4f}  slow_sma={details.slow_sma:.4f}  "
-                f"(gap={(details.fast_sma - details.slow_sma):+.4f})",
+                f"Signal: HOLD (warmup) — {result.close_count} bars collected.",
             )
         else:
-            need = int(params["slow_period"]) + 2
-            _log(
-                bot_id,
-                "info",
-                execution_mode,
-                f"Signal: HOLD (warmup) — {details.close_count}/{need} bars collected.",
-            )
+            meta_str = _format_meta(result.meta)
+            _log(bot_id, "info", execution_mode, f"Signal: HOLD — {meta_str}")
         try:
             record_bot_decision(bot_id, symbol, execution_mode, "HOLD", None, False)
         except Exception:
             pass
         return
 
-    _log(
-        bot_id,
-        "info",
-        execution_mode,
-        f"Signal: {details.signal.upper()} — fast_sma={details.fast_sma:.4f}  slow_sma={details.slow_sma:.4f}  "
-        f"(gap={(details.fast_sma - details.slow_sma):+.4f}  prev_gap={(details.prev_fast_sma - details.prev_slow_sma):+.4f})",
-    )
+    meta_str = _format_meta(result.meta)
+    _log(bot_id, "info", execution_mode, f"Signal: {result.signal.upper()} — {meta_str}")
 
-    # Confidence proxy: normalised SMA gap width (0–1 capped at 0.05 spread).
-    _signal_confidence: float | None = None
-    if (
-        details.fast_sma is not None
-        and details.slow_sma is not None
-        and details.slow_sma > 0
-    ):
-        _signal_confidence = round(
-            min(1.0, abs(details.fast_sma - details.slow_sma) / details.slow_sma * 20), 4
-        )
+    _signal_confidence: float | None = result.confidence
 
     try:
-        if not ex.markets:
-            ex.load_markets()
-        market = ex.market(symbol)
+        if not data_ex.markets:
+            data_ex.load_markets()
+        market = data_ex.market(symbol)
     except Exception as e:
         _log(bot_id, "error", execution_mode, f"market metadata failed: {e}")
         return
@@ -508,6 +504,17 @@ async def run_async():
         await asyncio.sleep(POLL_SEC)
 
 
+_public_exchange = None  # lazily initialised mainnet read-only instance
+
+
+def _get_public_exchange():
+    """Return (or create) the shared unauthenticated mainnet exchange for OHLCV."""
+    global _public_exchange
+    if _public_exchange is None:
+        _public_exchange = build_binance_public()
+    return _public_exchange
+
+
 def _run_one_cycle():
     """One polling cycle — extracted so both the async and sync entrypoints share it."""
     if is_global_halt():
@@ -525,18 +532,17 @@ def _run_one_cycle():
         )
         return
 
+    # Authenticated exchanges (per execution_mode) — used only for balance + orders.
     exchanges = _build_exchanges_for_bots(bots)
+    # Single unauthenticated mainnet exchange — used for OHLCV + market metadata.
+    public_ex = _get_public_exchange()
 
-    # ── Pre-fetch OHLCV once per unique (mode, symbol, timeframe, limit) ──────
-    # Bots sharing the same market data key reuse the same candles, cutting
-    # redundant exchange API calls from N-bots down to N-unique-symbols.
+    # ── Pre-fetch OHLCV once per unique (symbol, timeframe, limit) ────────────
+    # All bots share the same mainnet candle data regardless of their execution_mode,
+    # so signals are always computed from real market prices.
     ohlcv_cache: dict[tuple, list | None] = {}
     for bot in bots:
-        mode = bot.get("execution_mode", "testnet")
-        ex = exchanges.get(mode)
-        if ex is None:
-            continue
-        params = _merge_params(bot.get("strategy_params_json"))
+        params = _merge_params(bot.get("strategy") or "sma_cross", bot.get("strategy_params_json"))
         # Skip pre-fetch for bots still in cooldown — they won't use the data.
         interval_key = float(params["min_trade_interval_sec"])
         if time.monotonic() - _last_trade_monotonic.get(bot["bot_id"], 0.0) < interval_key:
@@ -544,12 +550,12 @@ def _run_one_cycle():
         symbol = bot["symbol"]
         timeframe = str(params.get("ohlcv_timeframe", "5m"))
         limit = int(params.get("ohlcv_limit", 50))
-        cache_key = (mode, symbol, timeframe, limit)
+        cache_key = (symbol, timeframe, limit)  # mode-independent: always mainnet
         if cache_key not in ohlcv_cache:
             try:
-                if not ex.markets:
-                    ex.load_markets()
-                ohlcv_cache[cache_key] = ex.fetch_ohlcv(
+                if not public_ex.markets:
+                    public_ex.load_markets()
+                ohlcv_cache[cache_key] = public_ex.fetch_ohlcv(
                     symbol, timeframe=timeframe, limit=limit
                 )
             except Exception as e:
@@ -557,8 +563,6 @@ def _run_one_cycle():
                 ohlcv_cache[cache_key] = None  # bot will fall back to its own fetch
 
     # ── Dispatch all bots in parallel threads ─────────────────────────────────
-    # Each bot thread computes its signal and, only when it needs to trade,
-    # fetches a fresh balance and places the order independently.
     def _run_bot(bot: dict[str, Any]) -> None:
         mode = bot.get("execution_mode", "testnet")
         ex = exchanges.get(mode)
@@ -566,13 +570,13 @@ def _run_one_cycle():
             _log(bot["bot_id"], "error", mode,
                  f"No exchange for execution_mode={mode!r} — check API keys in .env.")
             return
-        params = _merge_params(bot.get("strategy_params_json"))
+        params = _merge_params(bot.get("strategy") or "sma_cross", bot.get("strategy_params_json"))
         symbol = bot["symbol"]
         timeframe = str(params.get("ohlcv_timeframe", "5m"))
         limit = int(params.get("ohlcv_limit", 50))
-        prefetched = ohlcv_cache.get((mode, symbol, timeframe, limit))
+        prefetched = ohlcv_cache.get((symbol, timeframe, limit))
         try:
-            _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched)
+            _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched, public_ex=public_ex)
         except Exception:
             _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
 
