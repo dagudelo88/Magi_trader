@@ -16,6 +16,7 @@ from database import (
     create_bot,
     delete_bot,
     get_db_connection,
+    get_latest_voter_signals,
     init_db,
     fetch_bot_orders_panel,
     fetch_bot_orders_chronological,
@@ -60,6 +61,66 @@ load_dotenv(os.path.join(_repo_root, ".env"))
 load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
 
 
+async def _meta_training_loop() -> None:
+    """
+    Background task: labels voter_feedback forward returns and updates MetaMagi
+    voter weights every 30 minutes.
+
+    Uses only local SQLite data (market_ticks + voter_feedback) — zero Binance
+    API calls.
+    """
+    import asyncio
+    import logging
+
+    from database import (
+        get_voter_feedback_batch,
+        label_voter_feedback_forward_roc,
+    )
+    from trading.metatrader import get_metatrader
+
+    logger = logging.getLogger("meta_training_loop")
+    metatrader = get_metatrader()
+
+    INTERVAL_SEC = 1800  # 30 minutes
+
+    while True:
+        try:
+            await asyncio.sleep(INTERVAL_SEC)
+
+            # 1. Fill forward_roc_30s / forward_roc_5m from stored market_ticks.
+            # Use a 48-hour window so rows accumulated between restarts are
+            # always reachable even if multiple training cycles were missed.
+            labeled_count = label_voter_feedback_forward_roc(
+                lookback_minutes=2880
+            )
+            logger.info(
+                "MetaMagi: labeled %d voter_feedback rows.", labeled_count
+            )
+
+            # 2. Pull last 24 h of feedback (now with forward ROC filled).
+            batch = get_voter_feedback_batch(hours=24)
+            if not batch:
+                logger.info(
+                    "MetaMagi: no voter_feedback data yet — skipping."
+                )
+                continue
+
+            # 3. Update EMA-based voter weights.
+            updated_weights = metatrader.train_step(batch)
+            if updated_weights:
+                weight_str = "  ".join(
+                    f"{v}={w:.3f}" for v, w in sorted(updated_weights.items())
+                )
+                logger.info("MetaMagi: updated weights — %s", weight_str)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "MetaMagi training loop error — will retry next cycle."
+            )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     import asyncio
@@ -75,10 +136,11 @@ async def lifespan(_app: FastAPI):
         conn.close()
     bot_task = asyncio.create_task(_bot_runner_async())
     collector_task = asyncio.create_task(_data_collector_async())
+    meta_task = asyncio.create_task(_meta_training_loop())
     try:
         yield
     finally:
-        for t in (bot_task, collector_task):
+        for t in (bot_task, collector_task, meta_task):
             t.cancel()
             try:
                 await t
@@ -615,6 +677,16 @@ def get_bot(bot_id: str):
         }
     finally:
         conn.close()
+
+
+@app.get("/api/bots/{bot_id}/voter-signals")
+def get_voter_signals(bot_id: str):
+    """
+    Return the latest signal cast by each voter for the given bot.
+    Polled by the Bot Detail page to keep voter cards live.
+    """
+    rows = get_latest_voter_signals(bot_id)
+    return {"voter_signals": rows}
 
 
 @app.patch("/api/bots/{bot_id}/strategy-params")

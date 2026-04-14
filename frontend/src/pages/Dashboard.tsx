@@ -65,6 +65,20 @@ function parseStrategyLabel(strategy: string, paramsJson: string | null): string
       return 'SMA Cross';
     }
   }
+  if (strategy.startsWith('magi_ensemble')) {
+    try {
+      const p: Record<string, unknown> = paramsJson ? JSON.parse(paramsJson) : {};
+      const tf     = typeof p.ohlcv_timeframe === 'string' ? p.ohlcv_timeframe : '';
+      const voters = Array.isArray(p.voters) ? p.voters.length : '?';
+      const mode   = typeof p.consensus_mode === 'string' ? p.consensus_mode : '';
+      const score  = typeof p.consensus_threshold === 'number'
+        ? ` ≥${(p.consensus_threshold * 100).toFixed(0)}%`
+        : '';
+      return `Magi ${voters}v · ${tf}${mode ? ' · ' + mode : ''}${score}`;
+    } catch {
+      return 'Magi Ensemble';
+    }
+  }
   return strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 

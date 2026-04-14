@@ -16,21 +16,23 @@ interface DbStats {
 }
 
 const TABLE_COLORS: Record<string, string> = {
-  market_ticks:  "bg-primary",
-  bot_orders:    "bg-green-500",
-  bot_logs:      "bg-yellow-500",
-  bot_decisions: "bg-purple-500",
-  market_depth:  "bg-blue-400",
-  bots:          "bg-gray-400",
+  market_ticks:   "bg-primary",
+  bot_orders:     "bg-green-500",
+  bot_logs:       "bg-yellow-500",
+  bot_decisions:  "bg-purple-500",
+  voter_feedback: "bg-orange-400",
+  market_depth:   "bg-blue-400",
+  bots:           "bg-gray-400",
 };
 
 const TABLE_LABEL: Record<string, string> = {
-  market_ticks:  "Market Ticks",
-  bot_orders:    "Bot Orders",
-  bot_logs:      "Bot Logs",
-  bot_decisions: "Bot Decisions",
-  market_depth:  "Market Depth",
-  bots:          "Bots",
+  market_ticks:   "Market Ticks",
+  bot_orders:     "Bot Orders",
+  bot_logs:       "Bot Logs",
+  bot_decisions:  "Bot Decisions",
+  voter_feedback: "Voter Feedback",
+  market_depth:   "Market Depth",
+  bots:           "Bots",
 };
 
 function fmt(n: number): string {

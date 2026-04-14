@@ -166,11 +166,35 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
 
 def get_db_connection():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
+def _enable_wal_once() -> None:
+    """
+    Switch the database to WAL journal mode the first time it is initialised.
+
+    WAL mode is persistent on the file — this only needs to succeed once.
+    A failed attempt (e.g. stale lock on first boot) is silently ignored;
+    the next restart will retry.  Never called from get_db_connection() so
+    routine connections carry zero overhead and cannot trigger a startup crash.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=3)
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.close()
+        if mode != "wal":
+            import logging
+            logging.getLogger(__name__).warning(
+                "journal_mode=%s (WAL not active — stale lock?)", mode
+            )
+    except Exception:
+        pass  # Non-fatal: delete-mode still works; WAL will be set on next restart.
+
+
 def init_db():
+    _enable_wal_once()
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -302,6 +326,64 @@ def init_db():
             defaults,
         )
 
+    # Per-voter vote log used by MetaMagi to learn dynamic weights.
+    # forward_roc_* and realized_pnl are filled later by meta_training_loop.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS voter_feedback (
+            feedback_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id             TEXT,
+            timestamp          INTEGER NOT NULL,
+            target_asset       TEXT    NOT NULL,
+            ensemble_signal    TEXT    NOT NULL,
+            voter_name         TEXT    NOT NULL,
+            voter_signal       TEXT    NOT NULL,
+            confidence         REAL,
+            forward_roc_30s    REAL,
+            forward_roc_5m     REAL,
+            realized_pnl       REAL,
+            consensus_score    REAL,
+            features_snapshot  TEXT
+        )
+    """)
+    # Migrate existing databases that predate the bot_id / confidence columns.
+    for col, col_def in [("bot_id", "TEXT"), ("confidence", "REAL")]:
+        try:
+            cursor.execute(
+                f"ALTER TABLE voter_feedback ADD COLUMN {col} {col_def}"
+            )
+        except Exception:
+            pass  # column already exists — safe to ignore
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_voter_feedback_asset_ts "
+        "ON voter_feedback(target_asset, timestamp)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_voter_feedback_bot_ts "
+        "ON voter_feedback(bot_id, timestamp)"
+    )
+
+    # Cached OHLCV candles — written by bot_runner on every fetch so the
+    # backtesting engine can replay any historical window without hitting
+    # the Binance API.  ts_open is the candle open timestamp in ms.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ohlcv_candles (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol    TEXT    NOT NULL,
+            timeframe TEXT    NOT NULL,
+            ts_open   INTEGER NOT NULL,
+            open      REAL,
+            high      REAL,
+            low       REAL,
+            close     REAL,
+            volume    REAL,
+            UNIQUE(symbol, timeframe, ts_open)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ohlcv_sym_tf_ts "
+        "ON ohlcv_candles(symbol, timeframe, ts_open)"
+    )
+
     conn.commit()
     conn.close()
 
@@ -352,6 +434,47 @@ def record_bot_order(bot_id: str, execution_mode: str, order: dict[str, Any]) ->
             f"[record_bot_order] FAILED bot_id={bot_id!r}: {traceback.format_exc()}",
             file=sys.stderr,
         )
+    finally:
+        conn.close()
+
+
+def upsert_ohlcv_candles(
+    symbol: str,
+    timeframe: str,
+    candles: list[list],
+) -> None:
+    """
+    Persist a batch of CCXT-format OHLCV candles to ``ohlcv_candles``.
+
+    ``candles`` is the list returned by ``exchange.fetch_ohlcv()``:
+    ``[[ts_open_ms, open, high, low, close, volume], ...]``
+
+    Uses INSERT OR IGNORE so duplicate candles (same symbol+timeframe+ts_open)
+    are silently skipped.  Failures are swallowed — a missing candle is never
+    worth interrupting the live trading loop.
+    """
+    if not candles:
+        return
+    rows = [
+        (symbol, timeframe, int(c[0]), c[1], c[2], c[3], c[4], c[5])
+        for c in candles
+        if len(c) >= 6
+    ]
+    if not rows:
+        return
+    conn = get_db_connection()
+    try:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO ohlcv_candles
+              (symbol, timeframe, ts_open, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+    except Exception:
+        pass  # never interrupt the live trading path
     finally:
         conn.close()
 
@@ -648,6 +771,208 @@ def record_bot_decision(
             (bot_id, tick_id, mode, action.upper(), confidence, int(executed)),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_voter_feedback(record: dict[str, Any]) -> None:
+    """
+    Persist one voter's vote for a single ensemble decision.
+
+    Required keys: timestamp, target_asset, ensemble_signal, voter_name, voter_signal
+    Optional keys: bot_id, confidence, consensus_score, features_snapshot (JSON string)
+    Deferred keys: forward_roc_30s, forward_roc_5m, realized_pnl  (filled by training loop)
+    """
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO voter_feedback (
+                bot_id, timestamp, target_asset, ensemble_signal,
+                voter_name, voter_signal, confidence,
+                forward_roc_30s, forward_roc_5m, realized_pnl,
+                consensus_score, features_snapshot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("bot_id"),
+                record["timestamp"],
+                record["target_asset"],
+                record["ensemble_signal"],
+                record["voter_name"],
+                record["voter_signal"],
+                record.get("confidence"),
+                record.get("forward_roc_30s"),
+                record.get("forward_roc_5m"),
+                record.get("realized_pnl"),
+                record.get("consensus_score"),
+                record.get("features_snapshot"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_latest_voter_signals(bot_id: str) -> list[dict[str, Any]]:
+    """
+    Return the most-recent signal for each voter for a given bot.
+
+    Used by the Bot Detail page to render live voter cards.
+    Each row: voter_name, voter_signal, confidence, consensus_score, timestamp.
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT vf.voter_name,
+                   vf.voter_signal,
+                   vf.confidence,
+                   vf.consensus_score,
+                   vf.timestamp
+            FROM voter_feedback vf
+            INNER JOIN (
+                SELECT voter_name, MAX(timestamp) AS max_ts
+                FROM voter_feedback
+                WHERE bot_id = ?
+                GROUP BY voter_name
+            ) latest
+              ON vf.voter_name = latest.voter_name
+             AND vf.timestamp  = latest.max_ts
+             AND vf.bot_id     = ?
+            ORDER BY vf.voter_name ASC
+            """,
+            (bot_id, bot_id),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_voter_feedback_batch(hours: int = 24) -> list[dict[str, Any]]:
+    """Return labeled + unlabeled voter_feedback rows from the last `hours` hours."""
+    cutoff_ms = int((time.time() - hours * 3600) * 1000)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT feedback_id, timestamp, target_asset, ensemble_signal,
+                   voter_name, voter_signal,
+                   forward_roc_30s, forward_roc_5m, realized_pnl,
+                   consensus_score, features_snapshot
+            FROM voter_feedback
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (cutoff_ms,),
+        )
+        return [dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def label_voter_feedback_forward_roc(lookback_minutes: int = 60) -> int:
+    """
+    Fill ``forward_roc_30s`` and ``forward_roc_5m`` for unlabeled
+    ``voter_feedback`` rows by joining against ``market_ticks``.
+
+    Implemented as two correlated-subquery UPDATE statements so the entire
+    labeling pass completes in a single round-trip per asset group — no Python
+    loop per row.  This is critical because the data collector writes to
+    ``market_ticks`` every second; the old N-queries-per-row design caused
+    severe lock contention in SQLite's default journal mode.
+
+    Returns the number of rows updated.
+    Pure SQLite — no Binance API calls.
+    """
+    cutoff_ms = int((time.time() - lookback_minutes * 60) * 1000)
+    # Leave a 5-minute gap at the trailing edge so both forward windows (30s
+    # and 5m) have time to arrive in market_ticks before we attempt labeling.
+    trailing_gap_ms = 300_000
+    upper_ms = int(time.time() * 1000) - trailing_gap_ms
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+
+        # ── forward_roc_30s ──────────────────────────────────────────────────
+        # For each unlabeled row, find the closest market_tick at or after
+        # (timestamp + 30 000 ms) for the same asset, compute ROC inline.
+        cur.execute(
+            """
+            UPDATE voter_feedback
+            SET forward_roc_30s = (
+                SELECT
+                    CASE
+                        WHEN base_t.target_price > 0
+                        THEN (fwd_t.target_price - base_t.target_price)
+                             / base_t.target_price
+                        ELSE NULL
+                    END
+                FROM market_ticks AS base_t
+                JOIN market_ticks AS fwd_t
+                  ON fwd_t.target_asset = voter_feedback.target_asset
+                 AND fwd_t.timestamp = (
+                         SELECT MIN(timestamp) FROM market_ticks
+                         WHERE target_asset = voter_feedback.target_asset
+                           AND timestamp >= voter_feedback.timestamp + 30000
+                     )
+                WHERE base_t.target_asset = voter_feedback.target_asset
+                  AND base_t.timestamp = (
+                         SELECT MAX(timestamp) FROM market_ticks
+                         WHERE target_asset = voter_feedback.target_asset
+                           AND timestamp <= voter_feedback.timestamp
+                     )
+                LIMIT 1
+            )
+            WHERE forward_roc_30s IS NULL
+              AND timestamp >= ?
+              AND timestamp <= ?
+            """,
+            (cutoff_ms, upper_ms),
+        )
+        updated_30s = cur.rowcount
+
+        # ── forward_roc_5m ───────────────────────────────────────────────────
+        cur.execute(
+            """
+            UPDATE voter_feedback
+            SET forward_roc_5m = (
+                SELECT
+                    CASE
+                        WHEN base_t.target_price > 0
+                        THEN (fwd_t.target_price - base_t.target_price)
+                             / base_t.target_price
+                        ELSE NULL
+                    END
+                FROM market_ticks AS base_t
+                JOIN market_ticks AS fwd_t
+                  ON fwd_t.target_asset = voter_feedback.target_asset
+                 AND fwd_t.timestamp = (
+                         SELECT MIN(timestamp) FROM market_ticks
+                         WHERE target_asset = voter_feedback.target_asset
+                           AND timestamp >= voter_feedback.timestamp + 300000
+                     )
+                WHERE base_t.target_asset = voter_feedback.target_asset
+                  AND base_t.timestamp = (
+                         SELECT MAX(timestamp) FROM market_ticks
+                         WHERE target_asset = voter_feedback.target_asset
+                           AND timestamp <= voter_feedback.timestamp
+                     )
+                LIMIT 1
+            )
+            WHERE forward_roc_5m IS NULL
+              AND timestamp >= ?
+              AND timestamp <= ?
+            """,
+            (cutoff_ms, upper_ms),
+        )
+        updated_5m = cur.rowcount
+
+        conn.commit()
+        return max(updated_30s, updated_5m)
     finally:
         conn.close()
 

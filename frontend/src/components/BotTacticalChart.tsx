@@ -190,7 +190,7 @@ export function BotTacticalChart({
   }, [symbol, timeframe, limit, fastPeriod, slowPeriod, liveOhlcvPollMs]);
 
   return (
-    <div className="relative h-[min(440px,55vh)] w-full overflow-hidden border border-magi-grid/20 bg-magi-container-low sm:h-[min(500px,56vh)] 2xl:h-[min(580px,60vh)]">
+    <div className="relative h-[min(500px,58vh)] w-full overflow-hidden border border-magi-grid/20 bg-magi-container-low sm:h-[min(560px,60vh)] 2xl:h-[min(640px,64vh)]">
       <div className="pointer-events-none absolute inset-0 z-10 opacity-15 scanline" />
       <div
         className="absolute inset-0 z-0 opacity-[0.07]"

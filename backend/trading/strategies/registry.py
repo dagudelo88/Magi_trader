@@ -32,6 +32,19 @@ _STRATEGY_MODULE_MAP: dict[str, str] = {
     "obv_price": "trading.strategies.obv_price",
     "price_breakout": "trading.strategies.price_breakout",
     "spot_grid": "trading.strategies.spot_grid",
+    # Magi Ensemble — many voters → one consensus signal → one bot execution
+    "magi_ensemble_high": "trading.strategies.magi_ensemble_high",
+    "magi_ensemble_mid": "trading.strategies.magi_ensemble_mid",
+    "magi_ensemble_low": "trading.strategies.magi_ensemble_low",
+    # Magi Lag Ensemble — BTC-alt lead/lag specialization (uses market_ticks microstructure)
+    "magi_lag_ensemble_high": "trading.strategies.magi_lag_ensemble_high",
+    "magi_lag_ensemble_mid": "trading.strategies.magi_lag_ensemble_mid",
+    "magi_lag_ensemble_low": "trading.strategies.magi_lag_ensemble_low",
+    # Lag voters (used inside Magi Lag Ensembles — not intended as standalone bots)
+    "btc_lead_detector": "trading.strategies.btc_lead_detector",
+    "roc_divergence": "trading.strategies.roc_divergence",
+    "lag_correlation": "trading.strategies.lag_correlation",
+    "ratio_mean_reversion": "trading.strategies.ratio_mean_reversion",
 }
 
 # Human-readable display names for the UI
@@ -52,6 +65,16 @@ STRATEGY_DISPLAY_NAMES: dict[str, str] = {
     "obv_price": "OBV + Price",
     "price_breakout": "Price Breakout",
     "spot_grid": "Spot Grid",
+    "magi_ensemble_high": "Magi Ensemble — High Frequency",
+    "magi_ensemble_mid": "Magi Ensemble — Mid Frequency",
+    "magi_ensemble_low": "Magi Ensemble — Low Frequency",
+    "magi_lag_ensemble_high": "Magi Lag Ensemble — High Frequency",
+    "magi_lag_ensemble_mid": "Magi Lag Ensemble — Mid Frequency",
+    "magi_lag_ensemble_low": "Magi Lag Ensemble — Low Frequency",
+    "btc_lead_detector": "BTC Lead Detector",
+    "roc_divergence": "ROC Divergence",
+    "lag_correlation": "Lag Correlation",
+    "ratio_mean_reversion": "Ratio Mean Reversion",
 }
 
 _cache: dict[str, Any] = {}

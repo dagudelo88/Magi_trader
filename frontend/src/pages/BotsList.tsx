@@ -30,12 +30,38 @@ function statusBadge(s: string) {
 
 type CreateStep = 'pick-template' | 'configure';
 
+/** Strategy default params fetched from GET /api/strategies. */
+type StrategyDefaults = Record<string, unknown>;
+
 interface CreateConfig {
   template: BotTemplate;
+  /** Default params fetched from the backend for this template's strategy. */
+  params: StrategyDefaults;
   name: string;
   symbol: string;
   budget: string;
+  /** Active voter list for ensemble templates (ignored for non-ensemble). */
+  voters: string[];
 }
+
+/** All strategies that can act as voters (leaf strategies only — no ensembles). */
+const ALL_VOTERS: { id: string; label: string }[] = [
+  { id: 'macd_rsi',     label: 'MACD + RSI' },
+  { id: 'stochastic',   label: 'Stochastic' },
+  { id: 'cci',          label: 'CCI' },
+  { id: 'bb_breakout',  label: 'BB Breakout' },
+  { id: 'rsi_cross',    label: 'RSI Cross' },
+  { id: 'supertrend',   label: 'Supertrend' },
+  { id: 'dual_ema',     label: 'Dual EMA' },
+  { id: 'bb_rsi',       label: 'BB + RSI' },
+  { id: 'ema_ribbon',   label: 'EMA Ribbon' },
+  { id: 'parabolic_sar',label: 'Parabolic SAR' },
+  { id: 'donchian',     label: 'Donchian' },
+  { id: 'tema',         label: 'TEMA' },
+  { id: 'sma_cross',    label: 'SMA Cross' },
+  { id: 'obv_price',    label: 'OBV + Price' },
+  { id: 'price_breakout', label: 'Price Breakout' },
+];
 
 // ── Edit modal state ────────────────────────────────────────────────────────
 
@@ -52,6 +78,10 @@ export default function BotsList() {
   const [error, setError] = useState<string | null>(null);
   const [busyBotId, setBusyBotId] = useState<string | null>(null);
 
+  // Strategy defaults fetched from backend — keyed by strategy name.
+  // This is the single source of truth for all strategy params.
+  const [strategyDefaults, setStrategyDefaults] = useState<Record<string, StrategyDefaults>>({});
+
   // create modal
   const [createStep, setCreateStep] = useState<CreateStep | null>(null);
   const [createConfig, setCreateConfig] = useState<CreateConfig | null>(null);
@@ -67,9 +97,10 @@ export default function BotsList() {
 
   const load = async () => {
     try {
-      const [botsRes, settingsRes] = await Promise.all([
+      const [botsRes, settingsRes, strategiesRes] = await Promise.all([
         fetch(`${API_BASE}/api/bots`),
         fetch(`${API_BASE}/api/settings/trading`),
+        fetch(`${API_BASE}/api/strategies`),
       ]);
       if (!botsRes.ok) throw new Error('Failed to load bots');
       const b = await botsRes.json();
@@ -77,6 +108,14 @@ export default function BotsList() {
       if (settingsRes.ok) {
         const s = await settingsRes.json();
         setExecutionMode(s.execution_mode);
+      }
+      if (strategiesRes.ok) {
+        const s = await strategiesRes.json();
+        const defaults: Record<string, StrategyDefaults> = {};
+        for (const entry of (s.strategies ?? [])) {
+          defaults[entry.name] = entry.default_params ?? {};
+        }
+        setStrategyDefaults(defaults);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load');
@@ -103,11 +142,17 @@ export default function BotsList() {
   };
 
   const pickTemplate = (tpl: BotTemplate) => {
+    const params = strategyDefaults[tpl.strategy] ?? {};
+    const defaultVoters = tpl.strategy.includes('ensemble')
+      ? (params.voters as string[] | undefined ?? [])
+      : [];
     setCreateConfig({
       template: tpl,
+      params,
       name: '',
       symbol: tpl.defaultSymbol,
       budget: '',
+      voters: defaultVoters,
     });
     setCreateError(null);
     setCreateStep('configure');
@@ -127,17 +172,29 @@ export default function BotsList() {
       return;
     }
 
+    const isEnsemble = createConfig.template.strategy.includes('ensemble');
+    if (isEnsemble && createConfig.voters.length < 2) {
+      setCreateError('Select at least 2 voters for an ensemble bot.');
+      return;
+    }
+
     setCreateBusy(true);
     try {
+      // Send backend-fetched params so they stay in sync with strategy_templates.py.
+      // Only override voters when the user has customised them.
+      const strategyParams = isEnsemble
+        ? { ...createConfig.params, voters: createConfig.voters }
+        : createConfig.params;
+
       const res = await fetch(`${API_BASE}/api/bots`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name,
           symbol: createConfig.symbol,
-          strategy: 'sma_cross',
+          strategy: createConfig.template.strategy,
           initial_budget_quote: budget,
-          strategy_params: createConfig.template.params,
+          strategy_params: strategyParams,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -364,7 +421,11 @@ export default function BotsList() {
       {createStep !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
           <div className="bg-[#161616] border border-[#2a2a2a] rounded-xl w-full shadow-2xl"
-            style={{ maxWidth: createStep === 'pick-template' ? 680 : 460 }}>
+            style={{
+              maxWidth: createStep === 'pick-template'
+                ? 680
+                : createConfig?.template.strategy.startsWith('magi_ensemble') ? 560 : 460,
+            }}>
 
             {/* Modal header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-[#2a2a2a]">
@@ -392,7 +453,10 @@ export default function BotsList() {
             {/* Step 1: Template picker */}
             {createStep === 'pick-template' && (
               <div className="p-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {BOT_TEMPLATES.map((tpl) => (
+                {BOT_TEMPLATES.map((tpl) => {
+                  const p = strategyDefaults[tpl.strategy] ?? {};
+                  const isEnsemble = tpl.strategy.includes('ensemble');
+                  return (
                   <button
                     key={tpl.id}
                     type="button"
@@ -404,7 +468,7 @@ export default function BotsList() {
                         {tpl.name}
                       </p>
                       <span className="shrink-0 text-[9px] font-bold uppercase tracking-wider text-primary/70 bg-primary/10 border border-primary/20 px-2 py-0.5 rounded whitespace-nowrap">
-                        {tpl.params.ohlcv_timeframe}
+                        {(p.ohlcv_timeframe as string) ?? '…'}
                       </span>
                     </div>
                     <p className="text-[10px] font-semibold text-amber-400/80 uppercase tracking-wider mb-1.5">
@@ -412,13 +476,24 @@ export default function BotsList() {
                     </p>
                     <p className="text-[11px] text-gray-400 leading-snug">{tpl.description}</p>
                     <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-gray-600 font-mono">
-                      <span>fast={tpl.params.fast_period}</span>
-                      <span>slow={tpl.params.slow_period}</span>
-                      <span>buy={tpl.params.quote_fraction * 100}%</span>
-                      <span>sell={tpl.params.base_fraction * 100}%</span>
+                      {isEnsemble ? (
+                        <>
+                          <span>voters={(p.voters as string[] | undefined)?.length ?? '…'}</span>
+                          <span>mode={(p.consensus_mode as string) ?? '…'}</span>
+                          <span>threshold={p.consensus_threshold !== undefined ? `${(p.consensus_threshold as number) * 100}%` : '…'}</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>fast={(p.fast_period as number | undefined) ?? '…'}</span>
+                          <span>slow={(p.slow_period as number | undefined) ?? '…'}</span>
+                        </>
+                      )}
+                      <span>buy={p.quote_fraction !== undefined ? `${(p.quote_fraction as number) * 100}%` : '…'}</span>
+                      <span>sell={p.base_fraction !== undefined ? `${(p.base_fraction as number) * 100}%` : '…'}</span>
                     </div>
                   </button>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -437,13 +512,62 @@ export default function BotsList() {
                     {createConfig.template.name}
                   </span>
                   <span className="text-[10px] text-gray-500 font-mono">
-                    {createConfig.template.params.ohlcv_timeframe} ·
-                    fast={createConfig.template.params.fast_period} /
-                    slow={createConfig.template.params.slow_period} ·
-                    buy {createConfig.template.params.quote_fraction * 100}% ·
-                    sell {createConfig.template.params.base_fraction * 100}%
+                    {(createConfig.params.ohlcv_timeframe as string) ?? '…'}
+                    {createConfig.template.strategy.includes('ensemble') ? (
+                      <> · {createConfig.voters.length} voters
+                        · {(createConfig.params.consensus_mode as string) ?? '…'}</>
+                    ) : (
+                      <> · fast={(createConfig.params.fast_period as number | undefined) ?? '…'}
+                        / slow={(createConfig.params.slow_period as number | undefined) ?? '…'}</>
+                    )}
+                    {' '}· buy {createConfig.params.quote_fraction !== undefined ? `${(createConfig.params.quote_fraction as number) * 100}%` : '…'}
+                    · sell {createConfig.params.base_fraction !== undefined ? `${(createConfig.params.base_fraction as number) * 100}%` : '…'}
                   </span>
                 </div>
+
+                {/* Voter picker — ensemble strategies only */}
+                {createConfig.template.strategy.startsWith('magi_ensemble') && (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400">
+                        Voters
+                      </span>
+                      <span className={`text-[10px] font-mono ${createConfig.voters.length < 2 ? 'text-red-400' : 'text-primary/70'}`}>
+                        {createConfig.voters.length} selected
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {ALL_VOTERS.map(({ id, label }) => {
+                        const active = createConfig.voters.includes(id);
+                        return (
+                          <button
+                            key={id}
+                            type="button"
+                            onClick={() =>
+                              setCreateConfig((c) => {
+                                if (!c) return c;
+                                const next = active
+                                  ? c.voters.filter((v) => v !== id)
+                                  : [...c.voters, id];
+                                return { ...c, voters: next };
+                              })
+                            }
+                            className={`px-2 py-1.5 rounded text-[10px] font-bold border transition-all text-left truncate ${
+                              active
+                                ? 'border-primary/60 bg-primary/10 text-primary'
+                                : 'border-[#2a2a2a] bg-[#1c1c1c] text-gray-500 hover:border-gray-600 hover:text-gray-400'
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <p className="text-[10px] text-gray-600">
+                      Select 2 or more. MetaMagi will auto-adjust weights over time based on each voter's accuracy.
+                    </p>
+                  </div>
+                )}
 
                 <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
                   Bot Name

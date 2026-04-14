@@ -1,90 +1,79 @@
-/** Premade bot strategy templates the user can select when creating a new bot. */
+/**
+ * UI metadata for bot creation templates.
+ *
+ * Strategy params (voters, consensus_mode, thresholds, timeframes, etc.) are
+ * intentionally NOT stored here. They are fetched at runtime from the backend
+ * via GET /api/strategies, which calls each strategy's default_params().
+ *
+ * Single source of truth for params: backend/trading/strategy_templates.py
+ */
 
 export interface BotTemplate {
   id: string;
+  /** Registry strategy name sent to POST /api/bots */
+  strategy: string;
   name: string;
   tagline: string;
   description: string;
   defaultSymbol: string;
-  params: {
-    fast_period: number;
-    slow_period: number;
-    quote_fraction: number;
-    base_fraction: number;
-    min_trade_interval_sec: number;
-    ohlcv_timeframe: string;
-    ohlcv_limit: number;
-  };
 }
 
 export const BOT_TEMPLATES: BotTemplate[] = [
+  // ── Magi Ensemble ───────────────────────────────────────────────────────
   {
-    id: 'sma_scalper',
-    name: 'SMA Scalper',
-    tagline: 'High-frequency · 1m candles',
+    id: 'magi_high',
+    strategy: 'magi_ensemble_high',
+    name: 'Magi — High Frequency',
+    tagline: 'Committee · 1m · directional_net',
     description:
-      'Reacts to fast SMA crossovers on 1-minute bars. Trades small fractions often — best on liquid pairs like BTC and ETH.',
+      'Five high-activity voters vote on every 1-minute bar using directional_net consensus. A net edge on one side of the committee is enough to trade. Ideal for scalping liquid pairs.',
     defaultSymbol: 'BTC/USDT',
-    params: {
-      fast_period: 3,
-      slow_period: 7,
-      quote_fraction: 0.05,
-      base_fraction: 0.5,
-      min_trade_interval_sec: 60,
-      ohlcv_timeframe: '1m',
-      ohlcv_limit: 50,
-    },
   },
   {
-    id: 'sma_standard',
-    name: 'SMA Standard',
-    tagline: 'Balanced · 5m candles',
+    id: 'magi_mid',
+    strategy: 'magi_ensemble_mid',
+    name: 'Magi — Mid Frequency',
+    tagline: 'Committee · 5m · directional_net · recommended',
     description:
-      'Classic 5/15 crossover on 5-minute bars with moderate position sizing. Good all-round starting point for any pair.',
+      'Best balance of signal quality vs. frequency. Five voters on 5-minute bars with a stricter net threshold to filter microstructure noise.',
     defaultSymbol: 'BTC/USDT',
-    params: {
-      fast_period: 5,
-      slow_period: 15,
-      quote_fraction: 0.02,
-      base_fraction: 0.5,
-      min_trade_interval_sec: 300,
-      ohlcv_timeframe: '5m',
-      ohlcv_limit: 50,
-    },
   },
   {
-    id: 'sma_swing',
-    name: 'SMA Swing Trader',
-    tagline: 'Momentum · 15m candles',
+    id: 'magi_low',
+    strategy: 'magi_ensemble_low',
+    name: 'Magi — Swing Trading',
+    tagline: 'Committee · 1h · directional_net · high conviction',
     description:
-      'Captures medium-term momentum swings on 15-minute bars. Larger position sizes, less noise-sensitive.',
+      'Trend + breakout voters on 1-hour bars. High threshold requires a clear net directional edge. Trades rarely but with maximum confidence. Best for larger budgets.',
+    defaultSymbol: 'BTC/USDT',
+  },
+  // ── Magi Lag Ensemble ────────────────────────────────────────────────────
+  {
+    id: 'magi_lag_high',
+    strategy: 'magi_lag_ensemble_high',
+    name: 'Magi Lag — High Frequency',
+    tagline: 'BTC-Alt Lag · 1m · directional_net',
+    description:
+      'Detects BTC lead / alt lag using per-second microstructure data. Four lag-specialized voters fire on every 1-minute bar. Best on ETH/USDT or BNB/USDT.',
     defaultSymbol: 'ETH/USDT',
-    params: {
-      fast_period: 8,
-      slow_period: 21,
-      quote_fraction: 0.05,
-      base_fraction: 0.7,
-      min_trade_interval_sec: 900,
-      ohlcv_timeframe: '15m',
-      ohlcv_limit: 60,
-    },
   },
   {
-    id: 'sma_trend',
-    name: 'SMA Trend Rider',
-    tagline: 'Macro trend · 1h candles',
+    id: 'magi_lag_mid',
+    strategy: 'magi_lag_ensemble_mid',
+    name: 'Magi Lag — Mid Frequency',
+    tagline: 'BTC-Alt Lag · 5m · directional_net · recommended',
     description:
-      'Follows sustained macro trends on hourly bars. Very few trades — high conviction, large sizing per signal.',
-    defaultSymbol: 'BTC/USDT',
-    params: {
-      fast_period: 10,
-      slow_period: 30,
-      quote_fraction: 0.10,
-      base_fraction: 0.80,
-      min_trade_interval_sec: 3600,
-      ohlcv_timeframe: '1h',
-      ohlcv_limit: 80,
-    },
+      'Best balance of lag signal quality vs. trade frequency. All four lag voters on 5-minute bars. Recommended starting point for lag-based trading.',
+    defaultSymbol: 'ETH/USDT',
+  },
+  {
+    id: 'magi_lag_low',
+    strategy: 'magi_lag_ensemble_low',
+    name: 'Magi Lag — Low Frequency',
+    tagline: 'BTC-Alt Lag · 15m · directional_net · high conviction',
+    description:
+      'Three high-reliability lag voters on 15-minute bars. Equivalent to 2/3 majority but resistant to all-hold bias. Best for larger budgets.',
+    defaultSymbol: 'ETH/USDT',
   },
 ];
 

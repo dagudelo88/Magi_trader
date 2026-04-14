@@ -40,7 +40,14 @@ load_dotenv(os.path.join(_repo_root, ".env"))
 load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
 # endregion
 
-from database import get_db_connection, record_bot_order, record_bot_decision, fetch_bot_orders_chronological
+from database import (
+    get_db_connection,
+    record_bot_order,
+    record_bot_decision,
+    fetch_bot_orders_chronological,
+    insert_voter_feedback,
+    upsert_ohlcv_candles,
+)
 from trading.app_settings import get_execution_mode, is_global_halt
 from trading.bot_performance import compute_strategy_performance
 from trading.exchange_factory import build_binance_spot, build_binance_public
@@ -65,6 +72,78 @@ def _format_meta(meta: dict) -> str:
         else:
             parts.append(f"{k}={v}")
     return "  ".join(parts) if parts else "(no meta)"
+
+
+def _get_features_snapshot(symbol: str) -> str | None:
+    """
+    Fetch the latest ``features_json`` blob from ``market_ticks`` for
+    ``symbol``.  Returns a JSON string ready for storage, or ``None`` if
+    no recent tick is available.
+
+    Wrapped in a broad try/except — a missing snapshot must never interrupt
+    trade execution or voter feedback logging.
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT features_json FROM market_ticks
+                WHERE target_asset = ?
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (symbol,),
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if row and row["features_json"]:
+            return row["features_json"]
+    except Exception:
+        pass
+    return None
+
+
+def _log_voter_feedback(bot_id: str, symbol: str, result: Any) -> None:
+    """
+    Persist per-voter votes to voter_feedback for MetaMagi training.
+
+    Called only for ensemble strategies
+    (detected via 'voter_signals' in result.meta).
+    forward_roc_* / realized_pnl are filled later by meta_training_loop.
+    Failures are silently swallowed — must never interrupt trade execution.
+    """
+    meta = result.meta if isinstance(result.meta, dict) else {}
+    voter_signals: dict = meta.get("voter_signals") or {}
+    voter_confidences: dict = meta.get("voter_confidences") or {}
+    if not voter_signals:
+        return
+
+    ts = int(time.time() * 1000)
+    consensus_score = meta.get("consensus_score")
+    # Capture the current market microstructure snapshot once per cycle so
+    # all voters in this ensemble share the same feature context.  This is
+    # the primary feature vector MetaMagi uses for future neural-net training.
+    features_snapshot = _get_features_snapshot(symbol)
+
+    for voter_name, voter_signal in voter_signals.items():
+        try:
+            insert_voter_feedback(
+                {
+                    "bot_id": bot_id,
+                    "timestamp": ts,
+                    "target_asset": symbol,
+                    "ensemble_signal": result.signal,
+                    "voter_name": voter_name,
+                    "voter_signal": voter_signal,
+                    "confidence": voter_confidences.get(voter_name),
+                    "consensus_score": consensus_score,
+                    "features_snapshot": features_snapshot,
+                }
+            )
+        except Exception:
+            pass
 
 
 def _idle_log_interval_sec() -> float:
@@ -262,6 +341,10 @@ def _process_bot(
 
     result = strategy.evaluate(ohlcv, params)
 
+    # Log per-voter votes for MetaMagi feedback on every tick (ensemble only).
+    # Must happen before any early return so HOLD ticks are also recorded.
+    _log_voter_feedback(bot_id, symbol, result)
+
     if result.signal == "hold":
         if result.warmup:
             _log(
@@ -312,7 +395,7 @@ def _process_bot(
         f"Wallet before trade: {base_cur}={free_base:.8f}  {quote_cur}={free_quote:.4f}",
     )
 
-    if details.signal == "buy":
+    if result.signal == "buy":
         quote_fraction = float(params["quote_fraction"])
         initial_budget = float(params.get("initial_budget_quote") or 0)
 
@@ -400,7 +483,7 @@ def _process_bot(
                 pass
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
 
-    elif details.signal == "sell":
+    elif result.signal == "sell":
         base_fraction = float(params["base_fraction"])
         initial_budget = float(params.get("initial_budget_quote") or 0)
 
@@ -555,9 +638,13 @@ def _run_one_cycle():
             try:
                 if not public_ex.markets:
                     public_ex.load_markets()
-                ohlcv_cache[cache_key] = public_ex.fetch_ohlcv(
+                candles = public_ex.fetch_ohlcv(
                     symbol, timeframe=timeframe, limit=limit
                 )
+                ohlcv_cache[cache_key] = candles
+                # Persist candles for backtesting replay — failures are
+                # swallowed inside upsert_ohlcv_candles, never blocking trades.
+                upsert_ohlcv_candles(symbol, timeframe, candles)
             except Exception as e:
                 print(f"[bot_runner] pre-fetch OHLCV failed {symbol} {timeframe}: {e}")
                 ohlcv_cache[cache_key] = None  # bot will fall back to its own fetch

@@ -147,6 +147,236 @@ function formatLogLinePlain(log: BotLogRow) {
   return `[${formatLogTime(log.created_at)}] [${log.execution_mode}] [${log.level}] ${log.message}`;
 }
 
+// ── Voter display metadata ──────────────────────────────────────────────────
+
+const VOTER_META: Record<string, { label: string; role: string }> = {
+  macd_rsi:      { label: 'MACD + RSI',     role: 'Momentum' },
+  stochastic:    { label: 'Stochastic',      role: 'Mean-Rev' },
+  cci:           { label: 'CCI',             role: 'Mean-Rev' },
+  bb_breakout:   { label: 'BB Breakout',     role: 'Breakout' },
+  rsi_cross:     { label: 'RSI Cross',       role: 'Mean-Rev' },
+  supertrend:    { label: 'Supertrend',      role: 'Trend' },
+  dual_ema:      { label: 'Dual EMA',        role: 'Trend' },
+  bb_rsi:        { label: 'BB + RSI',        role: 'Mean-Rev' },
+  ema_ribbon:    { label: 'EMA Ribbon',      role: 'Trend' },
+  parabolic_sar: { label: 'Parabolic SAR',   role: 'Trend' },
+  donchian:      { label: 'Donchian',        role: 'Breakout' },
+  tema:          { label: 'TEMA',            role: 'Trend' },
+  sma_cross:     { label: 'SMA Cross',       role: 'Trend' },
+  obv_price:     { label: 'OBV + Price',     role: 'Volume' },
+  price_breakout:{ label: 'Price Breakout',  role: 'Breakout' },
+  // Lag-specialized voters
+  btc_lead_detector:    { label: 'BTC Lead',        role: 'Lag' },
+  roc_divergence:       { label: 'ROC Divergence',  role: 'Lag' },
+  lag_correlation:      { label: 'Lag Correlation', role: 'Lag' },
+  ratio_mean_reversion: { label: 'Ratio MR',        role: 'Lag' },
+};
+
+const ROLE_COLORS: Record<string, string> = {
+  'Trend':    'text-blue-300   border-blue-400/30   bg-blue-500/8',
+  'Mean-Rev': 'text-purple-300 border-purple-400/30 bg-purple-500/8',
+  'Momentum': 'text-magi-primary border-magi-primary/30 bg-magi-primary/8',
+  'Breakout': 'text-green-300  border-green-400/30  bg-green-500/8',
+  'Volume':   'text-cyan-300   border-cyan-400/30   bg-cyan-500/8',
+  'Lag':      'text-yellow-300 border-yellow-400/30 bg-yellow-500/8',
+};
+
+interface EnsembleParams {
+  voters: string[];
+  voterWeights: Record<string, number>;
+  consensusMode: string;
+  consensusThreshold: number;
+}
+
+function parseEnsembleParams(raw: string | null): EnsembleParams | null {
+  if (!raw) return null;
+  try {
+    const p = JSON.parse(raw) as Record<string, unknown>;
+    const voters = Array.isArray(p.voters) ? (p.voters as string[]) : null;
+    if (!voters || voters.length === 0) return null;
+    return {
+      voters,
+      voterWeights: (p.voter_weights as Record<string, number>) ?? {},
+      consensusMode: typeof p.consensus_mode === 'string' ? p.consensus_mode : 'majority',
+      consensusThreshold: typeof p.consensus_threshold === 'number'
+        ? p.consensus_threshold : 0.55,
+    };
+  } catch {
+    return null;
+  }
+}
+
+// Live signal returned by /api/bots/:id/voter-signals
+interface LiveVoterSignal {
+  voter_name: string;
+  voter_signal: 'buy' | 'sell' | 'hold';
+  confidence: number | null;
+  consensus_score: number | null;
+  timestamp: number;
+}
+
+const SIGNAL_STYLES: Record<string, string> = {
+  buy:  'bg-emerald-500/20 border-emerald-400/50 text-emerald-300',
+  sell: 'bg-red-500/20    border-red-400/50    text-red-300',
+  hold: 'bg-magi-grid/10  border-magi-grid/30  text-magi-muted/60',
+};
+
+const SIGNAL_DOT: Record<string, string> = {
+  buy:  'bg-emerald-400 animate-pulse',
+  sell: 'bg-red-400 animate-pulse',
+  hold: 'bg-magi-muted/30',
+};
+
+interface VoterCouncilProps {
+  ensemble: EnsembleParams;
+  liveSignals: LiveVoterSignal[];
+  lastUpdated: number | null;
+}
+
+function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps) {
+  const { voters, voterWeights, consensusMode, consensusThreshold } = ensemble;
+  const maxWeight = Math.max(...voters.map((v) => voterWeights[v] ?? 1.0), 1);
+
+  // Build a quick lookup keyed by voter_name
+  const signalMap = Object.fromEntries(
+    liveSignals.map((s) => [s.voter_name, s])
+  );
+
+  // Derive consensus tally from live signals for the summary bar
+  const tally = { buy: 0, sell: 0, hold: 0 };
+  liveSignals.forEach((s) => {
+    tally[s.voter_signal] = (tally[s.voter_signal] ?? 0) + 1;
+  });
+  const total = liveSignals.length;
+
+  return (
+    <div className="border-b border-magi-grid/15 px-4 py-4">
+      {/* Section header */}
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div className="flex items-center gap-2">
+          <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">
+            Voter Council
+          </span>
+          <span className="font-label text-[9px] font-bold text-magi-primary/70 border border-magi-primary/20 bg-magi-primary/8 px-1.5 py-0.5 rounded">
+            {voters.length} voters
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/40">
+            {consensusMode}
+          </span>
+          <span className="font-mono text-[9px] text-magi-muted/40">
+            ≥{(consensusThreshold * 100).toFixed(0)}%
+          </span>
+        </div>
+      </div>
+
+      {/* Live consensus mini-bar — only when data is present */}
+      {total > 0 && (
+        <div className="mb-3">
+          <div className="flex h-1.5 w-full overflow-hidden rounded-full">
+            {tally.buy > 0 && (
+              <div
+                className="bg-emerald-400 transition-all"
+                style={{ width: `${(tally.buy / total) * 100}%` }}
+              />
+            )}
+            {tally.hold > 0 && (
+              <div
+                className="bg-magi-muted/20 transition-all"
+                style={{ width: `${(tally.hold / total) * 100}%` }}
+              />
+            )}
+            {tally.sell > 0 && (
+              <div
+                className="bg-red-400 transition-all"
+                style={{ width: `${(tally.sell / total) * 100}%` }}
+              />
+            )}
+          </div>
+          <div className="mt-1 flex justify-between font-label text-[8px] text-magi-muted/50">
+            <span className="text-emerald-400/80">{tally.buy}B</span>
+            <span>{tally.hold}H</span>
+            <span className="text-red-400/80">{tally.sell}S</span>
+          </div>
+        </div>
+      )}
+
+      {/* Voter grid — 2-col fits the left sidebar at any breakpoint */}
+      <div className="grid grid-cols-2 gap-1.5">
+        {voters.map((voterId) => {
+          const meta = VOTER_META[voterId] ?? { label: voterId, role: 'Other' };
+          const roleColor = ROLE_COLORS[meta.role] ?? 'text-magi-muted border-magi-grid/30 bg-magi-grid/5';
+          const weight = voterWeights[voterId] ?? 1.0;
+          const weightPct = maxWeight > 0 ? (weight / maxWeight) * 100 : 100;
+          const live = signalMap[voterId];
+          const sig = live?.voter_signal ?? null;
+          const signalStyle = sig ? SIGNAL_STYLES[sig] : null;
+
+          return (
+            <div
+              key={voterId}
+              className={`relative flex flex-col gap-1.5 rounded border px-2.5 py-2 transition-colors ${
+                signalStyle ?? roleColor
+              }`}
+            >
+              {/* Signal dot — top-right corner */}
+              {sig && (
+                <span
+                  className={`absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full ${SIGNAL_DOT[sig]}`}
+                />
+              )}
+
+              {/* Name row */}
+              <div className="flex items-start justify-between gap-1 min-w-0 pr-3">
+                <p className="font-label text-[10px] font-black truncate leading-tight">
+                  {meta.label}
+                </p>
+              </div>
+
+              {/* Signal badge OR role badge */}
+              {sig ? (
+                <span className={`self-start font-label text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded border ${signalStyle}`}>
+                  {sig}
+                  {live.confidence != null && (
+                    <span className="ml-1 opacity-70 font-normal normal-case">
+                      {(live.confidence * 100).toFixed(0)}%
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span className="font-label text-[8px] font-bold uppercase tracking-wide opacity-50">
+                  {meta.role}
+                </span>
+              )}
+
+              {/* Weight bar */}
+              <div className="flex items-center gap-1.5">
+                <div className="flex-1 h-0.5 rounded-full bg-current opacity-20 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-current opacity-80 transition-all"
+                    style={{ width: `${weightPct}%` }}
+                  />
+                </div>
+                <span className="font-mono text-[8px] opacity-50 shrink-0">
+                  {weight.toFixed(1)}×
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Last updated timestamp */}
+      {lastUpdated != null && (
+        <p className="mt-2 font-label text-[8px] text-magi-muted/30 text-right">
+          updated {new Date(lastUpdated).toLocaleTimeString()}
+        </p>
+      )}
+    </div>
+  );
+}
+
 interface PortfolioDistributionProps {
   baseSym: string;
   quoteSym: string;
@@ -399,6 +629,38 @@ export default function BotDetail() {
     };
   }, [bot?.strategy_params_json]);
 
+  const isEnsemble =
+    (bot?.strategy?.startsWith('magi_ensemble') ||
+     bot?.strategy?.startsWith('magi_lag_ensemble')) ?? false;
+  const ensembleParams = useMemo(
+    () => (isEnsemble ? parseEnsembleParams(bot?.strategy_params_json ?? null) : null),
+    [isEnsemble, bot?.strategy_params_json],
+  );
+
+  // ── Live voter signals (polled independently from the main bot refresh) ──
+  const [liveVoterSignals, setLiveVoterSignals] = useState<LiveVoterSignal[]>([]);
+  const [voterSignalsUpdatedAt, setVoterSignalsUpdatedAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!id || !isEnsemble) return;
+
+    const fetchVoterSignals = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/bots/${id}/voter-signals`);
+        if (!res.ok) return;
+        const data = (await res.json()) as { voter_signals: LiveVoterSignal[] };
+        setLiveVoterSignals(data.voter_signals ?? []);
+        setVoterSignalsUpdatedAt(Date.now());
+      } catch {
+        // Non-fatal — cards degrade gracefully to static display
+      }
+    };
+
+    void fetchVoterSignals();
+    const timer = setInterval(() => void fetchVoterSignals(), 15_000);
+    return () => clearInterval(timer);
+  }, [id, isEnsemble]);
+
   const forkNewBotInstance = async () => {
     if (!id) return;
     const msg =
@@ -525,7 +787,18 @@ export default function BotDetail() {
   const botExecMode = bot?.execution_mode ?? executionMode ?? 'testnet';
   const liveLabel =
     botExecMode === 'live' ? 'LIVE TRADING' : botExecMode === 'testnet' ? 'TESTNET' : 'OFFLINE';
-  const strategyTag = bot?.strategy?.toUpperCase().replace(/-/g, '_') ?? '—';
+  const strategyTag = (() => {
+    const s = bot?.strategy ?? '';
+    if (s.startsWith('magi_lag_ensemble_')) {
+      const freq = s.replace('magi_lag_ensemble_', '').toUpperCase();
+      return `MAGI LAG · ${freq}`;
+    }
+    if (s.startsWith('magi_ensemble_')) {
+      const freq = s.replace('magi_ensemble_', '').toUpperCase();
+      return `MAGI · ${freq}`;
+    }
+    return s.toUpperCase().replace(/-/g, '_') || '—';
+  })();
   const qc = strategyHealth?.quote_currency ?? 'USDT';
   const winRateLabel =
     strategyHealth?.win_rate_pct != null ? `${strategyHealth.win_rate_pct}%` : '—';
@@ -542,15 +815,20 @@ export default function BotDetail() {
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-magi-bg text-magi-on-bg">
       <main className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden lg:grid-cols-12">
 
-        {/* ── LEFT COLUMN ───────────────────────────────────── */}
-        <div className="col-span-1 flex min-h-0 min-w-0 flex-col overflow-y-auto overflow-x-hidden border-r border-magi-grid/15 lg:col-span-8">
+        {/* ── LEFT SIDEBAR: Strategy / Voter config ─────────── */}
+        <div className="col-span-1 flex min-h-0 flex-col overflow-y-auto border-b border-magi-grid/15 bg-magi-container-low/30 lg:col-span-3 lg:border-b-0 lg:border-r">
 
-          {/* Compact header */}
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-magi-grid/30 px-4 py-3 sm:px-6">
-            <div className="flex min-w-0 flex-wrap items-center gap-3">
-              <h1 className="font-headline text-2xl font-black uppercase italic leading-none tracking-tighter text-magi-primary phosphor-amber sm:text-3xl">
+          {/* Bot identity strip */}
+          <div className="flex flex-col gap-1 border-b border-magi-grid/20 px-4 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h1 className="font-headline text-xl font-black uppercase italic leading-none tracking-tighter text-magi-primary phosphor-amber">
                 {symbolHeadline(bot?.symbol)}
               </h1>
+              <p className="font-headline text-base font-bold tracking-tight text-magi-on-bg">
+                {(bot?.status ?? '—').toUpperCase()}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
               <span
                 className={`font-label inline-flex items-center border px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
                   botExecMode === 'live'
@@ -568,21 +846,112 @@ export default function BotDetail() {
                 {liveLabel}
               </span>
               <span className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">
-                {strategyTag} · {bot?.name ?? '…'}
+                {strategyTag}
               </span>
             </div>
-            <p className="font-headline text-xl font-bold tracking-tight text-magi-on-bg sm:text-2xl">
-              {(bot?.status ?? '—').toUpperCase()}
-            </p>
+            {bot?.name && (
+              <p className="font-label text-[10px] text-magi-muted/40 truncate">{bot.name}</p>
+            )}
           </div>
 
           {error && (
-            <div className="mx-4 mt-3 border border-red-500/50 bg-red-950/20 p-3 text-sm text-red-300 sm:mx-6">
+            <div className="mx-3 mt-3 border border-red-500/50 bg-red-950/20 p-3 text-xs text-red-300">
               {error}
             </div>
           )}
 
-          {/* Chart — flush, full width of left column */}
+          {/* Voter Council (ensemble) or strategy params label (non-ensemble) */}
+          {ensembleParams ? (
+            <VoterCouncil
+              ensemble={ensembleParams}
+              liveSignals={liveVoterSignals}
+              lastUpdated={voterSignalsUpdatedAt}
+            />
+          ) : (
+            <div className="border-b border-magi-grid/15 px-4 py-3">
+              <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/40 mb-1">
+                Strategy
+              </p>
+              <p className="font-label text-[11px] font-bold text-magi-on-bg/80">
+                {bot?.strategy?.toUpperCase().replace(/_/g, ' ') ?? '—'}
+              </p>
+            </div>
+          )}
+
+          {/* Capital & Budget */}
+          <details className="border-b border-magi-grid/20 open:border-magi-primary/20" open>
+            <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/80 hover:text-magi-primary">
+              Capital &amp; New Instance
+            </summary>
+            <div className="border-t border-magi-grid/20 px-4 py-4 flex flex-col gap-4">
+              <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
+                <label className="flex flex-col gap-1.5 uppercase tracking-wider">
+                  <span className="text-magi-muted/50">Initial budget ({qc})</span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="e.g. 1000"
+                    value={budgetDraft}
+                    onChange={(e) => setBudgetDraft(e.target.value)}
+                    className="rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-base text-magi-on-bg focus:border-magi-primary/50 focus:outline-none"
+                  />
+                </label>
+                <button
+                  type="button"
+                  disabled={budgetBusy}
+                  onClick={() => void saveInitialBudget()}
+                  className="rounded border border-magi-primary/40 bg-magi-primary/15 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/25 disabled:opacity-40"
+                >
+                  {budgetBusy ? '…' : 'Save budget'}
+                </button>
+              </div>
+              <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
+                <label className="flex flex-col gap-1.5 uppercase tracking-wider">
+                  <span className="text-magi-muted/50">New instance name</span>
+                  <input
+                    type="text"
+                    placeholder={`${bot?.name ?? 'Bot'} (copy)`}
+                    value={forkNameDraft}
+                    onChange={(e) => setForkNameDraft(e.target.value)}
+                    className="rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-base text-magi-on-bg focus:border-magi-primary/50 focus:outline-none"
+                  />
+                </label>
+                <label className="flex cursor-pointer items-start gap-2 text-[10px] uppercase leading-snug tracking-wide text-magi-muted/70">
+                  <input
+                    type="checkbox"
+                    checked={forkApplyBudget}
+                    onChange={(e) => setForkApplyBudget(e.target.checked)}
+                    className="mt-0.5 border-magi-grid/40"
+                  />
+                  <span>Apply budget on fork</span>
+                </label>
+                <button
+                  type="button"
+                  disabled={forkBusy}
+                  onClick={() => void forkNewBotInstance()}
+                  className="rounded border border-magi-tertiary/50 bg-magi-tertiary/15 px-3 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-tertiary hover:bg-magi-tertiary/25 disabled:opacity-40"
+                >
+                  {forkBusy ? '…' : 'New instance →'}
+                </button>
+              </div>
+            </div>
+          </details>
+
+          {/* Strategy Params raw */}
+          <details className="border-b border-magi-grid/20 open:border-magi-primary/20">
+            <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/60 hover:text-magi-primary">
+              Strategy Params (raw)
+            </summary>
+            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all border-t border-magi-grid/20 p-4 font-mono text-[10px] text-magi-on-bg/80">
+              {formatParamsJson(bot?.strategy_params_json ?? null)}
+            </pre>
+          </details>
+        </div>
+
+        {/* ── CENTER: Chart + Stats + Execution history ─────── */}
+        <div className="col-span-1 flex min-h-0 min-w-0 flex-col overflow-y-auto overflow-x-hidden border-r border-magi-grid/15 lg:col-span-6">
+
+          {/* Chart — flush, full width of center column */}
           {bot?.symbol ? (
             <BotTacticalChart
               symbol={bot.symbol}
@@ -651,6 +1020,7 @@ export default function BotDetail() {
             />
           )}
 
+          {/* Stats grid */}
           <div className="grid grid-cols-2 gap-px border-b border-magi-grid/15 bg-magi-grid/10 sm:grid-cols-4">
             <div className="flex flex-col gap-1 bg-magi-container-low px-4 py-3">
               <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">Fills</p>
@@ -721,7 +1091,7 @@ export default function BotDetail() {
               </span>
             </div>
             <div className="max-h-[280px] overflow-auto">
-              <table className="w-full min-w-[42rem] text-left font-label text-[10px] sm:text-[11px]">
+              <table className="w-full min-w-[36rem] text-left font-label text-[10px] sm:text-[11px]">
                 <thead className="sticky top-0 border-b border-magi-grid/10 bg-magi-bg uppercase text-magi-muted/40">
                   <tr>
                     <th className="py-2 pr-3 font-normal">Timestamp</th>
@@ -749,8 +1119,6 @@ export default function BotDetail() {
                         ? o.cost / o.filled
                         : null;
 
-                    // For BUY: spent = cost (USDT), received = filled (BTC)
-                    // For SELL: spent = filled (BTC), received = cost (USDT)
                     const baseSym = o.symbol?.split('/')[0] ?? 'BASE';
                     const quoteSym = o.symbol?.split('/')[1] ?? 'QUOTE';
 
@@ -784,82 +1152,10 @@ export default function BotDetail() {
               </table>
             </div>
           </div>
-
-          {/* Collapsible utility panels */}
-          <div className="flex flex-col gap-2 px-4 py-3 sm:px-6 sm:py-4">
-            <details className="border border-magi-grid/20 bg-magi-container-low open:border-magi-primary/20">
-              <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/80 hover:text-magi-primary">
-                Capital &amp; New Instance
-              </summary>
-              <div className="border-t border-magi-grid/20 px-4 py-4">
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                  <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
-                    <label className="flex flex-col gap-1.5 uppercase tracking-wider">
-                      <span className="text-magi-muted/50">Initial budget ({qc})</span>
-                      <input
-                        type="text"
-                        inputMode="decimal"
-                        placeholder="e.g. 1000"
-                        value={budgetDraft}
-                        onChange={(e) => setBudgetDraft(e.target.value)}
-                        className="rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-base text-magi-on-bg focus:border-magi-primary/50 focus:outline-none"
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      disabled={budgetBusy}
-                      onClick={() => void saveInitialBudget()}
-                      className="rounded border border-magi-primary/40 bg-magi-primary/15 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/25 disabled:opacity-40"
-                    >
-                      {budgetBusy ? '…' : 'Save budget'}
-                    </button>
-                  </div>
-                  <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
-                    <label className="flex flex-col gap-1.5 uppercase tracking-wider">
-                      <span className="text-magi-muted/50">New instance name (optional)</span>
-                      <input
-                        type="text"
-                        placeholder={`Default: ${bot?.name ?? 'Bot'} (copy)`}
-                        value={forkNameDraft}
-                        onChange={(e) => setForkNameDraft(e.target.value)}
-                        className="rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-base text-magi-on-bg focus:border-magi-primary/50 focus:outline-none"
-                      />
-                    </label>
-                    <label className="flex cursor-pointer items-start gap-2 text-[10px] uppercase leading-snug tracking-wide text-magi-muted/70">
-                      <input
-                        type="checkbox"
-                        checked={forkApplyBudget}
-                        onChange={(e) => setForkApplyBudget(e.target.checked)}
-                        className="mt-0.5 border-magi-grid/40"
-                      />
-                      <span>Apply budget from field above on fork</span>
-                    </label>
-                    <button
-                      type="button"
-                      disabled={forkBusy}
-                      onClick={() => void forkNewBotInstance()}
-                      className="rounded border border-magi-tertiary/50 bg-magi-tertiary/15 px-3 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-tertiary hover:bg-magi-tertiary/25 disabled:opacity-40"
-                    >
-                      {forkBusy ? '…' : 'New bot instance (keep this history)'}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </details>
-
-            <details className="border border-magi-grid/20 bg-magi-container-low open:border-magi-primary/20">
-              <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/60 hover:text-magi-primary">
-                Strategy Params (raw)
-              </summary>
-              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all border-t border-magi-grid/20 p-4 font-mono text-[10px] text-magi-on-bg/80">
-                {formatParamsJson(bot?.strategy_params_json ?? null)}
-              </pre>
-            </details>
-          </div>
         </div>
 
         {/* ── RIGHT COLUMN (log) ────────────────────────────── */}
-        <aside className="col-span-1 flex min-h-[240px] min-w-0 flex-col overflow-hidden border-t border-magi-grid/20 bg-magi-container-low sm:min-h-[280px] lg:col-span-4 lg:min-h-0 lg:border-t-0">
+        <aside className="col-span-1 flex min-h-[240px] min-w-0 flex-col overflow-hidden border-t border-magi-grid/20 bg-magi-container-low sm:min-h-[280px] lg:col-span-3 lg:min-h-0 lg:border-t-0">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-magi-grid/20 bg-magi-surface-dim px-3 py-2">
             <span className="font-label flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-magi-tertiary">
               <span
