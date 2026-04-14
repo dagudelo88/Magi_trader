@@ -408,17 +408,20 @@ def _process_bot(
                      f"BUY skipped — budget exhausted "
                      f"({remaining_budget:.4f} {quote_cur} remaining < exchange min {min_cost} {quote_cur})")
                 return
-            # Ideal spend = fraction of remaining budget, capped by available funds
+            # Ideal spend = fraction of remaining budget, capped by available funds.
+            # Use 2% buffer on the minimum so price slippage between snapshot and fill
+            # can't push the executed notional below the exchange minimum.
+            min_spend = min_cost * 1.02 if min_cost > 0 else 0.0
             spend = min(quote_fraction * remaining_budget, remaining_budget, free_quote)
-            # If ideal spend falls below exchange minimum, bump up to minimum (budget permitting)
-            if spend < min_cost:
-                spend = min_cost
+            if spend < min_spend:
+                spend = min_spend
             _log(bot_id, "info", execution_mode,
                  f"Budget: {remaining_budget:.4f} {quote_cur} remaining of {initial_budget:.2f} {quote_cur} budget")
         else:
             # No budget configured — use exchange wallet as fallback
+            min_spend = min_cost * 1.02 if min_cost > 0 else 0.0
             spend = free_quote * quote_fraction
-            if spend < min_cost:
+            if spend < min_spend:
                 _log(bot_id, "warn", execution_mode,
                      f"BUY skipped — spend {spend:.4f} {quote_cur} below exchange minimum {min_cost} {quote_cur}")
                 return
@@ -433,9 +436,10 @@ def _process_bot(
         qty_raw = spend / last_close
         qty_prec = float(ex.amount_to_precision(symbol, qty_raw))
 
-        # If lot-size rounding dropped the notional below min_cost, ceiling-round
-        # the quantity up to the next valid lot step so the fill always meets the minimum.
-        if min_cost > 0 and qty_prec * last_close < min_cost:
+        # If lot-size rounding dropped the notional below the buffered minimum,
+        # ceiling-round the quantity up to the next valid lot step.
+        _min_notional = (min_cost * 1.02) if min_cost > 0 else 0.0
+        if _min_notional > 0 and qty_prec * last_close < _min_notional:
             try:
                 prec_val = market.get("precision", {}).get("amount")
                 if prec_val is not None:
@@ -446,7 +450,7 @@ def _process_bot(
                     if pv > 0:
                         step = pv if pv < 1 else 10.0 ** (-int(pv))
                         p = max(0, round(-math.log10(step)))
-                        min_qty = min_cost / last_close
+                        min_qty = _min_notional / last_close
                         qty_prec = round(math.ceil(round(min_qty / step, 9)) * step, p)
             except Exception:
                 pass  # best-effort; proceed with rounded-down qty
@@ -506,23 +510,26 @@ def _process_bot(
                  f"SELL skipped — amount {sell_amt:.8f} {base_cur} below exchange minimum {min_amt}")
             return
 
-        # Minimum notional (quote value) check — same filter Binance enforces.
-        # If the fractional sell is too small, try selling the full position instead.
-        # Only skip entirely when even the full position is below minimum notional.
+        # Minimum notional check — mirrors the BUY side: bump up to the minimum
+        # rather than failing. Only skip if the entire available position is too
+        # small (truly stuck; shouldn't happen with a correctly sized budget).
         if min_cost > 0 and last_close > 0:
             notional = sell_amt * last_close
             if notional < min_cost:
-                full_position = open_base if initial_budget > 0 else free_base
-                full_notional = full_position * last_close
-                if full_notional >= min_cost:
-                    sell_amt = min(full_position, free_base)
+                # Bump sell_amt up to exactly the minimum notional, capped by position.
+                min_sell_amt = min_cost / last_close
+                available = open_base if initial_budget > 0 else free_base
+                if min_sell_amt <= available:
                     _log(bot_id, "info", execution_mode,
-                         f"SELL: fractional notional {notional:.4f} {quote_cur} < min {min_cost} "
-                         f"— selling full position {sell_amt:.8f} {base_cur} instead")
+                         f"SELL: fractional notional {notional:.4f} {quote_cur} < min {min_cost}"
+                         f" — bumping to minimum ({min_sell_amt:.8f} {base_cur})")
+                    sell_amt = min_sell_amt
                 else:
+                    # Entire position is below minimum — nothing we can do.
+                    full_notional = available * last_close
                     _log(bot_id, "warn", execution_mode,
-                         f"SELL skipped — position notional {full_notional:.4f} {quote_cur} "
-                         f"below exchange minimum {min_cost} {quote_cur}")
+                         f"SELL skipped — full position notional {full_notional:.4f} {quote_cur}"
+                         f" below exchange minimum {min_cost} {quote_cur}")
                     return
 
         sell_prec = ex.amount_to_precision(symbol, sell_amt)
@@ -530,9 +537,19 @@ def _process_bot(
             _log(bot_id, "warn", execution_mode,
                  f"SELL skipped — rounded amount is zero (raw {sell_amt:.8f} {base_cur})")
             return
+
+        # Final notional guard after precision rounding — rounding can push the
+        # amount slightly below minimum. Add 1% buffer for price slippage.
+        final_notional = float(sell_prec) * last_close
+        if min_cost > 0 and final_notional < min_cost * 0.99:
+            _log(bot_id, "warn", execution_mode,
+                 f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
+                 f" below exchange minimum {min_cost} {quote_cur}")
+            return
+
         _log(bot_id, "info", execution_mode,
              f"SELL order: selling {sell_prec} {base_cur} "
-             f"(notional ~{float(sell_prec) * last_close:.4f} {quote_cur}) @ ~{last_close:.2f}")
+             f"(notional ~{final_notional:.4f} {quote_cur}) @ ~{last_close:.2f}")
         try:
             order = ex.create_order(symbol, "market", "sell", float(sell_prec))
             _last_trade_monotonic[bot_id] = time.monotonic()
@@ -569,7 +586,11 @@ def _build_exchanges_for_bots(bots: list[dict[str, Any]]) -> dict[str, Any]:
         if mode in exchanges:
             continue
         try:
-            exchanges[mode] = build_binance_spot(mode)
+            ex = build_binance_spot(mode)
+            # ccxt timeout is in milliseconds.  15 s is generous for testnet
+            # but still short enough that a dead connection unblocks quickly.
+            ex.timeout = 15_000
+            exchanges[mode] = ex
         except ValueError as e:
             print(f"[bot_runner] Exchange config error for mode={mode}: {e}")
     return exchanges
@@ -578,10 +599,23 @@ def _build_exchanges_for_bots(bots: list[dict[str, Any]]) -> dict[str, Any]:
 async def run_async():
     """Async entry-point embedded as an asyncio task in uvicorn's lifespan."""
     import asyncio
+    loop = asyncio.get_event_loop()
     print("Bot runner started — polling for running bots.")
     while True:
         try:
-            _run_one_cycle()
+            # Run the synchronous cycle in a thread-pool executor so ccxt's
+            # blocking HTTP calls never freeze the asyncio event loop.
+            # A 120 s hard cap ensures a completely stuck cycle doesn't prevent
+            # the next one from starting.
+            await asyncio.wait_for(
+                loop.run_in_executor(None, _run_one_cycle),
+                timeout=120.0,
+            )
+        except asyncio.TimeoutError:
+            print(
+                "[bot_runner] Full cycle exceeded 120 s wall time — "
+                "skipping to next poll."
+            )
         except Exception:
             pass
         await asyncio.sleep(POLL_SEC)
@@ -638,6 +672,9 @@ def _run_one_cycle():
             try:
                 if not public_ex.markets:
                     public_ex.load_markets()
+                # Hard timeout on the network call so one slow exchange response
+                # can't hold up the entire pre-fetch loop.
+                public_ex.timeout = 15_000  # milliseconds (ccxt option)
                 candles = public_ex.fetch_ohlcv(
                     symbol, timeframe=timeframe, limit=limit
                 )
@@ -667,14 +704,32 @@ def _run_one_cycle():
         except Exception:
             _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
 
+    # Per-cycle hard deadline: a single stuck Binance TCP connection must not
+    # freeze the entire runner.  Each bot gets up to 60 s; the whole batch is
+    # capped at 90 s regardless of how many bots are running.
+    _CYCLE_TIMEOUT_SEC = 90
+
     max_workers = min(len(bots), 32)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(_run_bot, bot): bot["bot_id"] for bot in bots}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                future.result()
-            except Exception:
-                pass
+        try:
+            for future in concurrent.futures.as_completed(
+                futures, timeout=_CYCLE_TIMEOUT_SEC
+            ):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+        except concurrent.futures.TimeoutError:
+            bot_ids = ", ".join(
+                bid for f, bid in futures.items() if not f.done()
+            )
+            print(
+                f"[bot_runner] Cycle timed out after {_CYCLE_TIMEOUT_SEC}s — "
+                f"cancelling hung bots: {bot_ids}"
+            )
+            for future in futures:
+                future.cancel()
 
 
 def main():

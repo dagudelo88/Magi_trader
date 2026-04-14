@@ -95,12 +95,12 @@ export default function BotsList() {
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
-  const load = async () => {
+  const load = async (signal?: AbortSignal) => {
     try {
       const [botsRes, settingsRes, strategiesRes] = await Promise.all([
-        fetch(`${API_BASE}/api/bots`),
-        fetch(`${API_BASE}/api/settings/trading`),
-        fetch(`${API_BASE}/api/strategies`),
+        fetch(`${API_BASE}/api/bots`, { signal }),
+        fetch(`${API_BASE}/api/settings/trading`, { signal }),
+        fetch(`${API_BASE}/api/strategies`, { signal }),
       ]);
       if (!botsRes.ok) throw new Error('Failed to load bots');
       const b = await botsRes.json();
@@ -118,11 +118,33 @@ export default function BotsList() {
         setStrategyDefaults(defaults);
       }
     } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') return;
       setError(e instanceof Error ? e.message : 'Failed to load');
     }
   };
 
-  useEffect(() => { void load(); }, []);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 10_000);
+    void load(ctrl.signal).then(() => clearTimeout(t));
+
+    // Refresh bot statuses every 15 s; strategy defaults only need one load
+    const pollCtrl = { current: new AbortController() };
+    const id = setInterval(() => {
+      pollCtrl.current = new AbortController();
+      const pt = setTimeout(() => pollCtrl.current.abort(), 10_000);
+      fetch(`${API_BASE}/api/bots`, { signal: pollCtrl.current.signal })
+        .then((r) => r.json())
+        .then((d: { bots?: BotRow[] }) => { clearTimeout(pt); setBots(d.bots ?? []); })
+        .catch(() => clearTimeout(pt));
+    }, 15_000);
+
+    return () => {
+      ctrl.abort();
+      pollCtrl.current.abort();
+      clearInterval(id);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Focus budget field when configure step opens
   useEffect(() => {

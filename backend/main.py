@@ -204,6 +204,13 @@ def get_wallet_balances(
         )
     effective = view if view in ("testnet", "live") else bot_mode
 
+    # Serve from cache if fresh enough — avoids blocking the thread pool on
+    # every page load / navigation when the UI polls rapidly.
+    _now = time.time()
+    cached_wallet = _wallet_cache.get(effective)
+    if cached_wallet and _now - cached_wallet[1] < _WALLET_TTL_SEC:
+        return cached_wallet[0]
+
     try:
         exchange = build_binance_spot(effective)
         balance = exchange.fetch_balance()
@@ -241,14 +248,20 @@ def get_wallet_balances(
             return (2, a)
 
         non_zero_balances.sort(key=_balance_sort_key)
-        return {
+        payload = {
             "balances": non_zero_balances,
             "wallet_view": effective,
             "execution_mode": bot_mode,
         }
+        _wallet_cache[effective] = (payload, _now)
+        return payload
     except HTTPException:
         raise
     except Exception as e:
+        # On error, return stale cache if available rather than a 502 that
+        # blanks the entire Dashboard.
+        if cached_wallet:
+            return cached_wallet[0]
         raise HTTPException(
             status_code=502,
             detail=explain_fetch_balance_error(e, effective),
@@ -544,6 +557,21 @@ def put_bot_execution_mode(bot_id: str, body: BotExecutionModeBody):
     return {"bot": bot}
 
 
+# TTL caches to rate-limit expensive exchange calls in GET /api/bots/{id}.
+# Each bot gets one mark-price fetch and one order-sync per TTL window.
+# This prevents the 4-second UI poll from hammering Binance and blocking
+# the FastAPI thread pool while the bot runner is also active.
+_mark_price_cache: dict[str, tuple[float, float]] = {}   # bot_id → (price, ts)
+_order_sync_cache: dict[str, float] = {}                 # bot_id → last_sync_ts
+_MARK_PRICE_TTL_SEC = 15.0
+_ORDER_SYNC_TTL_SEC = 60.0
+
+# Wallet balance is expensive (live Binance call). Cache per network view so
+# rapid UI re-loads (page switches, polling) reuse the last known balance.
+_wallet_cache: dict[str, tuple[dict, float]] = {}   # view → (payload, ts)
+_WALLET_TTL_SEC = 30.0
+
+
 @app.get("/api/bots/{bot_id}")
 def get_bot(bot_id: str):
     conn = get_db_connection()
@@ -566,14 +594,25 @@ def get_bot(bot_id: str):
         # Use the bot's own execution_mode, not the global setting
         bot_mode = str(bot_row.get("execution_mode") or "testnet")
         sync_bot_orders_from_logs(bot_id, sym)
-        try:
-            refresh_stale_bot_orders_from_exchange(bot_id, build_binance_spot(bot_mode))
-        except Exception:
-            pass
+
+        # Rate-limit the exchange order-sync: at most once per TTL window.
+        now = time.time()
+        if now - _order_sync_cache.get(bot_id, 0.0) >= _ORDER_SYNC_TTL_SEC:
+            try:
+                refresh_stale_bot_orders_from_exchange(bot_id, build_binance_spot(bot_mode))
+                _order_sync_cache[bot_id] = now
+            except Exception:
+                pass
+
         order_stats, orders = fetch_bot_orders_panel(bot_id, order_limit=50)
         orders_asc = fetch_bot_orders_chronological(bot_id)
+
+        # Rate-limit the mark-price fetch: reuse cached value within TTL.
         mark_price: float | None = None
-        if sym:
+        cached = _mark_price_cache.get(bot_id)
+        if cached and now - cached[1] < _MARK_PRICE_TTL_SEC:
+            mark_price = cached[0]
+        elif sym:
             try:
                 ex = build_binance_spot(bot_mode)
                 if not ex.markets:
@@ -582,8 +621,9 @@ def get_bot(bot_id: str):
                 lp = tk.get("last")
                 if lp is not None:
                     mark_price = float(lp)
+                    _mark_price_cache[bot_id] = (mark_price, now)
             except Exception:
-                mark_price = None
+                mark_price = cached[0] if cached else None
         perf = compute_strategy_performance(orders_asc, sym, mark_price=mark_price)
         total_pnl = perf["realized_pnl_quote"] + (perf["unrealized_pnl_quote"] or 0.0)
         raw_params = bot_row.get("strategy_params_json")

@@ -197,9 +197,9 @@ function parseEnsembleParams(raw: string | null): EnsembleParams | null {
     return {
       voters,
       voterWeights: (p.voter_weights as Record<string, number>) ?? {},
-      consensusMode: typeof p.consensus_mode === 'string' ? p.consensus_mode : 'majority',
+      consensusMode: typeof p.consensus_mode === 'string' ? p.consensus_mode : 'directional_net',
       consensusThreshold: typeof p.consensus_threshold === 'number'
-        ? p.consensus_threshold : 0.55,
+        ? p.consensus_threshold : 0.15,
     };
   } catch {
     return null;
@@ -236,18 +236,31 @@ interface VoterCouncilProps {
 function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps) {
   const { voters, voterWeights, consensusMode, consensusThreshold } = ensemble;
   const maxWeight = Math.max(...voters.map((v) => voterWeights[v] ?? 1.0), 1);
+  const isDirectionalNet = consensusMode === 'directional_net';
 
-  // Build a quick lookup keyed by voter_name
-  const signalMap = Object.fromEntries(
-    liveSignals.map((s) => [s.voter_name, s])
-  );
+  const signalMap = Object.fromEntries(liveSignals.map((s) => [s.voter_name, s]));
+  const hasLiveData = liveSignals.length > 0;
 
-  // Derive consensus tally from live signals for the summary bar
-  const tally = { buy: 0, sell: 0, hold: 0 };
-  liveSignals.forEach((s) => {
-    tally[s.voter_signal] = (tally[s.voter_signal] ?? 0) + 1;
+  // Compute weighted buy/sell/hold totals from live signals
+  const weightedTotals = { buy: 0, sell: 0, hold: 0 };
+  voters.forEach((v) => {
+    const sig = signalMap[v]?.voter_signal;
+    if (sig) weightedTotals[sig] += (voterWeights[v] ?? 1.0);
   });
-  const total = liveSignals.length;
+  const totalWeight = weightedTotals.buy + weightedTotals.sell + weightedTotals.hold;
+
+  // directional_net: net = (buy_w - sell_w) / total_w
+  const net = totalWeight > 0 ? (weightedTotals.buy - weightedTotals.sell) / totalWeight : 0;
+  const consensusSignal: 'buy' | 'sell' | 'hold' = isDirectionalNet
+    ? net > consensusThreshold ? 'buy' : net < -consensusThreshold ? 'sell' : 'hold'
+    : weightedTotals.buy >= weightedTotals.sell && weightedTotals.buy / totalWeight >= consensusThreshold
+      ? 'buy'
+      : weightedTotals.sell / totalWeight >= consensusThreshold ? 'sell' : 'hold';
+
+  // Threshold label is mode-specific
+  const thresholdLabel = isDirectionalNet
+    ? `net>${(consensusThreshold * 100).toFixed(0)}%`
+    : `≥${(consensusThreshold * 100).toFixed(0)}%`;
 
   return (
     <div className="border-b border-magi-grid/15 px-4 py-4">
@@ -266,43 +279,91 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
             {consensusMode}
           </span>
           <span className="font-mono text-[9px] text-magi-muted/40">
-            ≥{(consensusThreshold * 100).toFixed(0)}%
+            {thresholdLabel}
           </span>
         </div>
       </div>
 
-      {/* Live consensus mini-bar — only when data is present */}
-      {total > 0 && (
+      {/* Consensus visualisation */}
+      {hasLiveData && (
         <div className="mb-3">
-          <div className="flex h-1.5 w-full overflow-hidden rounded-full">
-            {tally.buy > 0 && (
-              <div
-                className="bg-emerald-400 transition-all"
-                style={{ width: `${(tally.buy / total) * 100}%` }}
-              />
-            )}
-            {tally.hold > 0 && (
-              <div
-                className="bg-magi-muted/20 transition-all"
-                style={{ width: `${(tally.hold / total) * 100}%` }}
-              />
-            )}
-            {tally.sell > 0 && (
-              <div
-                className="bg-red-400 transition-all"
-                style={{ width: `${(tally.sell / total) * 100}%` }}
-              />
-            )}
-          </div>
-          <div className="mt-1 flex justify-between font-label text-[8px] text-magi-muted/50">
-            <span className="text-emerald-400/80">{tally.buy}B</span>
-            <span>{tally.hold}H</span>
-            <span className="text-red-400/80">{tally.sell}S</span>
-          </div>
+          {isDirectionalNet ? (
+            // directional_net: centered bar showing (buy_w - sell_w) / total_w
+            // Center = 0, left = sell pressure, right = buy pressure
+            <div>
+              <div className="relative h-2 w-full rounded-full bg-magi-grid/20 overflow-hidden">
+                {/* center baseline */}
+                <div className="absolute inset-y-0 left-1/2 w-px bg-magi-grid/60" />
+                {/* threshold markers */}
+                <div
+                  className="absolute inset-y-0 w-px bg-magi-primary/30"
+                  style={{ left: `${(0.5 + consensusThreshold / 2) * 100}%` }}
+                />
+                <div
+                  className="absolute inset-y-0 w-px bg-magi-primary/30"
+                  style={{ left: `${(0.5 - consensusThreshold / 2) * 100}%` }}
+                />
+                {/* net bar */}
+                {net > 0 ? (
+                  <div
+                    className="absolute inset-y-0 bg-emerald-400/80 transition-all"
+                    style={{ left: '50%', width: `${Math.min(Math.abs(net) / 2, 0.5) * 100}%` }}
+                  />
+                ) : net < 0 ? (
+                  <div
+                    className="absolute inset-y-0 bg-red-400/80 transition-all"
+                    style={{ right: '50%', width: `${Math.min(Math.abs(net) / 2, 0.5) * 100}%` }}
+                  />
+                ) : null}
+              </div>
+              <div className="mt-1 flex items-center justify-between font-label text-[8px] text-magi-muted/50">
+                <span className="text-red-400/80">SELL</span>
+                <span className={`font-black ${
+                  consensusSignal === 'buy' ? 'text-emerald-400' :
+                  consensusSignal === 'sell' ? 'text-red-400' : 'text-magi-muted/60'
+                }`}>
+                  net {net >= 0 ? '+' : ''}{(net * 100).toFixed(1)}% → {consensusSignal.toUpperCase()}
+                </span>
+                <span className="text-emerald-400/80">BUY</span>
+              </div>
+            </div>
+          ) : (
+            // Classic modes: show raw vote share bar
+            <div>
+              <div className="flex h-1.5 w-full overflow-hidden rounded-full">
+                {weightedTotals.buy > 0 && (
+                  <div className="bg-emerald-400 transition-all"
+                    style={{ width: `${(weightedTotals.buy / totalWeight) * 100}%` }} />
+                )}
+                {weightedTotals.hold > 0 && (
+                  <div className="bg-magi-muted/20 transition-all"
+                    style={{ width: `${(weightedTotals.hold / totalWeight) * 100}%` }} />
+                )}
+                {weightedTotals.sell > 0 && (
+                  <div className="bg-red-400 transition-all"
+                    style={{ width: `${(weightedTotals.sell / totalWeight) * 100}%` }} />
+                )}
+              </div>
+              <div className="mt-1 flex justify-between font-label text-[8px] text-magi-muted/50">
+                <span className="text-emerald-400/80">
+                  B {totalWeight > 0 ? ((weightedTotals.buy / totalWeight) * 100).toFixed(0) : 0}%
+                </span>
+                <span className={`font-black ${
+                  consensusSignal === 'buy' ? 'text-emerald-400' :
+                  consensusSignal === 'sell' ? 'text-red-400' : 'text-magi-muted/60'
+                }`}>
+                  {consensusSignal.toUpperCase()}
+                </span>
+                <span className="text-red-400/80">
+                  S {totalWeight > 0 ? ((weightedTotals.sell / totalWeight) * 100).toFixed(0) : 0}%
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {/* Voter grid — 2-col fits the left sidebar at any breakpoint */}
+      {/* Voter grid */}
       <div className="grid grid-cols-2 gap-1.5">
         {voters.map((voterId) => {
           const meta = VOTER_META[voterId] ?? { label: voterId, role: 'Other' };
@@ -320,21 +381,14 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
                 signalStyle ?? roleColor
               }`}
             >
-              {/* Signal dot — top-right corner */}
               {sig && (
-                <span
-                  className={`absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full ${SIGNAL_DOT[sig]}`}
-                />
+                <span className={`absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full ${SIGNAL_DOT[sig]}`} />
               )}
-
-              {/* Name row */}
               <div className="flex items-start justify-between gap-1 min-w-0 pr-3">
                 <p className="font-label text-[10px] font-black truncate leading-tight">
                   {meta.label}
                 </p>
               </div>
-
-              {/* Signal badge OR role badge */}
               {sig ? (
                 <span className={`self-start font-label text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded border ${signalStyle}`}>
                   {sig}
@@ -349,8 +403,6 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
                   {meta.role}
                 </span>
               )}
-
-              {/* Weight bar */}
               <div className="flex items-center gap-1.5">
                 <div className="flex-1 h-0.5 rounded-full bg-current opacity-20 overflow-hidden">
                   <div
@@ -367,7 +419,6 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
         })}
       </div>
 
-      {/* Last updated timestamp */}
       {lastUpdated != null && (
         <p className="mt-2 font-label text-[8px] text-magi-muted/30 text-right">
           updated {new Date(lastUpdated).toLocaleTimeString()}

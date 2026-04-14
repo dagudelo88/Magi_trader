@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { API_BASE } from '../config';
 import { TRACKED_TICKER_SYMBOLS_FALLBACK } from '../trackedMarketsFallback';
 
@@ -90,6 +90,7 @@ const MINI_TICKER_WS: Record<NetworkView, string> = {
 };
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [tickers, setTickers] = useState<Record<string, Ticker>>({});
   const [wallet, setWallet] = useState<WalletItem[]>([]);
   const [trackedTickers, setTrackedTickers] = useState<string[]>([]);
@@ -101,13 +102,16 @@ export default function Dashboard() {
   const walletRef = useRef<WalletItem[]>([]);
   walletRef.current = wallet;
 
-  // Load bots with P&L
+  // Load bots with P&L — poll every 15 s; on failure keep existing data
   useEffect(() => {
-    const load = () =>
-      fetch(`${API_BASE}/api/bots`)
+    const load = () => {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10_000);
+      fetch(`${API_BASE}/api/bots`, { signal: ctrl.signal })
         .then((r) => r.json())
-        .then((d: { bots?: BotRow[] }) => setBots(d.bots ?? []))
-        .catch(() => {});
+        .then((d: { bots?: BotRow[] }) => { clearTimeout(t); setBots(d.bots ?? []); })
+        .catch(() => clearTimeout(t));
+    };
     void load();
     const id = setInterval(load, 15_000);
     return () => clearInterval(id);
@@ -134,10 +138,23 @@ export default function Dashboard() {
   useEffect(() => {
     if (walletView === null) return;
 
-    setLoading(true);
-    setError(null);
-    fetch(`${API_BASE}/api/wallet/balances?view=${walletView}`)
+    // Only show the full-page spinner on the very first load.
+    // Subsequent re-fetches (walletView switch etc.) update silently so the
+    // UI never goes blank while waiting for the Binance balance call.
+    const firstLoad = wallet.length === 0;
+    if (firstLoad) {
+      setLoading(true);
+      setError(null);
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+
+    fetch(`${API_BASE}/api/wallet/balances?view=${walletView}`, {
+      signal: controller.signal,
+    })
       .then(async (res) => {
+        clearTimeout(timeout);
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));
           const d = errData.detail;
@@ -161,10 +178,18 @@ export default function Dashboard() {
         setLoading(false);
       })
       .catch((err: Error) => {
+        clearTimeout(timeout);
+        if (err.name === 'AbortError') {
+          // Timeout — keep showing whatever data we already have
+          setLoading(false);
+          return;
+        }
         setError(err.message);
         setLoading(false);
       });
-  }, [walletView]);
+
+    return () => { clearTimeout(timeout); controller.abort(); };
+  }, [walletView]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (walletView === null) return;
@@ -328,11 +353,15 @@ export default function Dashboard() {
                     const pnl = bot.realized_pnl_quote ?? 0;
                     const positive = pnl >= 0;
                     return (
-                      <tr key={bot.bot_id} className="border-b border-border/40 hover:bg-border/20 transition-colors">
+                      <tr
+                        key={bot.bot_id}
+                        onClick={() => navigate(`/bots/${bot.bot_id}`)}
+                        className="border-b border-border/40 hover:bg-primary/10 cursor-pointer transition-colors group"
+                      >
                         <td className="px-5 py-2.5">
-                          <Link to={`/bots/${bot.bot_id}`} className="font-semibold text-white hover:text-primary transition-colors">
+                          <span className="font-semibold text-white group-hover:text-primary transition-colors">
                             {bot.name}
-                          </Link>
+                          </span>
                         </td>
                         <td className="px-4 py-2.5 text-gray-400 font-mono text-xs">{bot.symbol}</td>
                         <td className="px-4 py-2.5">
