@@ -2,6 +2,8 @@
 
 Binance **spot** trading stack: a FastAPI backend that runs configurable bots (CCXT), a React dashboard, and SQLite persistence. Strategies are pure Python modules; ensemble “Magi” strategies combine many voter strategies into one consensus signal per bot.
 
+The project name and ensemble concept are inspired by the **Magi supercomputer** in *Neon Genesis Evangelion*—multiple analytic cores that debate and reach a single decision—adapted here as configurable voters and consensus rules.
+
 ## Current status (April 2026)
 
 | Area | Status |
