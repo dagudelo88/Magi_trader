@@ -19,6 +19,38 @@ Binance **spot** trading stack: a FastAPI backend that runs configurable bots (C
 
 **Docs:** design and ensemble rationale live in [`docs/magitrade.md`](docs/magitrade.md) (some “next steps” there are **already implemented** in this repo — treat the codebase as source of truth).
 
+## Voters, ensembles, and how trades run
+
+### Voters vs bot
+
+- **Voters** are individual strategies registered in [`backend/trading/strategies/registry.py`](backend/trading/strategies/registry.py) (e.g. SMA cross, MACD+RSI). Each returns `buy`, `sell`, or `hold` from OHLCV (and sometimes extra features). They **do not** call the exchange.
+- The **bot** is [`backend/services/bot_runner.py`](backend/services/bot_runner.py): one DB row per bot. Each cycle it fetches **one** OHLCV series, calls **`strategy.evaluate(ohlcv, params)`** once, and **only that final signal** can trigger an order. Ensembles run many voters **in-process** on the same candles (no extra REST calls per voter).
+
+### Classic Magi Ensemble (`magi_ensemble_high` / `mid` / `low`)
+
+Implemented in [`backend/trading/strategies/ensemble_core.py`](backend/trading/strategies/ensemble_core.py):
+
+1. Configure a **`voters`** list and optional **`voter_weights`** in the bot’s `strategy_params_json`.
+2. Each voter runs `evaluate` on the **same** OHLCV; votes are weighted.
+3. [**MetaMagi**](backend/trading/metatrader.py) may override weights via `get_dynamic_weights` from learned feedback.
+4. **Consensus** (`consensus_mode`, `consensus_threshold`) turns weighted votes into one signal: e.g. **majority** / **threshold**, **unanimous**, or **directional_net** (net buy–sell pressure vs total weight).
+
+### Magi Lag Ensemble (`magi_lag_ensemble_*`)
+
+Implemented in [`backend/trading/strategies/lag_ensemble_core.py`](backend/trading/strategies/lag_ensemble_core.py): same voting idea, but the runner also passes **`lag_features`** (from `lag_helpers` / `market_ticks`) into each voter. Lag-specific voters (`btc_lead_detector`, `roc_divergence`, `lag_correlation`, `ratio_mean_reversion`) use that; classic OHLCV voters ignore it. **Ensemble strategies cannot nest** as voters (recursion guards).
+
+| | Classic Magi | Magi Lag |
+|--|--------------|----------|
+| **Input** | OHLCV only | OHLCV + `lag_features` for lag voters |
+| **Voters** | Allowlisted OHLCV strategies | Same + lag voters + optional classics |
+
+### From signal to trade
+
+1. **Cooldown** — `min_trade_interval_sec` since the bot’s last trade.
+2. **Signal** — `evaluate` returns `hold` → log and exit; **no order**.
+3. **Buy/sell** — Load balances and market limits; apply **`initial_budget_quote`**, **`quote_fraction`** / **`base_fraction`**, exchange min notional; then **`create_order`** (market) via CCXT and record the order.
+4. **Feedback** — For ensembles, [`_log_voter_feedback`](backend/services/bot_runner.py) writes per-voter rows to **`voter_feedback`** for MetaMagi (labels are filled later); this **does not** decide execution.
+
 ## Quick start
 
 **Requirements:** Python 3 with dependencies from `backend/requirements.txt`, Node.js for the frontend, and a configured `.env` (see backend for variables used by exchange and DB paths).
@@ -45,4 +77,4 @@ Alternatively run only the API: `npm run dev:backend` or only the UI: `npm run d
 
 ---
 
-*This README summarizes **current** implementation; for deep dives use `docs/magitrade.md` and the modules referenced above.*
+*This README summarizes **current** implementation; for more narrative detail see `docs/magitrade.md` and the modules linked above.*
