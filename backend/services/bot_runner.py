@@ -581,28 +581,52 @@ def _process_bot(
             return
 
         # Final notional guard after precision rounding.
-        # Rounding down can push the notional just below the exchange minimum, so
-        # bump sell_amt up by one step and re-round.  We use min_cost * 1.02 as
-        # the target (consistent with the BUY side) to absorb small price moves
-        # between the estimate and the actual fill.
+        # amount_to_precision truncates (rounds down), so the bumped amount can land
+        # on a step that is still below min_cost.  Mirror the BUY-side fix: use
+        # math.ceil to the nearest lot-size step so the rounded quantity is always
+        # >= the minimum notional requirement.
         final_notional = float(sell_prec) * last_close
         if min_cost > 0 and final_notional < min_cost:
-            # One more bump: re-derive the minimum amount from the current price
-            # with the same 2% safety margin used on the BUY side, then re-round.
-            # open_base is only set when initial_budget > 0; the ternary short-circuits.
             available = (open_base if initial_budget > 0 else free_base)
-            bumped_amt = (min_cost * 1.02) / last_close
-            if bumped_amt <= available:
-                sell_prec = ex.amount_to_precision(symbol, bumped_amt)
-                final_notional = float(sell_prec) * last_close
-                _log(bot_id, "info", execution_mode,
-                     f"SELL: post-rounding notional {float(sell_prec) * last_close:.4f} {quote_cur}"
-                     f" — re-bumped to {sell_prec} {base_cur} to clear NOTIONAL filter")
-            else:
-                _log(bot_id, "warn", execution_mode,
-                     f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
-                     f" below exchange minimum {min_cost} {quote_cur} and cannot bump further")
-                return
+            ceiled = False
+            try:
+                prec_val = market.get("precision", {}).get("amount")
+                if prec_val is not None:
+                    pv = float(prec_val)
+                    if pv > 0:
+                        # TICK_SIZE mode: pv is the step (e.g. 0.00001)
+                        # DECIMAL_PLACES mode: pv is decimal count (e.g. 5 → step 1e-5)
+                        step = pv if pv < 1 else 10.0 ** (-int(pv))
+                        p = max(0, round(-math.log10(step)))
+                        min_qty = min_cost / last_close
+                        ceiled_qty = round(math.ceil(round(min_qty / step, 9)) * step, p)
+                        if ceiled_qty <= available:
+                            sell_prec = ceiled_qty
+                            final_notional = float(sell_prec) * last_close
+                            _log(bot_id, "info", execution_mode,
+                                 f"SELL: post-rounding notional {final_notional:.4f} {quote_cur}"
+                                 f" — ceiled to {sell_prec} {base_cur} to clear NOTIONAL filter")
+                            ceiled = True
+                        else:
+                            _log(bot_id, "warn", execution_mode,
+                                 f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
+                                 f" below exchange minimum {min_cost} {quote_cur} and cannot bump further")
+                            return
+            except Exception:
+                pass  # fall through to the old margin approach below
+            if not ceiled:
+                bumped_amt = (min_cost * 1.02) / last_close
+                if bumped_amt <= available:
+                    sell_prec = ex.amount_to_precision(symbol, bumped_amt)
+                    final_notional = float(sell_prec) * last_close
+                    _log(bot_id, "info", execution_mode,
+                         f"SELL: post-rounding notional {final_notional:.4f} {quote_cur}"
+                         f" — re-bumped to {sell_prec} {base_cur} to clear NOTIONAL filter")
+                else:
+                    _log(bot_id, "warn", execution_mode,
+                         f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
+                         f" below exchange minimum {min_cost} {quote_cur} and cannot bump further")
+                    return
 
         _log(bot_id, "info", execution_mode,
              f"SELL order: selling {sell_prec} {base_cur} "
@@ -760,35 +784,52 @@ def _run_one_cycle():
         except Exception:
             _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
 
-    # Per-cycle hard deadline: a single stuck Binance TCP connection must not
-    # freeze the entire runner.  Each bot gets up to 60 s; the whole batch is
-    # capped at 90 s regardless of how many bots are running.
+    # Per-cycle hard deadline.  Each bot gets up to _CYCLE_TIMEOUT_SEC of wall
+    # time; after that we move on regardless — the hung thread is ORPHANED, not
+    # waited on.
+    #
+    # Critical design note
+    # --------------------
+    # We deliberately do NOT use `with ThreadPoolExecutor(...) as pool:`.
+    # That context manager calls pool.shutdown(wait=True) on exit, which BLOCKS
+    # until every thread finishes — including threads stuck on a hanging Binance
+    # TCP connection.  future.cancel() cannot interrupt a running thread, so
+    # the old `with` pattern caused the entire runner to freeze for 40+ minutes
+    # whenever one bot's network call hung (common on Binance testnet after
+    # repeated NOTIONAL filter rejections).
+    #
+    # pool.shutdown(wait=False) releases the pool immediately.  Orphaned threads
+    # clean themselves up when their TCP timeout eventually fires.
     _CYCLE_TIMEOUT_SEC = 90
 
     max_workers = min(len(bots), 32)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_run_bot, bot): bot["bot_id"] for bot in bots}
-        try:
-            for future in concurrent.futures.as_completed(
-                futures, timeout=_CYCLE_TIMEOUT_SEC
-            ):
-                try:
-                    future.result()
-                except Exception:
-                    pass
-        except concurrent.futures.TimeoutError:
-            bot_ids = ", ".join(
-                bid for f, bid in futures.items() if not f.done()
-            )
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    futures: dict[concurrent.futures.Future, str] = {
+        pool.submit(_run_bot, bot): bot["bot_id"] for bot in bots
+    }
+    try:
+        done, not_done = concurrent.futures.wait(
+            futures, timeout=_CYCLE_TIMEOUT_SEC
+        )
+        if not_done:
+            bot_ids = ", ".join(futures[f] for f in not_done)
             print(
                 f"[bot_runner] Cycle timed out after {_CYCLE_TIMEOUT_SEC}s — "
-                f"cancelling hung bots: {bot_ids}"
+                f"{len(not_done)} bot(s) still running (network hang?): {bot_ids}"
             )
-            for future in futures:
-                future.cancel()
+        for f in done:
+            try:
+                f.result()
+            except Exception:
+                pass
+    finally:
+        # Non-blocking shutdown: don't wait for hung threads.
+        pool.shutdown(wait=False)
 
-    # All bot threads have finished (or been cancelled).  Flush the entire
-    # cycle's bot_log rows in one transaction — the main DB write-reduction win.
+    # Flush all bot_log rows collected during this cycle in one transaction.
+    # Runs after the pool exits — by this point all *finished* threads have
+    # appended their rows; orphaned threads may add a few straggler rows to
+    # the next cycle's flush, which is acceptable.
     _flush_log_queue()
 
 
