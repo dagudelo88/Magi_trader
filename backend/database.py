@@ -1,9 +1,11 @@
 import json
+import queue
 import re
 import secrets
 import sqlite3
 import os
 import sys
+import threading
 import time
 import traceback
 from typing import Any
@@ -164,6 +166,151 @@ def refresh_stale_bot_orders_from_exchange(bot_id: str, ex: Any, cooldown_sec: f
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
 
+# ── Connection pool configuration ──────────────────────────────────────────
+# Reduces open/close overhead: instead of creating a fresh OS-level file
+# descriptor for every query, callers borrow a pre-warmed connection and
+# return it to the pool via close().
+
+DB_POOL_SIZE: int = int(os.environ.get("DB_POOL_SIZE", "10"))
+
+_pool_logger = __import__("logging").getLogger("db_pool")
+
+
+class _PooledConnection:
+    """Proxy for a sqlite3.Connection that returns it to the pool on close().
+
+    All attribute access (execute, executemany, commit, cursor, row_factory …)
+    is forwarded to the real connection so callers need no code changes.
+    """
+
+    __slots__ = ("_conn", "_pool")
+
+    def __init__(self, conn: sqlite3.Connection, pool: "_ConnectionPool") -> None:
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_pool", pool)
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in ("_conn", "_pool"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    def close(self) -> None:
+        pool = object.__getattribute__(self, "_pool")
+        conn = object.__getattribute__(self, "_conn")
+        pool._release(conn)
+
+
+class _ConnectionPool:
+    """Thread-safe SQLite connection pool.
+
+    Connections are created with check_same_thread=False because each
+    connection is held by at most one thread at a time (enforced by the
+    internal queue).  WAL journal mode (set once by _enable_wal_once) allows
+    multiple readers to coexist with a single writer so the pool does not
+    create write-contention beyond what SQLite already handles.
+
+    On acquire():
+      - If an idle connection is available it is returned immediately (pool hit).
+      - If the queue is exhausted an overflow connection is created and logged
+        as a pool miss — this should be rare; if it becomes frequent, raise
+        DB_POOL_SIZE.
+
+    On close() of the returned _PooledConnection the underlying connection is
+    put back into the queue.  If the queue is already full (overflow case) the
+    connection is truly closed.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._q: queue.Queue[sqlite3.Connection] = queue.Queue(maxsize=size)
+        self._lock = threading.Lock()
+        self._created: int = 0
+        self._acquired: int = 0
+        self._active: int = 0
+        self._pool_hits: int = 0
+        self._pool_misses: int = 0
+
+        for _ in range(size):
+            self._q.put(self._make_conn())
+
+    def _make_conn(self) -> sqlite3.Connection:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA cache_size=10000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        with self._lock:
+            self._created += 1
+            n = self._created
+        _pool_logger.debug("DB pool: created connection #%d (pool_size=%d)", n, self._size)
+        return conn
+
+    def acquire(self) -> _PooledConnection:
+        with self._lock:
+            self._acquired += 1
+            self._active += 1
+        try:
+            conn = self._q.get(timeout=15)
+            with self._lock:
+                self._pool_hits += 1
+        except queue.Empty:
+            with self._lock:
+                self._pool_misses += 1
+            _pool_logger.warning(
+                "DB pool exhausted (size=%d) — creating overflow connection "
+                "(consider raising DB_POOL_SIZE)",
+                self._size,
+            )
+            conn = self._make_conn()
+        return _PooledConnection(conn, self)
+
+    def _release(self, conn: sqlite3.Connection) -> None:
+        with self._lock:
+            self._active -= 1
+        try:
+            self._q.put_nowait(conn)
+        except queue.Full:
+            conn.close()
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "pool_size": self._size,
+                "idle": self._q.qsize(),
+                "active": self._active,
+                "total_created": self._created,
+                "total_acquired": self._acquired,
+                "pool_hits": self._pool_hits,
+                "pool_misses": self._pool_misses,
+            }
+
+
+# Lazily initialized singleton — created on first get_db_connection() call.
+_pool: _ConnectionPool | None = None
+_pool_init_lock = threading.Lock()
+
+
+def _get_pool() -> _ConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_init_lock:
+            if _pool is None:
+                _pool = _ConnectionPool(DB_POOL_SIZE)
+    return _pool
+
+
+def get_pool_stats() -> dict[str, Any]:
+    """Return current connection pool statistics (safe before pool is created)."""
+    global _pool
+    if _pool is None:
+        return {"pool_size": DB_POOL_SIZE, "status": "not_initialized"}
+    return _pool.stats()
+
 
 def _report_db_timing(label: str, duration_ms: float) -> None:
     """Forward a completed DB operation's timing to the performance monitor.
@@ -178,24 +325,23 @@ def _report_db_timing(label: str, duration_ms: float) -> None:
         pass
 
 
-def get_db_connection():
-    """Open a SQLite connection with per-connection performance pragmas.
+def get_db_connection() -> _PooledConnection:
+    """Borrow a SQLite connection from the thread-safe connection pool.
 
-    WAL journal mode is persistent (set once by _enable_wal_once at startup).
-    The remaining pragmas must be applied on every new connection because SQLite
-    resets them to defaults when the connection is opened:
+    Returns a _PooledConnection proxy; call .close() when done (the existing
+    try/finally pattern is unchanged).  The underlying connection is returned
+    to the pool rather than being truly closed, eliminating the per-operation
+    file-open/close overhead.
 
-    * synchronous=NORMAL  — safe with WAL; ~3× faster than FULL
-    * cache_size=10000    — 40 MB page cache (default is only 2 MB)
-    * temp_store=MEMORY   — keep temp tables/indexes in RAM, not disk
+    Pool connections are pre-warmed with the same performance pragmas that were
+    previously applied on each fresh connection:
+      * synchronous=NORMAL  — safe with WAL; ~3× faster than FULL
+      * cache_size=10000    — 40 MB page cache (vs SQLite default of 2 MB)
+      * temp_store=MEMORY   — keep temp tables/indexes in RAM, not disk
+
+    Pool size is controlled by the DB_POOL_SIZE env var (default: 10).
     """
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=10000")
-    conn.execute("PRAGMA temp_store=MEMORY")
-    return conn
+    return _get_pool().acquire()
 
 def _enable_wal_once() -> None:
     """
@@ -317,10 +463,14 @@ def _create_archive_tables(cursor: sqlite3.Cursor) -> None:
 
 def init_db():
     import logging as _logging
-    _logging.getLogger(__name__).info(
-        "DB Optimizations + Debugging Mode ENABLED  "
-        "(WAL journal, synchronous=NORMAL, cache_size=10000, temp_store=MEMORY, timeout=15s)"
+    _log = _logging.getLogger(__name__)
+    _log.info("=== MagiTrader - DB Pooling + Watchdog Mode ACTIVE ===")
+    _log.info(
+        "DB Pooling ENABLED — pool_size=%d, WAL journal, synchronous=NORMAL, "
+        "cache_size=10000, temp_store=MEMORY, timeout=15s",
+        DB_POOL_SIZE,
     )
+    _get_pool()  # pre-warm the pool before any DB access
     _enable_wal_once()
     conn = get_db_connection()
     cursor = conn.cursor()

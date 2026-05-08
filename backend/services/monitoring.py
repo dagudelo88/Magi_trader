@@ -70,6 +70,13 @@ class PerformanceMonitor:
         # ── Slow-op ring buffer (last 20 events) ─────────────────────────────
         self._slow_ops: deque[dict[str, Any]] = deque(maxlen=20)
 
+        # ── Watchdog heartbeat ───────────────────────────────────────────────
+        # Updated by maybe_log_health(); the watchdog background task checks
+        # that this timestamp advances at least once per WATCHDOG_TIMEOUT_SEC.
+        self._last_heartbeat: float = 0.0
+        self._heartbeat_bots: int = 0
+        self._heartbeat_clients: int = 0
+
     # ── DB timing ────────────────────────────────────────────────────────────
 
     def record_db_op(self, label: str, duration_ms: float) -> None:
@@ -181,17 +188,46 @@ class PerformanceMonitor:
                 "recent_slow_ops": list(self._slow_ops)[-10:],
             }
 
+    def watchdog_status(self) -> dict[str, Any]:
+        """Return watchdog state: seconds elapsed since the last health heartbeat.
+
+        The watchdog background task calls this to detect silent hangs.  A
+        ``seconds_since_update`` value greater than WATCHDOG_TIMEOUT_SEC means
+        the application is likely stuck.
+        """
+        with self._lock:
+            if self._last_heartbeat == 0.0:
+                return {
+                    "seconds_since_update": None,
+                    "healthy": False,
+                    "last_bots": 0,
+                    "last_clients": 0,
+                }
+            elapsed = time.monotonic() - self._last_heartbeat
+            return {
+                "seconds_since_update": round(elapsed),
+                "healthy": True,
+                "last_bots": self._heartbeat_bots,
+                "last_clients": self._heartbeat_clients,
+            }
+
     def maybe_log_health(self, running_bots: int = 0, ws_clients: int = 0) -> None:
         """Emit a one-line health summary at most once per _HEALTH_INTERVAL_SEC.
 
         Safe to call from any thread or coroutine — the 60-second gate is
         enforced under a lock so concurrent callers never double-log.
+        Also updates the watchdog heartbeat so the background watchdog task
+        can confirm the application is still making progress.
         """
         now = time.monotonic()
         with self._lock:
             if now - self._last_health_log < _HEALTH_INTERVAL_SEC:
                 return
             self._last_health_log = now
+            # Update watchdog heartbeat atomically with the health log.
+            self._last_heartbeat = now
+            self._heartbeat_bots = running_bots
+            self._heartbeat_clients = ws_clients
             # Capture values atomically while holding the lock.
             db_ops = self.db_ops
             db_slow = self.db_slow_ops

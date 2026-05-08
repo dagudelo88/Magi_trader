@@ -71,10 +71,12 @@ BINANCE_PROACTIVE_RECONNECT_SEC = 23 * 60 * 60 + 50 * 60
 BINANCE_RECV_TIMEOUT_SEC = 30.0
 MARKET_BROADCAST_MIN_INTERVAL_SEC = 2.0
 
-# Batch market_ticks writes: accumulate N seconds of rows before opening a
-# DB connection.  Reduces SQLite write pressure from 1 connection/s to
-# 1 connection / TICK_BATCH_SEC without sacrificing time-series granularity.
-TICK_BATCH_SEC: int = int(os.environ.get("TICK_BATCH_SEC", "5"))
+# Batch market_ticks writes: accumulate N seconds of rows before flushing to
+# the DB.  Reduces SQLite write pressure from 1 connection/s to 1 connection /
+# TICK_BATCH_SEC without sacrificing time-series resolution in the stored data.
+# Doubled from 5 → 10 s to further reduce DB contention with 4+ bots running.
+# Override with the TICK_BATCH_SEC environment variable.
+TICK_BATCH_SEC: int = int(os.environ.get("TICK_BATCH_SEC", "10"))
 
 # ── Per-symbol state ────────────────────────────────────────────────────────
 

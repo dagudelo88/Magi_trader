@@ -28,6 +28,7 @@ from database import (
     delete_bot,
     get_db_connection,
     get_latest_voter_signals,
+    get_pool_stats,
     init_db,
     fetch_bot_orders_panel,
     fetch_bot_orders_chronological,
@@ -174,12 +175,88 @@ async def _db_cleanup_loop() -> None:
         await asyncio.sleep(86_400)  # 24 hours
 
 
+async def _watchdog_loop() -> None:
+    """Background task: detect silent application hangs and log CRITICAL warnings.
+
+    Reads the watchdog heartbeat from the performance monitor (updated every
+    60 s by maybe_log_health).  If the heartbeat goes stale for longer than
+    WATCHDOG_TIMEOUT_SEC the application is likely stuck; a CRITICAL log is
+    emitted together with the full monitor snapshot so the cause is immediately
+    visible in the terminal without any external tooling.
+
+    The watchdog never interferes with normal operation — it only logs.
+    """
+    import asyncio
+    import logging
+
+    logger = logging.getLogger("watchdog")
+    INTERVAL = int(os.getenv("WATCHDOG_INTERVAL_SEC", "30"))
+    TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT_SEC", "90"))
+    POOL_LOG_INTERVAL = 300  # log pool stats every 5 minutes
+
+    # Allow the system to initialise before the first check.
+    await asyncio.sleep(INTERVAL * 2)
+
+    last_pool_log: float = 0.0
+
+    while True:
+        await asyncio.sleep(INTERVAL)
+        try:
+            status = perf_monitor.watchdog_status()
+            elapsed = status.get("seconds_since_update")
+
+            if elapsed is not None and elapsed > TIMEOUT:
+                snap = perf_monitor.snapshot(
+                    running_bots=status.get("last_bots", 0),
+                    ws_clients=status.get("last_clients", 0),
+                )
+                logger.critical(
+                    "[CRITICAL] WATCHDOG: Application may be stuck! "
+                    "No health update for %d seconds.\n"
+                    "Last state: %d bots | %d WS clients | "
+                    "DB ops: %d (slow: %d)",
+                    elapsed,
+                    status.get("last_bots", 0),
+                    status.get("last_clients", 0),
+                    snap["db"]["ops_total"],
+                    snap["db"]["slow_ops"],
+                )
+                logger.critical(
+                    "WATCHDOG snapshot: %s", json.dumps(snap, default=str)
+                )
+
+            # ── Pool stats (every 5 minutes) ──────────────────────────────
+            now = time.monotonic()
+            if now - last_pool_log >= POOL_LOG_INTERVAL:
+                last_pool_log = now
+                pool = get_pool_stats()
+                logger.info(
+                    "DB pool stats — size=%d  idle=%d  active=%d  "
+                    "acquired=%d  hits=%d  misses=%d",
+                    pool.get("pool_size", 0),
+                    pool.get("idle", 0),
+                    pool.get("active", 0),
+                    pool.get("total_acquired", 0),
+                    pool.get("pool_hits", 0),
+                    pool.get("pool_misses", 0),
+                )
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Watchdog loop error — continuing.")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     import asyncio
     from services.bot_runner import run_async as _bot_runner_async
     from services.data_collector import run_async as _data_collector_async
+    _lifespan_logger = logging.getLogger("lifespan")
     init_db()
+    _lifespan_logger.info(
+        "=== MagiTrader - DB Pooling + Watchdog Mode ACTIVE ==="
+    )
     ws_manager.bind_loop(asyncio.get_running_loop())
     # Pause any bots that were left running — the user must explicitly start them.
     conn = get_db_connection()
@@ -192,10 +269,11 @@ async def lifespan(_app: FastAPI):
     collector_task = asyncio.create_task(_data_collector_async())
     meta_task = asyncio.create_task(_meta_training_loop())
     cleanup_task = asyncio.create_task(_db_cleanup_loop())
+    watchdog_task = asyncio.create_task(_watchdog_loop())
     try:
         yield
     finally:
-        for t in (bot_task, collector_task, meta_task, cleanup_task):
+        for t in (bot_task, collector_task, meta_task, cleanup_task, watchdog_task):
             t.cancel()
             try:
                 await t
@@ -284,8 +362,9 @@ def ws_health():
 def api_health():
     """Comprehensive runtime health: DB stats, WS clients, bot cycles, slow ops.
 
-    Designed for quick triage — if the app hangs, hit this endpoint to see
-    exactly which operation is slow.
+    Includes watchdog status (seconds since last health heartbeat) and
+    connection pool statistics so hangs and pool exhaustion are immediately
+    visible without any external tooling.
     """
     conn = get_db_connection()
     try:
@@ -309,6 +388,9 @@ def api_health():
         snap["db_size_mb"] = round(os.path.getsize(snap["db_path"]) / 1_048_576, 1)
     except OSError:
         snap["db_size_mb"] = None
+
+    snap["watchdog"] = perf_monitor.watchdog_status()
+    snap["db_pool"] = get_pool_stats()
     return snap
 
 
