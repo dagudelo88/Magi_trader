@@ -22,7 +22,23 @@ if not exist "node_modules" (
   call npm install
 )
 
+:: Create logs directory if it doesn't exist
+if not exist "logs" mkdir logs
+
+:: Generate a timestamped log filename via PowerShell
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set SESSION_TS=%%i
+set LOGFILE=logs\session_%SESSION_TS%.txt
+
 echo Starting MagiTrader (backend + frontend in one terminal)...
+echo Session log: %LOGFILE%
 echo Press Ctrl+C to stop both.
 echo.
-call npm run dev
+
+:: Run dev server and tee all output (stdout + stderr) to the session log file.
+:: ANSI colour codes are stripped so the log is plain text and easy to grep.
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$log = '%LOGFILE%';" ^
+  "& { npm run dev } 2>&1 | ForEach-Object {" ^
+  "    Write-Host $_;" ^
+  "    ($_ -replace '\x1b\[[0-9;]*[mGKHF]', '') | Out-File -FilePath $log -Encoding UTF8 -Append" ^
+  "}"
