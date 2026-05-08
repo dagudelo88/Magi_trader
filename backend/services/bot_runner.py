@@ -44,6 +44,8 @@ from database import (
     get_db_connection,
     record_bot_order,
     record_bot_decision,
+    batch_insert_voter_feedback,
+    batch_record_bot_decisions,
     fetch_bot_orders_chronological,
     insert_voter_feedback,
     upsert_ohlcv_candles,
@@ -109,8 +111,11 @@ def _log_voter_feedback(bot_id: str, symbol: str, result: Any) -> None:
     """
     Persist per-voter votes to voter_feedback for MetaMagi training.
 
-    Called only for ensemble strategies
-    (detected via 'voter_signals' in result.meta).
+    Called only for ensemble strategies (detected via 'voter_signals' in
+    result.meta).  All voters for this bot+cycle are collected into a single
+    list and written in one batch transaction, replacing the old per-voter
+    INSERT loop that caused 80–120 separate transactions per 5-second cycle.
+
     forward_roc_* / realized_pnl are filled later by meta_training_loop.
     Failures are silently swallowed — must never interrupt trade execution.
     """
@@ -127,23 +132,24 @@ def _log_voter_feedback(bot_id: str, symbol: str, result: Any) -> None:
     # the primary feature vector MetaMagi uses for future neural-net training.
     features_snapshot = _get_features_snapshot(symbol)
 
-    for voter_name, voter_signal in voter_signals.items():
-        try:
-            insert_voter_feedback(
-                {
-                    "bot_id": bot_id,
-                    "timestamp": ts,
-                    "target_asset": symbol,
-                    "ensemble_signal": result.signal,
-                    "voter_name": voter_name,
-                    "voter_signal": voter_signal,
-                    "confidence": voter_confidences.get(voter_name),
-                    "consensus_score": consensus_score,
-                    "features_snapshot": features_snapshot,
-                }
-            )
-        except Exception:
-            pass
+    records = [
+        {
+            "bot_id": bot_id,
+            "timestamp": ts,
+            "target_asset": symbol,
+            "ensemble_signal": result.signal,
+            "voter_name": voter_name,
+            "voter_signal": voter_signal,
+            "confidence": voter_confidences.get(voter_name),
+            "consensus_score": consensus_score,
+            "features_snapshot": features_snapshot,
+        }
+        for voter_name, voter_signal in voter_signals.items()
+    ]
+    try:
+        batch_insert_voter_feedback(records)
+    except Exception:
+        pass
 
 
 def _idle_log_interval_sec() -> float:
@@ -289,6 +295,28 @@ def _process_bot(
     params = _merge_params(strategy_name, bot.get("strategy_params_json"))
     data_ex = public_ex if public_ex is not None else ex  # real prices for signals
 
+    # Collect bot_decisions for this cycle into a list; flush once at the end
+    # (or before any early return that follows a decision).  Each bot runs in
+    # its own thread — this list is local, so no locking is required.
+    _pending_decisions: list[dict] = []
+
+    def _queue_decision(action: str, confidence: float | None, executed: bool) -> None:
+        _pending_decisions.append({
+            "bot_id": bot_id,
+            "symbol": symbol,
+            "mode": execution_mode,
+            "action": action,
+            "confidence": confidence,
+            "executed": executed,
+        })
+
+    def _flush_decisions() -> None:
+        if _pending_decisions:
+            try:
+                batch_record_bot_decisions(_pending_decisions)
+            except Exception:
+                pass
+
     interval_key = float(params["min_trade_interval_sec"])
     last = _last_trade_monotonic.get(bot_id, 0.0)
     elapsed = time.monotonic() - last
@@ -356,10 +384,8 @@ def _process_bot(
         else:
             meta_str = _format_meta(result.meta)
             _log(bot_id, "info", execution_mode, f"Signal: HOLD — {meta_str}")
-        try:
-            record_bot_decision(bot_id, symbol, execution_mode, "HOLD", None, False)
-        except Exception:
-            pass
+        _queue_decision("HOLD", None, False)
+        _flush_decisions()
         return
 
     meta_str = _format_meta(result.meta)
@@ -476,15 +502,9 @@ def _process_bot(
                  f"-> received {filled_base:.8f} {base_cur} "
                  f"@ avg {avg_price:.2f} {quote_cur}/{base_cur}  [id={order.get('id')}]")
             _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
-            try:
-                record_bot_decision(bot_id, symbol, execution_mode, "BUY", _signal_confidence, True)
-            except Exception:
-                pass
+            _queue_decision("BUY", _signal_confidence, True)
         except Exception as e:
-            try:
-                record_bot_decision(bot_id, symbol, execution_mode, "BUY", _signal_confidence, False)
-            except Exception:
-                pass
+            _queue_decision("BUY", _signal_confidence, False)
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
 
     elif result.signal == "sell":
@@ -562,16 +582,15 @@ def _process_bot(
                  f"→ received {cost_quote:.4f} {quote_cur} "
                  f"@ avg {avg_price:.2f} {quote_cur}/{base_cur}  [id={order.get('id')}]")
             _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
-            try:
-                record_bot_decision(bot_id, symbol, execution_mode, "SELL", _signal_confidence, True)
-            except Exception:
-                pass
+            _queue_decision("SELL", _signal_confidence, True)
         except Exception as e:
-            try:
-                record_bot_decision(bot_id, symbol, execution_mode, "SELL", _signal_confidence, False)
-            except Exception:
-                pass
+            _queue_decision("SELL", _signal_confidence, False)
             _log(bot_id, "error", execution_mode, f"SELL failed: {e}\n{traceback.format_exc()}")
+
+    # Flush any queued decision for this cycle (BUY or SELL branch).
+    # HOLD already flushed before its early return; early exits before order
+    # placement have no queued decision, so this is a no-op for them.
+    _flush_decisions()
 
 
 def _build_exchanges_for_bots(bots: list[dict[str, Any]]) -> dict[str, Any]:

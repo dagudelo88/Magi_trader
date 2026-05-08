@@ -121,6 +121,46 @@ async def _meta_training_loop() -> None:
             )
 
 
+async def _db_cleanup_loop() -> None:
+    """
+    Background task: archive old rows from high-volume live tables once per day.
+
+    Waits 1 hour after startup before the first run so it does not compete with
+    the bot runner during the noisy initialisation period.  Subsequent runs fire
+    every 24 hours.  Any exception is caught and logged — this task must never
+    crash the server.
+    """
+    import asyncio
+    import logging
+
+    logger = logging.getLogger("db_cleanup_loop")
+
+    # Defer the first run: let the server settle for an hour before touching the DB.
+    await asyncio.sleep(3600)
+
+    while True:
+        try:
+            logger.info("Daily DB cleanup starting…")
+            loop = asyncio.get_event_loop()
+            from services.db_cleanup import run_cleanup
+            result = await loop.run_in_executor(None, run_cleanup)
+            logger.info(
+                "Daily DB cleanup done — voter_feedback=%d  bot_decisions=%d  "
+                "bot_logs=%d  market_ticks=%d  vacuumed=%s",
+                result.voter_feedback_moved,
+                result.bot_decisions_moved,
+                result.bot_logs_moved,
+                result.market_ticks_moved,
+                result.vacuumed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("DB cleanup loop error — will retry in 24 h.")
+
+        await asyncio.sleep(86_400)  # 24 hours
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     import asyncio
@@ -137,10 +177,11 @@ async def lifespan(_app: FastAPI):
     bot_task = asyncio.create_task(_bot_runner_async())
     collector_task = asyncio.create_task(_data_collector_async())
     meta_task = asyncio.create_task(_meta_training_loop())
+    cleanup_task = asyncio.create_task(_db_cleanup_loop())
     try:
         yield
     finally:
-        for t in (bot_task, collector_task, meta_task):
+        for t in (bot_task, collector_task, meta_task, cleanup_task):
             t.cancel()
             try:
                 await t

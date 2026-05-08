@@ -193,6 +193,101 @@ def _enable_wal_once() -> None:
         pass  # Non-fatal: delete-mode still works; WAL will be set on next restart.
 
 
+def _create_archive_tables(cursor: sqlite3.Cursor) -> None:
+    """
+    Create _archive mirror tables for the four high-volume live tables.
+    All archive tables use INSERT OR IGNORE so the cleanup script is idempotent.
+    No FOREIGN KEY constraints — archived rows must survive live-table purges.
+    """
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS voter_feedback_archive (
+            feedback_id       INTEGER PRIMARY KEY,
+            bot_id            TEXT,
+            timestamp         INTEGER NOT NULL,
+            target_asset      TEXT    NOT NULL,
+            ensemble_signal   TEXT    NOT NULL,
+            voter_name        TEXT    NOT NULL,
+            voter_signal      TEXT    NOT NULL,
+            confidence        REAL,
+            forward_roc_30s   REAL,
+            forward_roc_5m    REAL,
+            realized_pnl      REAL,
+            consensus_score   REAL,
+            features_snapshot TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vfa_asset_ts "
+        "ON voter_feedback_archive(target_asset, timestamp)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vfa_bot_ts "
+        "ON voter_feedback_archive(bot_id, timestamp)"
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_decisions_archive (
+            decision_id INTEGER PRIMARY KEY,
+            bot_id      TEXT,
+            tick_id     INTEGER,
+            mode        TEXT,
+            action      TEXT,
+            confidence  REAL,
+            executed    BOOLEAN,
+            created_at  INTEGER
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bda_bot_id "
+        "ON bot_decisions_archive(bot_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bda_created_at "
+        "ON bot_decisions_archive(created_at)"
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_logs_archive (
+            log_id         INTEGER PRIMARY KEY,
+            bot_id         TEXT    NOT NULL,
+            created_at     INTEGER NOT NULL,
+            level          TEXT    NOT NULL,
+            execution_mode TEXT    NOT NULL,
+            message        TEXT    NOT NULL
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bla_bot_time "
+        "ON bot_logs_archive(bot_id, created_at DESC)"
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS market_ticks_archive (
+            tick_id             INTEGER PRIMARY KEY,
+            timestamp           INTEGER NOT NULL,
+            target_asset        TEXT    NOT NULL,
+            target_price        REAL,
+            btc_price           REAL,
+            btc_roc_1s          REAL,
+            btc_roc_5s          REAL,
+            target_roc_1s       REAL,
+            target_roc_5s       REAL,
+            btc_volume_delta    REAL,
+            target_volume_delta REAL,
+            spread_bps          REAL,
+            features_json       TEXT
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mta_timestamp "
+        "ON market_ticks_archive(timestamp)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mta_asset "
+        "ON market_ticks_archive(target_asset)"
+    )
+
+
 def init_db():
     _enable_wal_once()
     conn = get_db_connection()
@@ -315,6 +410,31 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_bot_orders_bot_time ON bot_orders(bot_id, created_at DESC)"
     )
 
+    # Migration: add created_at to bot_decisions so rows can be time-bounded for
+    # archival and ML training queries.  Old rows will have NULL; new rows are
+    # stamped by batch_record_bot_decisions().
+    try:
+        cursor.execute("ALTER TABLE bot_decisions ADD COLUMN created_at INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    # Indexes for common ML training query patterns on bot_decisions.
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bot_decisions_bot_id "
+        "ON bot_decisions(bot_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bot_decisions_action "
+        "ON bot_decisions(action)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bot_decisions_created_at "
+        "ON bot_decisions(created_at)"
+    )
+
+    # Archive tables — same schema as their live counterparts, no FK constraints.
+    # Created here so they are always available even before the first cleanup run.
+    _create_archive_tables(cursor)
+
     cursor.execute("SELECT COUNT(*) AS c FROM app_settings")
     if cursor.fetchone()["c"] == 0:
         defaults = [
@@ -360,6 +480,11 @@ def init_db():
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_voter_feedback_bot_ts "
         "ON voter_feedback(bot_id, timestamp)"
+    )
+    # Per-voter-name lookups for MetaMagi training and feature extraction.
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_voter_feedback_voter_ts "
+        "ON voter_feedback(voter_name, timestamp)"
     )
 
     # Cached OHLCV candles — written by bot_runner on every fetch so the
@@ -808,6 +933,109 @@ def insert_voter_feedback(record: dict[str, Any]) -> None:
                 record.get("consensus_score"),
                 record.get("features_snapshot"),
             ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
+    """
+    Persist many voter votes in a single connection + single commit.
+
+    Replaces calling insert_voter_feedback() in a tight loop.  With 15 bots and
+    8 voters each, this drops ~120 separate transactions per 5-second cycle down
+    to one — eliminating the primary SQLite writer-lock contention source.
+
+    Accepts the same dict shape as insert_voter_feedback().
+    """
+    if not records:
+        return
+    rows = [
+        (
+            r.get("bot_id"),
+            r["timestamp"],
+            r["target_asset"],
+            r["ensemble_signal"],
+            r["voter_name"],
+            r["voter_signal"],
+            r.get("confidence"),
+            r.get("forward_roc_30s"),
+            r.get("forward_roc_5m"),
+            r.get("realized_pnl"),
+            r.get("consensus_score"),
+            r.get("features_snapshot"),
+        )
+        for r in records
+    ]
+    conn = get_db_connection()
+    try:
+        conn.executemany(
+            """
+            INSERT INTO voter_feedback (
+                bot_id, timestamp, target_asset, ensemble_signal,
+                voter_name, voter_signal, confidence,
+                forward_roc_30s, forward_roc_5m, realized_pnl,
+                consensus_score, features_snapshot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
+    """
+    Insert many bot_decisions rows in a single connection + single commit.
+
+    Each dict must contain: bot_id, symbol, mode, action, confidence, executed.
+    tick_id is resolved for all unique symbols in one query before the bulk insert,
+    so the entire batch costs one connection and two queries regardless of length.
+
+    Thread-safe: callers build their own list per bot per cycle; there is no
+    shared mutable state between threads.
+    """
+    if not decisions:
+        return
+
+    now_ms = int(time.time() * 1000)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+
+        # Resolve the latest tick_id for each unique symbol in a single connection.
+        unique_symbols = {d["symbol"] for d in decisions}
+        tick_map: dict[str, int | None] = {}
+        for sym in unique_symbols:
+            cur.execute(
+                "SELECT tick_id FROM market_ticks "
+                "WHERE target_asset = ? ORDER BY timestamp DESC LIMIT 1",
+                (sym,),
+            )
+            row = cur.fetchone()
+            tick_map[sym] = int(row["tick_id"]) if row else None
+
+        rows = [
+            (
+                d["bot_id"],
+                tick_map.get(d["symbol"]),
+                d["mode"],
+                d["action"].upper(),
+                d.get("confidence"),
+                int(d["executed"]),
+                now_ms,
+            )
+            for d in decisions
+        ]
+        cur.executemany(
+            """
+            INSERT INTO bot_decisions
+              (bot_id, tick_id, mode, action, confidence, executed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
         )
         conn.commit()
     finally:
