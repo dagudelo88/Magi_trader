@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import sys
 import time
 from collections import deque
+
+_dc_logger = logging.getLogger("data_collector")
 
 import websockets
 from dotenv import load_dotenv
@@ -67,6 +70,11 @@ BINANCE_MAX_STREAMS_PER_CONNECTION = 1024
 BINANCE_PROACTIVE_RECONNECT_SEC = 23 * 60 * 60 + 50 * 60
 BINANCE_RECV_TIMEOUT_SEC = 30.0
 MARKET_BROADCAST_MIN_INTERVAL_SEC = 2.0
+
+# Batch market_ticks writes: accumulate N seconds of rows before opening a
+# DB connection.  Reduces SQLite write pressure from 1 connection/s to
+# 1 connection / TICK_BATCH_SEC without sacrificing time-series granularity.
+TICK_BATCH_SEC: int = int(os.environ.get("TICK_BATCH_SEC", "5"))
 
 # ── Per-symbol state ────────────────────────────────────────────────────────
 
@@ -258,12 +266,16 @@ def _compute_volume_delta(sym: str) -> float:
     return delta
 
 
-def _write_ticks(timestamp: int) -> None:
-    """Snapshot every tracked symbol into market_ticks (including BTC)."""
+def _build_tick_rows(timestamp: int) -> list[tuple]:
+    """Compute one second's tick rows for all tracked symbols.
+
+    Returns an empty list when BTC price is not yet available (data not live).
+    Does NOT write to the database — call _flush_ticks() to persist.
+    """
     btc = state[BTC_STREAM_ID]
     btc_price = btc["price"][-1] if btc["price"] else 0.0
     if btc_price == 0.0:
-        return  # wait until BTC is live
+        return []  # wait until BTC is live
 
     btc_vol_delta = _compute_volume_delta(BTC_STREAM_ID)
     btc_roc = _roc_dict(BTC_STREAM_ID, "btc")
@@ -279,13 +291,11 @@ def _write_ticks(timestamp: int) -> None:
         target_roc = _roc_dict(sym, "target")
 
         features: dict = {
-            # Full bid/ask
             "bid": state[sym]["bid"],
             "ask": state[sym]["ask"],
             "btc_bid": btc["bid"],
             "btc_ask": btc["ask"],
             "btc_spread_bps": btc["spread_bps"],
-            # Extended ROC windows for ML
             **{f"target_roc_{w}s": target_roc[f"target_roc_{w}s"] for w in ROC_WINDOWS},
             **{f"btc_roc_{w}s": btc_roc[f"btc_roc_{w}s"] for w in ROC_WINDOWS},
         }
@@ -305,9 +315,20 @@ def _write_ticks(timestamp: int) -> None:
             json.dumps(features),
         ))
 
-    if not rows:
+    return rows
+
+
+def _flush_ticks(pending_rows: list[tuple]) -> None:
+    """Write accumulated tick rows to the database in one connection + commit.
+
+    Batching TICK_BATCH_SEC seconds of rows into a single write reduces SQLite
+    open/commit/close overhead from once per second to once per batch interval
+    without losing any time-series resolution in the stored data.
+    """
+    if not pending_rows:
         return
 
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         conn.executemany(
@@ -318,29 +339,57 @@ def _write_ticks(timestamp: int) -> None:
                btc_volume_delta, target_volume_delta, spread_bps, features_json)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            rows,
+            pending_rows,
         )
         conn.commit()
+    except Exception as exc:
+        _dc_logger.error("[data_collector] market_ticks flush failed: %s", exc)
     finally:
         conn.close()
 
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    try:
+        from services.monitoring import monitor  # noqa: PLC0415
+        monitor.record_db_op(f"flush_ticks({len(pending_rows)} rows)", elapsed_ms)
+    except Exception:
+        pass
+    if elapsed_ms > 500:
+        _dc_logger.warning(
+            "[data_collector] SLOW flush_ticks: %d rows → %.0f ms", len(pending_rows), elapsed_ms
+        )
+
 
 async def _data_logger() -> None:
-    print("[data_collector] Waiting 5s for initial stream data …")
+    print(
+        f"[data_collector] Waiting 5s for initial stream data … "
+        f"(batch interval: {TICK_BATCH_SEC}s)"
+    )
     await asyncio.sleep(5)
+
+    pending_rows: list[tuple] = []
+    tick_counter: int = 0
 
     while True:
         try:
             timestamp = int(time.time() * 1000)
 
-            # Snapshot current prices into rolling deques
+            # Snapshot current prices into rolling deques (every second).
             for sym in TRACKED_USDT_STREAM_IDS:
                 state[sym]["price"].append(state[sym]["latest_price"])
 
-            _write_ticks(timestamp)
+            # Build rows for this second without touching the DB.
+            rows = _build_tick_rows(timestamp)
+            pending_rows.extend(rows)
+            tick_counter += 1
+
+            # Flush to DB once per TICK_BATCH_SEC seconds.
+            if tick_counter >= TICK_BATCH_SEC:
+                _flush_ticks(pending_rows)
+                pending_rows = []
+                tick_counter = 0
 
         except Exception as exc:
-            print(f"[data_collector] Logger error: {exc}")
+            _dc_logger.error("[data_collector] Logger error: %s", exc)
 
         await asyncio.sleep(1.0)
 

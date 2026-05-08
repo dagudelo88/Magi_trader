@@ -114,12 +114,14 @@ class ConnectionManager:
         await websocket.accept()
         async with self._lock:
             self._channels[channel].add(websocket)
+        count = self.connected_count(channel)
+        logger.info("WS connect  channel=%r  clients=%d", channel, count)
         await websocket.send_text(
             WebSocketMessage(
                 type="connected",
                 data={
                     "channel": channel,
-                    "clients": self.connected_count(channel),
+                    "clients": count,
                 },
             ).model_dump_json()
         )
@@ -129,6 +131,10 @@ class ConnectionManager:
             self._channels[channel].discard(websocket)
             if not self._channels[channel]:
                 self._channels.pop(channel, None)
+        logger.info(
+            "WS disconnect  channel=%r  clients_remaining=%d",
+            channel, self.connected_count(channel),
+        )
 
     def connected_count(self, channel: str | None = None) -> int:
         if channel is not None:
@@ -176,6 +182,7 @@ class ConnectionManager:
         if not targets:
             return
 
+        _t0 = time.perf_counter()
         stale: list[WebSocket] = []
         for websocket in targets:
             try:
@@ -185,6 +192,13 @@ class ConnectionManager:
                 # refreshes and should not pollute production logs.
                 logger.debug("WS send failed on channel %r: %s", channel, exc)
                 stale.append(websocket)
+
+        broadcast_ms = (time.perf_counter() - _t0) * 1000
+        try:
+            from services.monitoring import monitor as _mon  # noqa: PLC0415
+            _mon.record_ws_broadcast(channel, len(targets), broadcast_ms)
+        except Exception:
+            pass
 
         if stale:
             async with self._lock:

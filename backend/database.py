@@ -164,10 +164,37 @@ def refresh_stale_bot_orders_from_exchange(bot_id: str, ex: Any, cooldown_sec: f
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
 
+
+def _report_db_timing(label: str, duration_ms: float) -> None:
+    """Forward a completed DB operation's timing to the performance monitor.
+
+    Uses a lazy import so database.py stays importable even before the services
+    package is on sys.path (e.g. standalone __main__ runs).  Never raises.
+    """
+    try:
+        from services.monitoring import monitor  # noqa: PLC0415
+        monitor.record_db_op(label, duration_ms)
+    except Exception:
+        pass
+
+
 def get_db_connection():
+    """Open a SQLite connection with per-connection performance pragmas.
+
+    WAL journal mode is persistent (set once by _enable_wal_once at startup).
+    The remaining pragmas must be applied on every new connection because SQLite
+    resets them to defaults when the connection is opened:
+
+    * synchronous=NORMAL  — safe with WAL; ~3× faster than FULL
+    * cache_size=10000    — 40 MB page cache (default is only 2 MB)
+    * temp_store=MEMORY   — keep temp tables/indexes in RAM, not disk
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=10000")
+    conn.execute("PRAGMA temp_store=MEMORY")
     return conn
 
 def _enable_wal_once() -> None:
@@ -289,6 +316,11 @@ def _create_archive_tables(cursor: sqlite3.Cursor) -> None:
 
 
 def init_db():
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "DB Optimizations + Debugging Mode ENABLED  "
+        "(WAL journal, synchronous=NORMAL, cache_size=10000, temp_store=MEMORY, timeout=15s)"
+    )
     _enable_wal_once()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -587,6 +619,7 @@ def upsert_ohlcv_candles(
     ]
     if not rows:
         return
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         conn.executemany(
@@ -602,6 +635,7 @@ def upsert_ohlcv_candles(
         pass  # never interrupt the live trading path
     finally:
         conn.close()
+    _report_db_timing(f"upsert_ohlcv_candles({symbol},{timeframe},{len(rows)})", (time.perf_counter() - t0) * 1000)
 
 
 def sync_bot_orders_from_logs(bot_id: str, symbol: str) -> int:
@@ -949,6 +983,7 @@ def batch_insert_bot_logs(records: list[tuple]) -> None:
     """
     if not records:
         return
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         conn.executemany(
@@ -960,6 +995,7 @@ def batch_insert_bot_logs(records: list[tuple]) -> None:
         conn.commit()
     finally:
         conn.close()
+    _report_db_timing(f"batch_insert_bot_logs({len(records)})", (time.perf_counter() - t0) * 1000)
 
 
 def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
@@ -991,6 +1027,7 @@ def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
         )
         for r in records
     ]
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         conn.executemany(
@@ -1007,6 +1044,7 @@ def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
         conn.commit()
     finally:
         conn.close()
+    _report_db_timing(f"batch_insert_voter_feedback({len(records)})", (time.perf_counter() - t0) * 1000)
 
 
 def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
@@ -1024,6 +1062,7 @@ def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
         return
 
     now_ms = int(time.time() * 1000)
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -1063,6 +1102,10 @@ def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
         conn.commit()
     finally:
         conn.close()
+    _report_db_timing(
+        f"batch_record_bot_decisions({len(decisions)})",
+        (time.perf_counter() - t0) * 1000,
+    )
 
 
 def get_latest_voter_signals(bot_id: str) -> list[dict[str, Any]]:

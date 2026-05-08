@@ -57,7 +57,8 @@ from trading.app_settings import get_execution_mode, is_global_halt
 from trading.bot_performance import compute_strategy_performance
 from trading.exchange_factory import build_binance_spot, build_binance_public
 from trading.strategies.registry import get_strategy, default_params_for
-from services.websocket_manager import publish_bot_event
+from services.websocket_manager import publish_bot_event, ws_manager
+from services.monitoring import monitor
 
 _last_trade_monotonic: dict[str, float] = {}
 
@@ -147,6 +148,7 @@ def _get_features_snapshot(symbol: str) -> str | None:
     trade execution or voter feedback logging.
     """
     try:
+        t0 = time.perf_counter()
         conn = get_db_connection()
         try:
             cur = conn.cursor()
@@ -161,6 +163,7 @@ def _get_features_snapshot(symbol: str) -> str | None:
             row = cur.fetchone()
         finally:
             conn.close()
+        monitor.record_db_op(f"get_features_snapshot({symbol})", (time.perf_counter() - t0) * 1000)
         if row and row["features_json"]:
             return row["features_json"]
     except Exception:
@@ -332,15 +335,18 @@ def _throttled_print(key: str, message: str) -> None:
 
 
 def _load_running_bots():
+    t0 = time.perf_counter()
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             "SELECT * FROM bots WHERE status = 'running' ORDER BY bot_id"
         )
-        return [dict(row) for row in cur.fetchall()]
+        result = [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
+    monitor.record_db_op("load_running_bots", (time.perf_counter() - t0) * 1000)
+    return result
 
 
 def _merge_params(strategy_name: str, raw: str | None) -> dict[str, Any]:
@@ -911,6 +917,8 @@ def _get_public_exchange():
 
 def _run_one_cycle():
     """One polling cycle — extracted so both the async and sync entrypoints share it."""
+    _cycle_wall_t0 = time.perf_counter()
+
     if is_global_halt():
         _throttled_print(
             "global_halt",
@@ -965,10 +973,11 @@ def _run_one_cycle():
 
     # ── Dispatch all bots in parallel threads ─────────────────────────────────
     def _run_bot(bot: dict[str, Any]) -> None:
+        bot_id = bot["bot_id"]
         mode = bot.get("execution_mode", "testnet")
         ex = exchanges.get(mode)
         if ex is None:
-            _log(bot["bot_id"], "error", mode,
+            _log(bot_id, "error", mode,
                  f"No exchange for execution_mode={mode!r} — check API keys in .env.")
             return
         params = _merge_params(bot.get("strategy") or "sma_cross", bot.get("strategy_params_json"))
@@ -976,29 +985,42 @@ def _run_one_cycle():
         timeframe = str(params.get("ohlcv_timeframe", "5m"))
         limit = int(params.get("ohlcv_limit", 50))
         prefetched = ohlcv_cache.get((symbol, timeframe, limit))
+
+        _cycle_t0 = time.perf_counter()
         try:
             _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched, public_ex=public_ex)
         except Exception:
-            _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
+            _log(bot_id, "error", mode, f"Unhandled: {traceback.format_exc()}")
         finally:
             # Flush all WS log entries collected during this bot's cycle as a
             # single batch event.  Must run even if _process_bot raised so logs
             # from the error path still reach the UI.
-            _flush_ws_log_buffer(bot["bot_id"])
+            _flush_ws_log_buffer(bot_id)
+
+        cycle_ms = (time.perf_counter() - _cycle_t0) * 1000
+        monitor.record_bot_cycle(bot_id, cycle_ms)
+
+        if cycle_ms > 500:
+            print(
+                f"[bot_runner] SLOW CYCLE bot={bot_id} symbol={symbol} "
+                f"→ {cycle_ms:.0f} ms",
+                flush=True,
+            )
 
         # bot_cycle_complete is informational noise at steady state.  Throttle
         # to once per _WS_CYCLE_COMPLETE_INTERVAL_SEC per bot so 6 bots don't
         # fire 6 empty events every 5 seconds.
         now_mono = time.monotonic()
-        if now_mono - _last_cycle_complete_ws.get(bot["bot_id"], 0.0) >= _WS_CYCLE_COMPLETE_INTERVAL_SEC:
-            _last_cycle_complete_ws[bot["bot_id"]] = now_mono
+        if now_mono - _last_cycle_complete_ws.get(bot_id, 0.0) >= _WS_CYCLE_COMPLETE_INTERVAL_SEC:
+            _last_cycle_complete_ws[bot_id] = now_mono
             _emit_bot_event(
-                bot["bot_id"],
+                bot_id,
                 "bot_cycle_complete",
                 {
                     "symbol": symbol,
                     "execution_mode": mode,
                     "status": bot.get("status"),
+                    "cycle_ms": round(cycle_ms, 1),
                 },
             )
 
@@ -1049,6 +1071,19 @@ def _run_one_cycle():
     # appended their rows; orphaned threads may add a few straggler rows to
     # the next cycle's flush, which is acceptable.
     _flush_log_queue()
+
+    # ── Observability ─────────────────────────────────────────────────────────
+    wall_ms = (time.perf_counter() - _cycle_wall_t0) * 1000
+    if wall_ms > 1000:
+        print(
+            f"[bot_runner] SLOW full cycle: {len(bots)} bot(s) → {wall_ms:.0f} ms",
+            flush=True,
+        )
+
+    monitor.maybe_log_health(
+        running_bots=len(bots),
+        ws_clients=ws_manager.connected_count(),
+    )
 
 
 def main():

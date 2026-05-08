@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 import os
 import subprocess
@@ -11,6 +12,16 @@ from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDis
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
+
+# Configure structured logging before anything else so all loggers
+# (monitoring, data_collector, meta_training_loop, etc.) emit to stdout.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
 
 from database import (
     create_bot,
@@ -55,6 +66,7 @@ from trading.strategies.registry import (
     strategy_catalog,
 )
 from services.websocket_manager import publish_bot_event, publish_bots_event, ws_manager
+from services.monitoring import monitor as perf_monitor
 
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_backend_dir, ".."))
@@ -266,6 +278,39 @@ async def ws_market(websocket: WebSocket):
 def ws_health():
     """Connection counts for WebSocket observability."""
     return ws_manager.health()
+
+
+@app.get("/api/health")
+def api_health():
+    """Comprehensive runtime health: DB stats, WS clients, bot cycles, slow ops.
+
+    Designed for quick triage — if the app hangs, hit this endpoint to see
+    exactly which operation is slow.
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM bots WHERE status = 'running'")
+        running_bots = cur.fetchone()[0]
+    except Exception:
+        running_bots = 0
+    finally:
+        conn.close()
+
+    snap = perf_monitor.snapshot(
+        running_bots=running_bots,
+        ws_clients=ws_manager.connected_count(),
+    )
+    snap["ws_channels"] = ws_manager.health()["channels"]
+    snap["db_path"] = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
+    )
+    try:
+        snap["db_size_mb"] = round(os.path.getsize(snap["db_path"]) / 1_048_576, 1)
+    except OSError:
+        snap["db_size_mb"] = None
+    return snap
+
 
 # Data collector runs as an asyncio.Task inside lifespan — always active.
 _DATA_COLLECTOR_MANAGED = True
