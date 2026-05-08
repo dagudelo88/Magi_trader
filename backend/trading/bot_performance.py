@@ -163,3 +163,100 @@ def compute_strategy_performance(
         "max_drawdown_pct": max_dd_pct,
         "quote_currency": qc,
     }
+
+
+def compute_closed_trades(
+    orders_oldest_first: list[dict[str, Any]],
+    symbol: str,
+) -> list[dict[str, Any]]:
+    """
+    Run FIFO matching and return one record per closed trade.
+
+    Each sell that consumed inventory produces one record:
+      - timestamp: sell order created_at (ms epoch)
+      - quantity: base units matched
+      - entry_price: weighted average cost basis per base unit
+      - exit_price: sell order execution price
+      - cost_basis_quote: total quote spent to acquire matched qty
+      - proceeds_quote: quote received from the sell (pro-rated)
+      - realized_pnl: proceeds_quote - cost_basis_quote
+      - outcome: 'win' | 'loss' | 'flat'
+      - quote_currency: e.g. 'USDT'
+    """
+    qc = _infer_quote_currency(symbol)
+    lots: list[Lot] = []
+    trades: list[dict[str, Any]] = []
+
+    for o in orders_oldest_first:
+        side = str(o.get("side") or "").lower()
+        if side == "buy":
+            b, q = _buy_base_cost(o)
+            if b <= 0:
+                continue
+            lots.append(Lot(rem_base=b, cost_quote=q))
+        elif side == "sell":
+            need, proceeds = _sell_base_proceeds(o)
+            if need <= 0:
+                continue
+            available = sum(lot.rem_base for lot in lots)
+            matched_base = min(need, available)
+            if matched_base <= 1e-12:
+                continue
+            if need > 1e-12:
+                proceeds_matched = proceeds * (matched_base / need)
+            else:
+                proceeds_matched = 0.0
+            basis = 0.0
+            rem = matched_base
+            while rem > 1e-12 and lots:
+                lot = lots[0]
+                take = min(rem, lot.rem_base)
+                if lot.rem_base > 1e-12:
+                    portion_cost = lot.cost_quote * (take / lot.rem_base)
+                else:
+                    portion_cost = 0.0
+                basis += portion_cost
+                lot.rem_base -= take
+                lot.cost_quote -= portion_cost
+                rem -= take
+                if lot.rem_base <= 1e-12:
+                    lots.pop(0)
+
+            pnl = proceeds_matched - basis
+            if matched_base > 1e-12:
+                entry_price: float | None = basis / matched_base
+            else:
+                entry_price = None
+
+            # Derive sell execution price from available fields
+            exit_price = _f(o.get("average"))
+            if exit_price is None:
+                filled = _f(o.get("filled"))
+                cost = _f(o.get("cost"))
+                if filled is not None and cost is not None and filled > 0:
+                    exit_price = cost / filled
+
+            if pnl > 1e-8:
+                outcome = "win"
+            elif pnl < -1e-8:
+                outcome = "loss"
+            else:
+                outcome = "flat"
+
+            trades.append({
+                "timestamp": o.get("created_at"),
+                "quantity": round(matched_base, 8),
+                "entry_price": (
+                    round(entry_price, 8) if entry_price is not None else None
+                ),
+                "exit_price": (
+                    round(exit_price, 8) if exit_price is not None else None
+                ),
+                "cost_basis_quote": round(basis, 8),
+                "proceeds_quote": round(proceeds_matched, 8),
+                "realized_pnl": round(pnl, 8),
+                "outcome": outcome,
+                "quote_currency": qc,
+            })
+
+    return trades

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { Copy, ChevronDown } from 'lucide-react';
+import { Copy, ChevronDown, Info } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
 
@@ -74,6 +74,18 @@ interface BotOrderRow {
   created_at: number;
   display_price?: number | null;
   display_status?: string;
+}
+
+interface ClosedTrade {
+  timestamp: number | null;
+  quantity: number;
+  entry_price: number | null;
+  exit_price: number | null;
+  cost_basis_quote: number;
+  proceeds_quote: number;
+  realized_pnl: number;
+  outcome: 'win' | 'loss' | 'flat';
+  quote_currency: string;
 }
 
 const _pad = (n: number, len = 2) => String(n).padStart(len, '0');
@@ -558,6 +570,11 @@ export default function BotDetail() {
   const logScrollRef = useRef<HTMLDivElement>(null);
   const logScrollRafRef = useRef<number | null>(null);
 
+  // Trade summary (FIFO per-trade PnL)
+  const [historyView, setHistoryView] = useState<'fills' | 'summary'>('fills');
+  const [tradeSummary, setTradeSummary] = useState<ClosedTrade[] | null>(null);
+  const [tradeSummaryLoading, setTradeSummaryLoading] = useState(false);
+
   const refresh = useCallback(async () => {
     if (!id) return;
     setError(null);
@@ -584,6 +601,34 @@ export default function BotDetail() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const fetchTradeSummary = useCallback(async () => {
+    if (!id) return;
+    setTradeSummaryLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${id}/trade-summary`);
+      if (!res.ok) return;
+      const data = await res.json() as { trades: ClosedTrade[] };
+      setTradeSummary(data.trades ?? []);
+    } catch {
+      // Non-fatal — summary degrades gracefully
+    } finally {
+      setTradeSummaryLoading(false);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    if (historyView === 'summary') {
+      void fetchTradeSummary();
+    }
+  }, [historyView, fetchTradeSummary]);
+
+  // Refresh trade summary alongside orders when bot is running
+  useEffect(() => {
+    if (!id || bot?.status !== 'running' || historyView !== 'summary') return;
+    const t = window.setInterval(() => void fetchTradeSummary(), 4000);
+    return () => window.clearInterval(t);
+  }, [id, bot?.status, historyView, fetchTradeSummary]);
 
   useEffect(() => {
     const b = strategyHealth?.initial_budget_quote;
@@ -1133,75 +1178,226 @@ export default function BotDetail() {
 
           {/* Execution history table */}
           <div className="min-w-0 px-4 pt-4 pb-2 sm:px-6 sm:pt-5">
+            {/* Header row: title + view toggle */}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h3 className="font-label text-[11px] font-bold uppercase tracking-widest text-magi-muted">
                 Execution History
               </h3>
-              <span className="font-label text-[9px] tracking-tight text-magi-muted/40">
-                {orderStats?.total_orders ?? 0} fills
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="font-label text-[9px] tracking-tight text-magi-muted/40">
+                  {orderStats?.total_orders ?? 0} fills
+                </span>
+                {/* View toggle */}
+                <div className="flex items-center rounded border border-magi-grid/30 overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => setHistoryView('fills')}
+                    className={`px-2.5 py-1 font-label text-[9px] font-bold uppercase tracking-wider transition-colors ${
+                      historyView === 'fills'
+                        ? 'bg-magi-primary/20 text-magi-primary'
+                        : 'text-magi-muted/50 hover:text-magi-muted/80'
+                    }`}
+                  >
+                    Fills
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setHistoryView('summary')}
+                    className={`px-2.5 py-1 font-label text-[9px] font-bold uppercase tracking-wider border-l border-magi-grid/30 transition-colors ${
+                      historyView === 'summary'
+                        ? 'bg-magi-primary/20 text-magi-primary'
+                        : 'text-magi-muted/50 hover:text-magi-muted/80'
+                    }`}
+                  >
+                    Trade PnL
+                  </button>
+                </div>
+              </div>
             </div>
-            <div className="max-h-[280px] overflow-auto">
-              <table className="w-full min-w-[36rem] text-left font-label text-[10px] sm:text-[11px]">
-                <thead className="sticky top-0 border-b border-magi-grid/10 bg-magi-bg uppercase text-magi-muted/40">
-                  <tr>
-                    <th className="py-2 pr-3 font-normal">Timestamp</th>
-                    <th className="py-2 pr-3 font-normal">Side</th>
-                    <th className="py-2 pr-3 text-right font-normal">Spent / Sold</th>
-                    <th className="py-2 pr-3 text-right font-normal">Received</th>
-                    <th className="py-2 pr-3 text-right font-normal">Avg Price</th>
-                    <th className="py-2 text-right font-normal">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-magi-grid/5">
-                  {orders.length === 0 && (
+
+            {historyView === 'fills' ? (
+              /* ── RAW FILLS TABLE (unchanged) ── */
+              <div className="max-h-[280px] overflow-auto">
+                <table className="w-full min-w-[36rem] text-left font-label text-[10px] sm:text-[11px]">
+                  <thead className="sticky top-0 border-b border-magi-grid/10 bg-magi-bg uppercase text-magi-muted/40">
                     <tr>
-                      <td colSpan={6} className="py-4 italic text-magi-muted/60">
-                        No fills yet — appears here after the first accepted buy/sell.
-                      </td>
+                      <th className="py-2 pr-3 font-normal">Timestamp</th>
+                      <th className="py-2 pr-3 font-normal">Side</th>
+                      <th className="py-2 pr-3 text-right font-normal">Spent / Sold</th>
+                      <th className="py-2 pr-3 text-right font-normal">Received</th>
+                      <th className="py-2 pr-3 text-right font-normal">Avg Price</th>
+                      <th className="py-2 text-right font-normal">Status</th>
                     </tr>
-                  )}
-                  {orders.map((o) => {
-                    const isBuy = o.side === 'buy';
-                    const avgPx =
-                      o.display_price != null ? o.display_price
-                      : o.average != null ? o.average
-                      : (o.cost != null && o.filled != null && o.filled > 0)
-                        ? o.cost / o.filled
-                        : null;
-
-                    const baseSym = o.symbol?.split('/')[0] ?? 'BASE';
-                    const quoteSym = o.symbol?.split('/')[1] ?? 'QUOTE';
-
-                    const spentLabel = isBuy
-                      ? o.cost != null ? `${formatQuoteAmount(o.cost, 4)} ${quoteSym}` : '—'
-                      : o.filled != null ? `${formatQuoteAmount(o.filled, 8)} ${baseSym}` : '—';
-
-                    const receivedLabel = isBuy
-                      ? o.filled != null ? `${formatQuoteAmount(o.filled, 8)} ${baseSym}` : '—'
-                      : o.cost != null ? `${formatQuoteAmount(o.cost, 4)} ${quoteSym}` : '—';
-
-                    const st = (o.display_status ?? o.status ?? 'FILLED').toUpperCase();
-                    return (
-                      <tr key={o.order_row_id} className="text-magi-on-bg/80 hover:bg-white/[0.02]">
-                        <td className="py-2 pr-3 font-mono text-magi-muted/60">{formatLogTimeExec(o.created_at)}</td>
-                        <td className={`py-2 pr-3 font-black tracking-wider ${isBuy ? 'text-magi-tertiary' : 'text-magi-secondary'}`}>
-                          {isBuy ? '▲ BUY' : '▼ SELL'}
+                  </thead>
+                  <tbody className="divide-y divide-magi-grid/5">
+                    {orders.length === 0 && (
+                      <tr>
+                        <td colSpan={6} className="py-4 italic text-magi-muted/60">
+                          No fills yet — appears here after the first accepted buy/sell.
                         </td>
-                        <td className="py-2 pr-3 text-right font-mono">{spentLabel}</td>
-                        <td className={`py-2 pr-3 text-right font-mono font-bold ${isBuy ? 'text-magi-tertiary' : 'text-magi-secondary'}`}>
-                          {receivedLabel}
-                        </td>
-                        <td className="py-2 pr-3 text-right font-mono text-magi-muted/70">
-                          {avgPx != null ? `${formatExecPrice(avgPx)}` : '—'}
-                        </td>
-                        <td className="py-2 text-right text-magi-muted/50">{st}</td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                    )}
+                    {orders.map((o) => {
+                      const isBuy = o.side === 'buy';
+                      const avgPx =
+                        o.display_price != null ? o.display_price
+                        : o.average != null ? o.average
+                        : (o.cost != null && o.filled != null && o.filled > 0)
+                          ? o.cost / o.filled
+                          : null;
+
+                      const baseSym = o.symbol?.split('/')[0] ?? 'BASE';
+                      const quoteSym = o.symbol?.split('/')[1] ?? 'QUOTE';
+
+                      const spentLabel = isBuy
+                        ? o.cost != null ? `${formatQuoteAmount(o.cost, 4)} ${quoteSym}` : '—'
+                        : o.filled != null ? `${formatQuoteAmount(o.filled, 8)} ${baseSym}` : '—';
+
+                      const receivedLabel = isBuy
+                        ? o.filled != null ? `${formatQuoteAmount(o.filled, 8)} ${baseSym}` : '—'
+                        : o.cost != null ? `${formatQuoteAmount(o.cost, 4)} ${quoteSym}` : '—';
+
+                      const st = (o.display_status ?? o.status ?? 'FILLED').toUpperCase();
+                      return (
+                        <tr key={o.order_row_id} className="text-magi-on-bg/80 hover:bg-white/[0.02]">
+                          <td className="py-2 pr-3 font-mono text-magi-muted/60">{formatLogTimeExec(o.created_at)}</td>
+                          <td className={`py-2 pr-3 font-black tracking-wider ${isBuy ? 'text-magi-tertiary' : 'text-magi-secondary'}`}>
+                            {isBuy ? '▲ BUY' : '▼ SELL'}
+                          </td>
+                          <td className="py-2 pr-3 text-right font-mono">{spentLabel}</td>
+                          <td className={`py-2 pr-3 text-right font-mono font-bold ${isBuy ? 'text-magi-tertiary' : 'text-magi-secondary'}`}>
+                            {receivedLabel}
+                          </td>
+                          <td className="py-2 pr-3 text-right font-mono text-magi-muted/70">
+                            {avgPx != null ? `${formatExecPrice(avgPx)}` : '—'}
+                          </td>
+                          <td className="py-2 text-right text-magi-muted/50">{st}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              /* ── TRADE SUMMARY / PnL TABLE ── */
+              <div>
+                {/* FIFO info banner */}
+                <div className="mb-2 flex items-start gap-1.5 rounded border border-magi-grid/20 bg-magi-grid/5 px-3 py-2">
+                  <Info className="mt-0.5 h-3 w-3 shrink-0 text-magi-muted/50" strokeWidth={2} />
+                  <p className="font-label text-[9px] leading-snug text-magi-muted/50">
+                    Each row is one closed trade — a sell matched against prior buys using{' '}
+                    <span className="font-bold text-magi-muted/70">FIFO</span> cost accounting.
+                    Entry price is the weighted average cost basis of the consumed lots.
+                  </p>
+                </div>
+                <div className="max-h-[280px] overflow-auto">
+                  {tradeSummaryLoading && tradeSummary === null ? (
+                    <p className="py-4 font-label text-[10px] italic text-magi-muted/50">Loading…</p>
+                  ) : (
+                    <table className="w-full min-w-[42rem] text-left font-label text-[10px] sm:text-[11px]">
+                      <thead className="sticky top-0 border-b border-magi-grid/10 bg-magi-bg uppercase text-magi-muted/40">
+                        <tr>
+                          <th className="py-2 pr-3 font-normal">Exit Time</th>
+                          <th className="py-2 pr-3 text-right font-normal">Qty</th>
+                          <th className="py-2 pr-3 text-right font-normal">Entry Price</th>
+                          <th className="py-2 pr-3 text-right font-normal">Exit Price</th>
+                          <th className="py-2 pr-3 text-right font-normal">Cost Basis</th>
+                          <th className="py-2 pr-3 text-right font-normal">Proceeds</th>
+                          <th className="py-2 text-right font-normal">Realized PnL</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-magi-grid/5">
+                        {(tradeSummary ?? []).length === 0 && (
+                          <tr>
+                            <td colSpan={7} className="py-4 italic text-magi-muted/60">
+                              No closed trades yet — PnL appears here after the first matched buy→sell pair.
+                            </td>
+                          </tr>
+                        )}
+                        {[...(tradeSummary ?? [])].reverse().map((t, i) => {
+                          const qc = t.quote_currency;
+                          const pnlColor =
+                            t.outcome === 'win'
+                              ? 'text-emerald-400'
+                              : t.outcome === 'loss'
+                              ? 'text-red-400'
+                              : 'text-magi-muted/60';
+                          const outcomeLabel =
+                            t.outcome === 'win' ? '▲ W' : t.outcome === 'loss' ? '▼ L' : '= B';
+                          const outcomeBadge =
+                            t.outcome === 'win'
+                              ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+                              : t.outcome === 'loss'
+                              ? 'bg-red-500/15 text-red-400 border-red-500/30'
+                              : 'bg-magi-grid/10 text-magi-muted/50 border-magi-grid/20';
+                          return (
+                            <tr
+                              key={i}
+                              className={`hover:bg-white/[0.02] ${
+                                t.outcome === 'win'
+                                  ? 'bg-emerald-500/[0.03]'
+                                  : t.outcome === 'loss'
+                                  ? 'bg-red-500/[0.03]'
+                                  : ''
+                              }`}
+                            >
+                              <td className="py-2 pr-3 font-mono text-magi-muted/60">
+                                {t.timestamp != null ? formatLogTimeExec(t.timestamp) : '—'}
+                              </td>
+                              <td className="py-2 pr-3 text-right font-mono text-magi-on-bg/70">
+                                {formatQuoteAmount(t.quantity, 6)}
+                              </td>
+                              <td className="py-2 pr-3 text-right font-mono text-magi-muted/70">
+                                {t.entry_price != null ? formatExecPrice(t.entry_price) : '—'}
+                              </td>
+                              <td className="py-2 pr-3 text-right font-mono text-magi-muted/70">
+                                {t.exit_price != null ? formatExecPrice(t.exit_price) : '—'}
+                              </td>
+                              <td className="py-2 pr-3 text-right font-mono text-magi-muted/50">
+                                {formatQuoteAmount(t.cost_basis_quote, 4)} {qc}
+                              </td>
+                              <td className="py-2 pr-3 text-right font-mono text-magi-muted/50">
+                                {formatQuoteAmount(t.proceeds_quote, 4)} {qc}
+                              </td>
+                              <td className="py-2 text-right">
+                                <span className={`inline-flex items-center gap-1.5 rounded border px-1.5 py-0.5 font-mono text-[10px] font-bold ${outcomeBadge}`}>
+                                  <span className="font-label text-[8px] tracking-wider">{outcomeLabel}</span>
+                                  {t.realized_pnl >= 0 ? '+' : ''}
+                                  {formatQuoteAmount(t.realized_pnl, 4)} {qc}
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                      {(tradeSummary ?? []).length > 0 && (
+                        <tfoot className="border-t border-magi-grid/20">
+                          <tr>
+                            <td colSpan={6} className="py-2 pr-3 font-label text-[9px] uppercase tracking-wider text-magi-muted/40">
+                              {(tradeSummary ?? []).length} closed trades ·{' '}
+                              {(tradeSummary ?? []).filter((t) => t.outcome === 'win').length}W ·{' '}
+                              {(tradeSummary ?? []).filter((t) => t.outcome === 'loss').length}L ·{' '}
+                              {(tradeSummary ?? []).filter((t) => t.outcome === 'flat').length}B
+                            </td>
+                            <td className="py-2 text-right">
+                              {(() => {
+                                const total = (tradeSummary ?? []).reduce((s, t) => s + t.realized_pnl, 0);
+                                const qc = tradeSummary?.[0]?.quote_currency ?? 'USDT';
+                                return (
+                                  <span className={`font-mono text-[11px] font-black ${total >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                    {total >= 0 ? '+' : ''}{formatQuoteAmount(total, 4)} {qc}
+                                  </span>
+                                );
+                              })()}
+                            </td>
+                          </tr>
+                        </tfoot>
+                      )}
+                    </table>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
 

@@ -43,7 +43,7 @@ from trading.app_settings import (
 from trading.constants import LIVE_TRADING_CONFIRMATION_PHRASE
 from trading.binance_errors import explain_fetch_balance_error
 from trading.exchange_factory import build_binance_spot
-from trading.bot_performance import compute_strategy_performance
+from trading.bot_performance import compute_strategy_performance, compute_closed_trades
 from trading.strategy_budget import (
     initial_budget_from_strategy_params_json,
     merge_strategy_params_json,
@@ -758,6 +758,39 @@ def get_bot(bot_id: str):
         }
     finally:
         conn.close()
+
+
+@app.get("/api/bots/{bot_id}/trade-summary")
+def get_bot_trade_summary(bot_id: str):
+    """
+    Return per-trade FIFO-matched closed trades for the bot.
+
+    Each entry represents one sell event that consumed inventory, with:
+      entry_price  — weighted average cost basis (FIFO)
+      exit_price   — sell execution price
+      realized_pnl — proceeds minus cost basis
+      outcome      — 'win' | 'loss' | 'flat'
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT symbol, execution_mode FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        sym = str(row["symbol"] or "")
+        bot_mode = str(row["execution_mode"] or "testnet")
+    finally:
+        conn.close()
+
+    orders_asc = fetch_bot_orders_chronological(bot_id)
+    trades = compute_closed_trades(orders_asc, sym)
+    return {
+        "trades": trades,
+        "symbol": sym,
+        "execution_mode": bot_mode,
+        "total_closed": len(trades),
+    }
 
 
 @app.get("/api/bots/{bot_id}/voter-signals")
