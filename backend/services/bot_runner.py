@@ -13,6 +13,7 @@ import json
 import math
 import os
 import sys
+import threading
 import time
 import traceback
 from typing import Any
@@ -44,6 +45,7 @@ from database import (
     get_db_connection,
     record_bot_order,
     record_bot_decision,
+    batch_insert_bot_logs,
     batch_insert_voter_feedback,
     batch_record_bot_decisions,
     fetch_bot_orders_chronological,
@@ -61,6 +63,12 @@ POLL_SEC = 5
 
 _last_throttled_bot_info: dict[str, float] = {}
 _last_throttled_print: dict[str, float] = {}
+
+# Per-cycle log queue — all bot_log rows written during one _run_one_cycle()
+# call are collected here and flushed in a single batch transaction at the end.
+# Protected by a lock because multiple bot threads append concurrently.
+_log_queue: list[tuple] = []
+_log_queue_lock = threading.Lock()
 
 
 def _format_meta(meta: dict) -> str:
@@ -166,23 +174,37 @@ def _debug_logs_enabled() -> bool:
 
 
 def _log(bot_id: str, level: str, execution_mode: str, message: str) -> None:
-    conn = get_db_connection()
+    # Print with HH:MM:SS timestamp so stalls in the terminal are immediately visible.
+    ts = time.strftime("%H:%M:%S")
     try:
-        conn.execute(
-            """
-            INSERT INTO bot_logs (bot_id, created_at, level, execution_mode, message)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (bot_id, int(time.time() * 1000), level, execution_mode, message),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    try:
-        print(f"[{level}] [{execution_mode}] bot={bot_id} {message}", flush=True)
+        print(f"{ts} [{level}] [{execution_mode}] bot={bot_id} {message}", flush=True)
     except (OSError, ValueError):
         # Stdout pipe is broken or closed (common when spawned as a subprocess).
-        # The DB write above already succeeded — this is just a console echo.
+        pass
+    # Queue the DB row for bulk insert at end of cycle (_flush_log_queue).
+    # This replaces the old per-line open/commit/close that caused lock contention.
+    with _log_queue_lock:
+        _log_queue.append(
+            (bot_id, int(time.time() * 1000), level, execution_mode, message)
+        )
+
+
+def _flush_log_queue() -> None:
+    """
+    Write all queued bot_log rows to the DB in a single transaction.
+
+    Called once at the end of every _run_one_cycle() — after all bot threads
+    have completed — so the entire cycle's logs cost exactly one DB commit
+    instead of one commit per log line (was ~30–50 commits per 5-second cycle).
+    """
+    with _log_queue_lock:
+        if not _log_queue:
+            return
+        rows = list(_log_queue)
+        _log_queue.clear()
+    try:
+        batch_insert_bot_logs(rows)
+    except Exception:
         pass
 
 
@@ -558,14 +580,29 @@ def _process_bot(
                  f"SELL skipped — rounded amount is zero (raw {sell_amt:.8f} {base_cur})")
             return
 
-        # Final notional guard after precision rounding — rounding can push the
-        # amount slightly below minimum. Add 1% buffer for price slippage.
+        # Final notional guard after precision rounding.
+        # Rounding down can push the notional just below the exchange minimum, so
+        # bump sell_amt up by one step and re-round.  We use min_cost * 1.02 as
+        # the target (consistent with the BUY side) to absorb small price moves
+        # between the estimate and the actual fill.
         final_notional = float(sell_prec) * last_close
-        if min_cost > 0 and final_notional < min_cost * 0.99:
-            _log(bot_id, "warn", execution_mode,
-                 f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
-                 f" below exchange minimum {min_cost} {quote_cur}")
-            return
+        if min_cost > 0 and final_notional < min_cost:
+            # One more bump: re-derive the minimum amount from the current price
+            # with the same 2% safety margin used on the BUY side, then re-round.
+            # open_base is only set when initial_budget > 0; the ternary short-circuits.
+            available = (open_base if initial_budget > 0 else free_base)
+            bumped_amt = (min_cost * 1.02) / last_close
+            if bumped_amt <= available:
+                sell_prec = ex.amount_to_precision(symbol, bumped_amt)
+                final_notional = float(sell_prec) * last_close
+                _log(bot_id, "info", execution_mode,
+                     f"SELL: post-rounding notional {float(sell_prec) * last_close:.4f} {quote_cur}"
+                     f" — re-bumped to {sell_prec} {base_cur} to clear NOTIONAL filter")
+            else:
+                _log(bot_id, "warn", execution_mode,
+                     f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
+                     f" below exchange minimum {min_cost} {quote_cur} and cannot bump further")
+                return
 
         _log(bot_id, "info", execution_mode,
              f"SELL order: selling {sell_prec} {base_cur} "
@@ -749,6 +786,10 @@ def _run_one_cycle():
             )
             for future in futures:
                 future.cancel()
+
+    # All bot threads have finished (or been cancelled).  Flush the entire
+    # cycle's bot_log rows in one transaction — the main DB write-reduction win.
+    _flush_log_queue()
 
 
 def main():

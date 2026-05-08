@@ -939,6 +939,29 @@ def insert_voter_feedback(record: dict[str, Any]) -> None:
         conn.close()
 
 
+def batch_insert_bot_logs(records: list[tuple]) -> None:
+    """
+    Persist many bot_log rows in a single connection + single commit.
+
+    Each tuple must be: (bot_id, created_at_ms, level, execution_mode, message).
+    Called once per cycle by _flush_log_queue() in bot_runner — replaces the
+    per-line open/commit/close pattern that caused heavy write contention.
+    """
+    if not records:
+        return
+    conn = get_db_connection()
+    try:
+        conn.executemany(
+            "INSERT INTO bot_logs"
+            "  (bot_id, created_at, level, execution_mode, message)"
+            "  VALUES (?, ?, ?, ?, ?)",
+            records,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
     """
     Persist many voter votes in a single connection + single commit.
