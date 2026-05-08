@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import defaultdict
 from typing import Any
 
 # region path / env
@@ -73,6 +74,35 @@ _log_queue_lock = threading.Lock()
 _ws_log_seq = 0
 _ws_log_seq_lock = threading.Lock()
 
+# ---------------------------------------------------------------------------
+# WS event throttling configuration
+# ---------------------------------------------------------------------------
+
+# How often (seconds) to re-broadcast bot_cooldown per bot.  Every 5-second
+# cycle would send one event per bot regardless of activity — throttling to
+# ~30 s cuts cooldown noise by ~6× with no meaningful UX loss.
+_WS_COOLDOWN_INTERVAL_SEC: float = float(
+    os.environ.get("WS_COOLDOWN_INTERVAL_SEC", "30")
+)
+
+# How often (seconds) to re-broadcast bot_cycle_complete per bot.
+# This event is informational noise in steady state; once per minute is enough.
+_WS_CYCLE_COMPLETE_INTERVAL_SEC: float = float(
+    os.environ.get("WS_CYCLE_COMPLETE_INTERVAL_SEC", "60")
+)
+
+# Per-bot timestamps for WS-level throttling (monotonic clock, not wall time).
+_last_cooldown_ws: dict[str, float] = {}
+_last_cycle_complete_ws: dict[str, float] = {}
+
+# Per-bot WS log buffer — log entries are accumulated during a cycle and
+# flushed as a single bot_log_batch event at the end of _run_bot().
+# This replaces the old one-event-per-log-line approach that could generate
+# 5–8 bot_log events per bot per cycle (30–50 total with 6 bots).
+# Protected by a lock because multiple bot threads write concurrently.
+_ws_log_buffers: dict[str, list] = defaultdict(list)
+_ws_log_buffer_lock = threading.Lock()
+
 
 def _next_ws_log_id(created_at: int) -> int:
     global _ws_log_seq
@@ -81,9 +111,15 @@ def _next_ws_log_id(created_at: int) -> int:
         return -((created_at * 100_000) + _ws_log_seq)
 
 
-def _emit_bot_event(bot_id: str, event_type: str, data: dict[str, Any]) -> None:
+def _emit_bot_event(
+    bot_id: str,
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    priority: bool = False,
+) -> None:
     try:
-        publish_bot_event(bot_id, event_type, data)
+        publish_bot_event(bot_id, event_type, data, priority=priority)
     except Exception:
         pass
 
@@ -222,20 +258,34 @@ def _log(bot_id: str, level: str, execution_mode: str, message: str) -> None:
         _log_queue.append(
             (bot_id, created_at, level, execution_mode, message)
         )
-    _emit_bot_event(
-        bot_id,
-        "bot_log",
-        {
-            "log": {
-                "log_id": _next_ws_log_id(created_at),
-                "bot_id": bot_id,
-                "created_at": created_at,
-                "level": level,
-                "execution_mode": execution_mode,
-                "message": message,
-            }
-        },
-    )
+    # Buffer the WS log entry — flushed as a single bot_log_batch event at the
+    # end of _run_bot() instead of firing one WebSocket message per log line.
+    # With 6 bots emitting 5–8 logs each this cuts WS traffic by ~30×.
+    with _ws_log_buffer_lock:
+        _ws_log_buffers[bot_id].append({
+            "log_id": _next_ws_log_id(created_at),
+            "bot_id": bot_id,
+            "created_at": created_at,
+            "level": level,
+            "execution_mode": execution_mode,
+            "message": message,
+        })
+
+
+def _flush_ws_log_buffer(bot_id: str) -> None:
+    """Emit all buffered log entries for this bot as a single WS batch event.
+
+    Called once at the end of each _run_bot() invocation so the entire cycle's
+    logs cost exactly one WebSocket message instead of one per log line.
+    """
+    with _ws_log_buffer_lock:
+        buf = _ws_log_buffers.get(bot_id)
+        if not buf:
+            return
+        logs = list(buf)
+        buf.clear()
+    if logs:
+        _emit_bot_event(bot_id, "bot_log_batch", {"logs": logs})
 
 
 def _flush_log_queue() -> None:
@@ -340,6 +390,7 @@ def _log_post_trade_balance(
                     quote_cur: {"free": free_quote},
                 },
             },
+            priority=True,
         )
     except Exception:
         pass
@@ -404,16 +455,21 @@ def _process_bot(
     elapsed = time.monotonic() - last
     if elapsed < interval_key:
         left = max(0.0, interval_key - elapsed)
-        _emit_bot_event(
-            bot_id,
-            "bot_cooldown",
-            {
-                "symbol": symbol,
-                "execution_mode": execution_mode,
-                "remaining_sec": round(left, 3),
-                "interval_sec": interval_key,
-            },
-        )
+        # Throttle bot_cooldown broadcasts: sending one per cycle (every 5 s) per
+        # bot generates pure noise — cap to once per _WS_COOLDOWN_INTERVAL_SEC.
+        now_mono = time.monotonic()
+        if now_mono - _last_cooldown_ws.get(bot_id, 0.0) >= _WS_COOLDOWN_INTERVAL_SEC:
+            _last_cooldown_ws[bot_id] = now_mono
+            _emit_bot_event(
+                bot_id,
+                "bot_cooldown",
+                {
+                    "symbol": symbol,
+                    "execution_mode": execution_mode,
+                    "remaining_sec": round(left, 3),
+                    "interval_sec": interval_key,
+                },
+            )
         _log_info_throttled(
             bot_id,
             execution_mode,
@@ -622,6 +678,7 @@ def _process_bot(
                         "status": order.get("status"),
                     },
                 },
+                priority=True,
             )
             _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
             _queue_decision("BUY", _signal_confidence, True)
@@ -636,6 +693,7 @@ def _process_bot(
                     "side": "buy",
                     "reason": str(e),
                 },
+                priority=True,
             )
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
 
@@ -768,6 +826,7 @@ def _process_bot(
                         "status": order.get("status"),
                     },
                 },
+                priority=True,
             )
             _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
             _queue_decision("SELL", _signal_confidence, True)
@@ -782,6 +841,7 @@ def _process_bot(
                     "side": "sell",
                     "reason": str(e),
                 },
+                priority=True,
             )
             _log(bot_id, "error", execution_mode, f"SELL failed: {e}\n{traceback.format_exc()}")
 
@@ -918,6 +978,20 @@ def _run_one_cycle():
         prefetched = ohlcv_cache.get((symbol, timeframe, limit))
         try:
             _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched, public_ex=public_ex)
+        except Exception:
+            _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
+        finally:
+            # Flush all WS log entries collected during this bot's cycle as a
+            # single batch event.  Must run even if _process_bot raised so logs
+            # from the error path still reach the UI.
+            _flush_ws_log_buffer(bot["bot_id"])
+
+        # bot_cycle_complete is informational noise at steady state.  Throttle
+        # to once per _WS_CYCLE_COMPLETE_INTERVAL_SEC per bot so 6 bots don't
+        # fire 6 empty events every 5 seconds.
+        now_mono = time.monotonic()
+        if now_mono - _last_cycle_complete_ws.get(bot["bot_id"], 0.0) >= _WS_CYCLE_COMPLETE_INTERVAL_SEC:
+            _last_cycle_complete_ws[bot["bot_id"]] = now_mono
             _emit_bot_event(
                 bot["bot_id"],
                 "bot_cycle_complete",
@@ -927,8 +1001,6 @@ def _run_one_cycle():
                     "status": bot.get("status"),
                 },
             )
-        except Exception:
-            _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
 
     # Per-cycle hard deadline.  Each bot gets up to _CYCLE_TIMEOUT_SEC of wall
     # time; after that we move on regardless — the hung thread is ORPHANED, not

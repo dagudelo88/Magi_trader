@@ -35,6 +35,19 @@ function reconnectDelayMs(attempt: number): number {
   return base + Math.floor(Math.random() * 500);
 }
 
+// Message types that carry no application state and should not be stored in
+// the React Query cache.  'connected' and 'pong' are from the handshake/client
+// ping flow; 'ping' is the backend heartbeat sent every ~22 s.
+const IGNORED_MESSAGE_TYPES = new Set(['connected', 'pong', 'ping']);
+
+// Cache entries for ['magi-ws', path, eventType] that have not been refreshed
+// within CACHE_STALE_THRESHOLD_MS are pruned every CACHE_CLEANUP_INTERVAL_MS.
+// In normal operation each (path, eventType) pair is overwritten on every event
+// and never accumulates, but orphaned entries from old sessions or rarely-fired
+// event types can linger indefinitely without this cleanup.
+const CACHE_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const CACHE_STALE_THRESHOLD_MS = 5 * 60 * 1000;  // 5 minutes without update
+
 export function useMagiWebSocket<TData = Record<string, unknown>>({
   path,
   enabled = true,
@@ -68,6 +81,29 @@ export function useMagiWebSocket<TData = Record<string, unknown>>({
       heartbeatTimer = 0;
     };
 
+    // Periodically prune stale ['magi-ws', path, eventType] cache entries.
+    // Each live subscription overwrites its key on every incoming event, so
+    // stale entries only appear when a channel produces a rarely-seen eventType
+    // or when the hook unmounts without explicit cache invalidation.
+    const cleanupTimer = window.setInterval(() => {
+      const cutoff = Date.now() - CACHE_STALE_THRESHOLD_MS;
+      queryClient
+        .getQueryCache()
+        .getAll()
+        .filter((q) => {
+          const key = q.queryKey;
+          return (
+            Array.isArray(key) &&
+            key[0] === 'magi-ws' &&
+            key[1] === path
+          );
+        })
+        .filter((q) => (q.state.dataUpdatedAt ?? 0) < cutoff)
+        .forEach((q) =>
+          queryClient.removeQueries({ queryKey: q.queryKey, exact: true })
+        );
+    }, CACHE_CLEANUP_INTERVAL_MS);
+
     const connect = () => {
       if (closedByEffect) return;
       setStatus(attempts === 0 ? 'connecting' : 'reconnecting');
@@ -76,6 +112,8 @@ export function useMagiWebSocket<TData = Record<string, unknown>>({
       socket.onopen = () => {
         attempts = 0;
         setStatus('open');
+        // Client-side ping keeps the connection alive and lets us detect a
+        // dead server independently of the backend heartbeat.
         heartbeatTimer = window.setInterval(() => {
           if (socket?.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ type: 'ping', timestamp: Date.now() }));
@@ -86,7 +124,8 @@ export function useMagiWebSocket<TData = Record<string, unknown>>({
       socket.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data) as MagiWebSocketMessage<TData>;
-          if (message.type === 'pong' || message.type === 'connected') return;
+          // Skip handshake/heartbeat frames — they carry no application state.
+          if (IGNORED_MESSAGE_TYPES.has(message.type)) return;
           queryClient.setQueryData(['magi-ws', path, message.type], message);
           if (queryKey) queryClient.setQueryData(queryKey, message);
           onMessageRef.current?.(message);
@@ -120,6 +159,7 @@ export function useMagiWebSocket<TData = Record<string, unknown>>({
     return () => {
       closedByEffect = true;
       clearTimers();
+      window.clearInterval(cleanupTimer);
       socket?.close();
     };
   }, [enabled, heartbeatMs, maxRetries, path, queryClient, queryKey]);

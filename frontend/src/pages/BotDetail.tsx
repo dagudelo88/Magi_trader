@@ -642,6 +642,17 @@ export default function BotDetail() {
         setLogs((prev) => [log, ...prev.filter((item) => item.log_id !== log.log_id)].slice(0, 150));
         return;
       }
+      // Batched log event: multiple log lines sent as one message to reduce WS traffic.
+      // Logs arrive in chronological order; prepend newest-first to match the store's order.
+      if (message.type === 'bot_log_batch' && Array.isArray(data.logs)) {
+        const batchLogs = (data.logs as BotLogRow[]).slice().reverse();
+        setLogs((prev) => {
+          const existingIds = new Set(prev.map((l) => l.log_id));
+          const newLogs = batchLogs.filter((l) => !existingIds.has(l.log_id));
+          return [...newLogs, ...prev].slice(0, 150);
+        });
+        return;
+      }
       if (message.type === 'voter_signals' && Array.isArray(data.voter_signals)) {
         setLiveVoterSignals(data.voter_signals as LiveVoterSignal[]);
         setVoterSignalsUpdatedAt(Date.now());
