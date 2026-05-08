@@ -56,6 +56,7 @@ from trading.app_settings import get_execution_mode, is_global_halt
 from trading.bot_performance import compute_strategy_performance
 from trading.exchange_factory import build_binance_spot, build_binance_public
 from trading.strategies.registry import get_strategy, default_params_for
+from services.websocket_manager import publish_bot_event
 
 _last_trade_monotonic: dict[str, float] = {}
 
@@ -69,6 +70,22 @@ _last_throttled_print: dict[str, float] = {}
 # Protected by a lock because multiple bot threads append concurrently.
 _log_queue: list[tuple] = []
 _log_queue_lock = threading.Lock()
+_ws_log_seq = 0
+_ws_log_seq_lock = threading.Lock()
+
+
+def _next_ws_log_id(created_at: int) -> int:
+    global _ws_log_seq
+    with _ws_log_seq_lock:
+        _ws_log_seq = (_ws_log_seq + 1) % 100_000
+        return -((created_at * 100_000) + _ws_log_seq)
+
+
+def _emit_bot_event(bot_id: str, event_type: str, data: dict[str, Any]) -> None:
+    try:
+        publish_bot_event(bot_id, event_type, data)
+    except Exception:
+        pass
 
 
 def _format_meta(meta: dict) -> str:
@@ -156,6 +173,23 @@ def _log_voter_feedback(bot_id: str, symbol: str, result: Any) -> None:
     ]
     try:
         batch_insert_voter_feedback(records)
+        _emit_bot_event(
+            bot_id,
+            "voter_signals",
+            {
+                "symbol": symbol,
+                "voter_signals": [
+                    {
+                        "voter_name": r["voter_name"],
+                        "voter_signal": r["voter_signal"],
+                        "confidence": r["confidence"],
+                        "consensus_score": r["consensus_score"],
+                        "timestamp": r["timestamp"],
+                    }
+                    for r in records
+                ],
+            },
+        )
     except Exception:
         pass
 
@@ -176,6 +210,7 @@ def _debug_logs_enabled() -> bool:
 def _log(bot_id: str, level: str, execution_mode: str, message: str) -> None:
     # Print with HH:MM:SS timestamp so stalls in the terminal are immediately visible.
     ts = time.strftime("%H:%M:%S")
+    created_at = int(time.time() * 1000)
     try:
         print(f"{ts} [{level}] [{execution_mode}] bot={bot_id} {message}", flush=True)
     except (OSError, ValueError):
@@ -185,8 +220,22 @@ def _log(bot_id: str, level: str, execution_mode: str, message: str) -> None:
     # This replaces the old per-line open/commit/close that caused lock contention.
     with _log_queue_lock:
         _log_queue.append(
-            (bot_id, int(time.time() * 1000), level, execution_mode, message)
+            (bot_id, created_at, level, execution_mode, message)
         )
+    _emit_bot_event(
+        bot_id,
+        "bot_log",
+        {
+            "log": {
+                "log_id": _next_ws_log_id(created_at),
+                "bot_id": bot_id,
+                "created_at": created_at,
+                "level": level,
+                "execution_mode": execution_mode,
+                "message": message,
+            }
+        },
+    )
 
 
 def _flush_log_queue() -> None:
@@ -281,6 +330,17 @@ def _log_post_trade_balance(
             execution_mode,
             f"Wallet after trade: {base_cur}={free_base:.8f}  {quote_cur}={free_quote:.4f}",
         )
+        _emit_bot_event(
+            bot_id,
+            "wallet_update",
+            {
+                "execution_mode": execution_mode,
+                "balances": {
+                    base_cur: {"free": free_base},
+                    quote_cur: {"free": free_quote},
+                },
+            },
+        )
     except Exception:
         pass
 
@@ -344,6 +404,16 @@ def _process_bot(
     elapsed = time.monotonic() - last
     if elapsed < interval_key:
         left = max(0.0, interval_key - elapsed)
+        _emit_bot_event(
+            bot_id,
+            "bot_cooldown",
+            {
+                "symbol": symbol,
+                "execution_mode": execution_mode,
+                "remaining_sec": round(left, 3),
+                "interval_sec": interval_key,
+            },
+        )
         _log_info_throttled(
             bot_id,
             execution_mode,
@@ -390,6 +460,19 @@ def _process_bot(
         return
 
     result = strategy.evaluate(ohlcv, params)
+    _emit_bot_event(
+        bot_id,
+        "bot_signal",
+        {
+            "symbol": symbol,
+            "execution_mode": execution_mode,
+            "signal": result.signal,
+            "confidence": result.confidence,
+            "warmup": result.warmup,
+            "close_count": result.close_count,
+            "meta": result.meta if isinstance(result.meta, dict) else {},
+        },
+    )
 
     # Log per-voter votes for MetaMagi feedback on every tick (ensemble only).
     # Must happen before any early return so HOLD ticks are also recorded.
@@ -523,10 +606,37 @@ def _process_bot(
                  f"[OK] BUY filled — spent {cost_quote:.4f} {quote_cur} "
                  f"-> received {filled_base:.8f} {base_cur} "
                  f"@ avg {avg_price:.2f} {quote_cur}/{base_cur}  [id={order.get('id')}]")
+            _emit_bot_event(
+                bot_id,
+                "trade_executed",
+                {
+                    "execution_mode": execution_mode,
+                    "symbol": symbol,
+                    "side": "buy",
+                    "order": {
+                        "id": order.get("id"),
+                        "amount": order.get("amount"),
+                        "cost": cost_quote,
+                        "filled": filled_base,
+                        "average": avg_price,
+                        "status": order.get("status"),
+                    },
+                },
+            )
             _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
             _queue_decision("BUY", _signal_confidence, True)
         except Exception as e:
             _queue_decision("BUY", _signal_confidence, False)
+            _emit_bot_event(
+                bot_id,
+                "trade_rejected",
+                {
+                    "execution_mode": execution_mode,
+                    "symbol": symbol,
+                    "side": "buy",
+                    "reason": str(e),
+                },
+            )
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
 
     elif result.signal == "sell":
@@ -642,10 +752,37 @@ def _process_bot(
                  f"[OK] SELL filled — sold {filled_base:.8f} {base_cur} "
                  f"→ received {cost_quote:.4f} {quote_cur} "
                  f"@ avg {avg_price:.2f} {quote_cur}/{base_cur}  [id={order.get('id')}]")
+            _emit_bot_event(
+                bot_id,
+                "trade_executed",
+                {
+                    "execution_mode": execution_mode,
+                    "symbol": symbol,
+                    "side": "sell",
+                    "order": {
+                        "id": order.get("id"),
+                        "amount": order.get("amount"),
+                        "cost": cost_quote,
+                        "filled": filled_base,
+                        "average": avg_price,
+                        "status": order.get("status"),
+                    },
+                },
+            )
             _log_post_trade_balance(bot_id, execution_mode, ex, base_cur, quote_cur)
             _queue_decision("SELL", _signal_confidence, True)
         except Exception as e:
             _queue_decision("SELL", _signal_confidence, False)
+            _emit_bot_event(
+                bot_id,
+                "trade_rejected",
+                {
+                    "execution_mode": execution_mode,
+                    "symbol": symbol,
+                    "side": "sell",
+                    "reason": str(e),
+                },
+            )
             _log(bot_id, "error", execution_mode, f"SELL failed: {e}\n{traceback.format_exc()}")
 
     # Flush any queued decision for this cycle (BUY or SELL branch).
@@ -781,6 +918,15 @@ def _run_one_cycle():
         prefetched = ohlcv_cache.get((symbol, timeframe, limit))
         try:
             _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched, public_ex=public_ex)
+            _emit_bot_event(
+                bot["bot_id"],
+                "bot_cycle_complete",
+                {
+                    "symbol": symbol,
+                    "execution_mode": mode,
+                    "status": bot.get("status"),
+                },
+            )
         except Exception:
             _log(bot["bot_id"], "error", mode, f"Unhandled: {traceback.format_exc()}")
 

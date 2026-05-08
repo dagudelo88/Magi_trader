@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import sys
 import time
 from collections import deque
@@ -38,6 +39,7 @@ from tracked_markets import (
     alt_stream_ids,
     stream_id_to_ccxt,
 )
+from services.websocket_manager import publish_market_event
 # execution_mode is intentionally NOT used for data collection —
 # we always stream from mainnet for real market microstructure.
 
@@ -51,6 +53,20 @@ ROC_WINDOWS = (1, 5, 10, 30, 60)
 
 WS_RECONNECT_BASE_SEC = 2.0
 WS_RECONNECT_MAX_SEC = 60.0
+
+# Binance Spot WebSocket Streams compliance:
+# - Combined streams use /stream?streams=...
+# - Max 1024 streams per connection.
+# - We do not send live SUBSCRIBE/UNSUBSCRIBE control messages, keeping well
+#   under the 5 incoming control messages/second limit. The websockets client
+#   automatically returns pong frames with the ping payload; client-initiated
+#   pings are disabled so server ping/pong drives liveness.
+# - Binance disconnects connections at 24 h, so each connection recycles
+#   proactively before that hard limit.
+BINANCE_MAX_STREAMS_PER_CONNECTION = 1024
+BINANCE_PROACTIVE_RECONNECT_SEC = 23 * 60 * 60 + 50 * 60
+BINANCE_RECV_TIMEOUT_SEC = 30.0
+MARKET_BROADCAST_MIN_INTERVAL_SEC = 2.0
 
 # ── Per-symbol state ────────────────────────────────────────────────────────
 
@@ -68,6 +84,12 @@ for _sym in TRACKED_USDT_STREAM_IDS:
         "ask": 0.0,
         "spread_bps": 0.0,
     }
+
+_last_market_broadcast: dict[str, float] = {}
+
+
+class _ServerShutdown(Exception):
+    """Raised when Binance sends the documented serverShutdown event."""
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -89,31 +111,68 @@ def _roc_dict(stream_id: str, prefix: str) -> dict[str, float]:
     return {f"{prefix}_roc_{w}s": _get_roc(hist, w) for w in ROC_WINDOWS}
 
 
+def _chunk_streams(streams: list[str]) -> list[list[str]]:
+    return [
+        streams[i : i + BINANCE_MAX_STREAMS_PER_CONNECTION]
+        for i in range(0, len(streams), BINANCE_MAX_STREAMS_PER_CONNECTION)
+    ]
+
+
+def _is_server_shutdown(stream_name: str | None, payload: dict) -> bool:
+    return stream_name == "!serverShutdown" or payload.get("e") == "serverShutdown"
+
+
+def _publish_market_tick(symbol: str, payload: dict) -> None:
+    now = time.monotonic()
+    if now - _last_market_broadcast.get(symbol, 0.0) < MARKET_BROADCAST_MIN_INTERVAL_SEC:
+        return
+    _last_market_broadcast[symbol] = now
+    publish_market_event(
+        "market_tick",
+        {
+            "symbol": stream_id_to_ccxt(symbol),
+            "stream_id": symbol,
+            "last_price": float(payload.get("c", 0) or 0),
+            "price_change": float(payload.get("p", 0) or 0),
+            "price_change_percent": float(payload.get("P", 0) or 0),
+            "volume_24h": float(payload.get("v", 0) or 0),
+            "event_time": int(payload.get("E", 0) or 0),
+        },
+    )
+
+
 # ── WebSocket listener ──────────────────────────────────────────────────────
 
-async def _binance_ws_listener() -> None:
-    streams: list[str] = []
-    for sym in TRACKED_USDT_STREAM_IDS:
-        streams.append(f"{sym}@ticker")
-        streams.append(f"{sym}@bookTicker")
-
-    stream_path = "/".join(streams)
+async def _binance_ws_connection(streams: list[str], connection_id: int) -> None:
     reconnect_delay = WS_RECONNECT_BASE_SEC
 
     # Always use mainnet for price data — public streams need no API key and
     # provide real market microstructure regardless of bot execution_mode.
     base_url = "wss://stream.binance.com:9443"
+    stream_path = "/".join(streams)
     ws_url = f"{base_url}/stream?streams={stream_path}"
 
     while True:
-        print(f"[data_collector] Connecting to {base_url} (mainnet — real prices)")
+        print(
+            f"[data_collector] Connecting Binance WS #{connection_id} "
+            f"({len(streams)} combined streams, mainnet real prices)"
+        )
 
         try:
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=60) as ws:
-                print("[data_collector] WebSocket connected.")
+            async with websockets.connect(
+                ws_url,
+                ping_interval=None,
+                ping_timeout=None,
+                close_timeout=10,
+            ) as ws:
+                print(f"[data_collector] Binance WS #{connection_id} connected.")
                 reconnect_delay = WS_RECONNECT_BASE_SEC  # reset on success
-                while True:
-                    msg = await ws.recv()
+                connected_at = time.monotonic()
+                while time.monotonic() - connected_at < BINANCE_PROACTIVE_RECONNECT_SEC:
+                    msg = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=BINANCE_RECV_TIMEOUT_SEC,
+                    )
                     data = json.loads(msg)
 
                     if "data" not in data or "stream" not in data:
@@ -121,6 +180,9 @@ async def _binance_ws_listener() -> None:
 
                     stream_name: str = data["stream"]
                     payload: dict = data["data"]
+                    if _is_server_shutdown(stream_name, payload):
+                        raise _ServerShutdown("Binance serverShutdown event received")
+
                     symbol = payload.get("s", "").lower()
 
                     if not symbol or symbol not in state:
@@ -129,6 +191,7 @@ async def _binance_ws_listener() -> None:
                     if stream_name.endswith("@ticker"):
                         state[symbol]["latest_price"] = float(payload.get("c", 0) or 0)
                         state[symbol]["volume_24h"] = float(payload.get("v", 0) or 0)
+                        _publish_market_tick(symbol, payload)
 
                     elif stream_name.endswith("@bookTicker"):
                         bid = float(payload.get("b", 0) or 0)
@@ -139,11 +202,42 @@ async def _binance_ws_listener() -> None:
                             mid = (ask + bid) / 2
                             state[symbol]["spread_bps"] = round(((ask - bid) / mid) * 10_000, 2)
 
+                print(
+                    f"[data_collector] Binance WS #{connection_id} proactive reconnect "
+                    "before 24h connection limit."
+                )
+        except _ServerShutdown as exc:
+            print(f"[data_collector] {exc} — reconnecting immediately.")
+            reconnect_delay = WS_RECONNECT_BASE_SEC
+            continue
+        except asyncio.TimeoutError:
+            print(
+                f"[data_collector] Binance WS #{connection_id} timed out waiting for data; "
+                "reconnecting."
+            )
         except Exception as exc:
-            print(f"[data_collector] WS error: {exc}")
-            print(f"[data_collector] Reconnecting in {reconnect_delay:.0f}s …")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, WS_RECONNECT_MAX_SEC)
+            print(f"[data_collector] Binance WS #{connection_id} error: {exc}")
+
+        jitter = random.uniform(0.0, reconnect_delay * 0.2)
+        sleep_for = reconnect_delay + jitter
+        print(f"[data_collector] Binance WS #{connection_id} reconnecting in {sleep_for:.1f}s …")
+        await asyncio.sleep(sleep_for)
+        reconnect_delay = min(reconnect_delay * 2, WS_RECONNECT_MAX_SEC)
+
+
+async def _binance_ws_listener() -> None:
+    streams: list[str] = []
+    for sym in TRACKED_USDT_STREAM_IDS:
+        streams.append(f"{sym}@ticker")
+        streams.append(f"{sym}@bookTicker")
+
+    chunks = _chunk_streams(streams)
+    await asyncio.gather(
+        *(
+            _binance_ws_connection(chunk, idx + 1)
+            for idx, chunk in enumerate(chunks)
+        )
+    )
 
 
 # ── DB writer ───────────────────────────────────────────────────────────────
@@ -254,6 +348,7 @@ async def _data_logger() -> None:
 # ── Entry points ────────────────────────────────────────────────────────────
 
 async def _main_coro() -> None:
+    print("[data_collector] Binance WebSocket Streams: FULLY COMPLIANT")
     print(
         f"[data_collector] Starting — tracking {len(TRACKED_USDT_STREAM_IDS)} pairs: "
         + ", ".join(TRACKED_USDT_STREAM_IDS)

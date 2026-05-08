@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom';
 import { Copy, ChevronDown, Info } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
+import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
 
 /** Pixels from bottom to consider the user "at" the latest log line. */
 const LOG_BOTTOM_THRESHOLD_PX = 72;
@@ -569,11 +570,14 @@ export default function BotDetail() {
   const [logsCopied, setLogsCopied] = useState(false);
   const logScrollRef = useRef<HTMLDivElement>(null);
   const logScrollRafRef = useRef<number | null>(null);
+  const detailRefreshTimerRef = useRef<number | null>(null);
 
   // Trade summary (FIFO per-trade PnL)
   const [historyView, setHistoryView] = useState<'fills' | 'summary'>('fills');
   const [tradeSummary, setTradeSummary] = useState<ClosedTrade[] | null>(null);
   const [tradeSummaryLoading, setTradeSummaryLoading] = useState(false);
+  const [liveVoterSignals, setLiveVoterSignals] = useState<LiveVoterSignal[]>([]);
+  const [voterSignalsUpdatedAt, setVoterSignalsUpdatedAt] = useState<number | null>(null);
 
   const refresh = useCallback(async () => {
     if (!id) return;
@@ -617,18 +621,66 @@ export default function BotDetail() {
     }
   }, [id]);
 
+  const scheduleDetailRefresh = useCallback(() => {
+    if (detailRefreshTimerRef.current != null) return;
+    detailRefreshTimerRef.current = window.setTimeout(() => {
+      detailRefreshTimerRef.current = null;
+      void refresh();
+      if (historyView === 'summary') {
+        void fetchTradeSummary();
+      }
+    }, 1_000);
+  }, [fetchTradeSummary, historyView, refresh]);
+
+  const detailWs = useMagiWebSocket({
+    path: `/ws/bot/${id}`,
+    enabled: Boolean(id),
+    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
+      const data = message.data;
+      if (message.type === 'bot_log' && data.log && typeof data.log === 'object') {
+        const log = data.log as BotLogRow;
+        setLogs((prev) => [log, ...prev.filter((item) => item.log_id !== log.log_id)].slice(0, 150));
+        return;
+      }
+      if (message.type === 'voter_signals' && Array.isArray(data.voter_signals)) {
+        setLiveVoterSignals(data.voter_signals as LiveVoterSignal[]);
+        setVoterSignalsUpdatedAt(Date.now());
+        return;
+      }
+      if (message.type === 'bot_status' && typeof data.status === 'string') {
+        setBot((prev) => (prev ? { ...prev, status: data.status as string } : prev));
+        return;
+      }
+      if (message.type === 'bot_updated' && data.bot && typeof data.bot === 'object') {
+        setBot(data.bot as BotRecord);
+        return;
+      }
+      if (['trade_executed', 'trade_rejected', 'wallet_update'].includes(message.type)) {
+        scheduleDetailRefresh();
+      }
+    },
+  });
+
+  useEffect(() => {
+    return () => {
+      if (detailRefreshTimerRef.current != null) {
+        window.clearTimeout(detailRefreshTimerRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (historyView === 'summary') {
       void fetchTradeSummary();
     }
   }, [historyView, fetchTradeSummary]);
 
-  // Refresh trade summary alongside orders when bot is running
+  // WebSocket fallback only: refresh trade summary alongside orders at low cadence.
   useEffect(() => {
-    if (!id || bot?.status !== 'running' || historyView !== 'summary') return;
-    const t = window.setInterval(() => void fetchTradeSummary(), 4000);
+    if (!detailWs.isFallbackPolling || !id || bot?.status !== 'running' || historyView !== 'summary') return;
+    const t = window.setInterval(() => void fetchTradeSummary(), 30_000);
     return () => window.clearInterval(t);
-  }, [id, bot?.status, historyView, fetchTradeSummary]);
+  }, [detailWs.isFallbackPolling, id, bot?.status, historyView, fetchTradeSummary]);
 
   useEffect(() => {
     const b = strategyHealth?.initial_budget_quote;
@@ -641,10 +693,10 @@ export default function BotDetail() {
   }, [id]);
 
   useEffect(() => {
-    if (!id || bot?.status !== 'running') return;
-    const t = window.setInterval(refresh, 4000);
+    if (!detailWs.isFallbackPolling || !id || bot?.status !== 'running') return;
+    const t = window.setInterval(refresh, 30_000);
     return () => window.clearInterval(t);
-  }, [id, bot?.status, refresh]);
+  }, [detailWs.isFallbackPolling, id, bot?.status, refresh]);
 
   const logsChronological = useMemo(() => [...logs].reverse(), [logs]);
 
@@ -733,10 +785,6 @@ export default function BotDetail() {
     [isEnsemble, bot?.strategy_params_json],
   );
 
-  // ── Live voter signals (polled independently from the main bot refresh) ──
-  const [liveVoterSignals, setLiveVoterSignals] = useState<LiveVoterSignal[]>([]);
-  const [voterSignalsUpdatedAt, setVoterSignalsUpdatedAt] = useState<number | null>(null);
-
   useEffect(() => {
     if (!id || !isEnsemble) return;
 
@@ -753,9 +801,10 @@ export default function BotDetail() {
     };
 
     void fetchVoterSignals();
-    const timer = setInterval(() => void fetchVoterSignals(), 15_000);
+    if (!detailWs.isFallbackPolling) return;
+    const timer = setInterval(() => void fetchVoterSignals(), 30_000);
     return () => clearInterval(timer);
-  }, [id, isEnsemble]);
+  }, [id, isEnsemble, detailWs.isFallbackPolling]);
 
   const forkNewBotInstance = async () => {
     if (!id) return;
@@ -1316,12 +1365,6 @@ export default function BotDetail() {
                         )}
                         {[...(tradeSummary ?? [])].reverse().map((t, i) => {
                           const qc = t.quote_currency;
-                          const pnlColor =
-                            t.outcome === 'win'
-                              ? 'text-emerald-400'
-                              : t.outcome === 'loss'
-                              ? 'text-red-400'
-                              : 'text-magi-muted/60';
                           const outcomeLabel =
                             t.outcome === 'win' ? '▲ W' : t.outcome === 'loss' ? '▼ L' : '= B';
                           const outcomeBadge =

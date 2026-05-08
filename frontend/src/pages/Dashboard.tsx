@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { API_BASE } from '../config';
 import { TRACKED_TICKER_SYMBOLS_FALLBACK } from '../trackedMarketsFallback';
+import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
 
 interface Ticker {
   symbol: string;
@@ -102,20 +103,82 @@ export default function Dashboard() {
   const walletRef = useRef<WalletItem[]>([]);
   walletRef.current = wallet;
 
-  // Load bots with P&L — poll every 15 s; on failure keep existing data
+  const loadBots = () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 10_000);
+    fetch(`${API_BASE}/api/bots`, { signal: ctrl.signal })
+      .then((r) => r.json())
+      .then((d: { bots?: BotRow[] }) => { clearTimeout(t); setBots(d.bots ?? []); })
+      .catch(() => clearTimeout(t));
+  };
+
+  const botsWs = useMagiWebSocket({
+    path: '/ws/bots',
+    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
+      const data = message.data;
+      if (message.type === 'bot_status' && typeof data.bot_id === 'string') {
+        setBots((prev) =>
+          prev.map((bot) =>
+            bot.bot_id === data.bot_id
+              ? { ...bot, status: String(data.status ?? bot.status) }
+              : bot,
+          ),
+        );
+        return;
+      }
+      if (message.type === 'trading_settings' && typeof data.execution_mode === 'string') {
+        setBotExecutionMode(data.execution_mode);
+        setWalletView(data.execution_mode === 'live' ? 'live' : 'testnet');
+        return;
+      }
+      if (message.type === 'bots_changed' && data.action === 'deleted' && typeof data.bot_id === 'string') {
+        setBots((prev) => prev.filter((bot) => bot.bot_id !== data.bot_id));
+        return;
+      }
+      if (['bots_changed', 'bot_updated', 'trade_executed'].includes(message.type)) {
+        void loadBots();
+      }
+    },
+  });
+
+  const marketWs = useMagiWebSocket({
+    path: '/ws/market',
+    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
+      if (message.type !== 'market_tick') return;
+      const symbol = typeof message.data.stream_id === 'string'
+        ? message.data.stream_id.toUpperCase()
+        : String(message.data.symbol ?? '').replace('/', '');
+      if (!symbol) return;
+
+      const holdings = walletRef.current;
+      const isTracked = trackedTickers.includes(symbol);
+      const isWalletAssetPair = holdings.some((w) => symbol === `${w.asset}USDT`);
+      if (!isTracked && !isWalletAssetPair) return;
+
+      const price = Number(message.data.last_price);
+      const change = Number(message.data.price_change);
+      const changePercent = Number(message.data.price_change_percent);
+      if (!Number.isFinite(price)) return;
+
+      setTickers((prev) => ({
+        ...prev,
+        [symbol]: {
+          symbol,
+          price: price.toFixed(2),
+          change: Number.isFinite(change) ? change.toFixed(2) : '0.00',
+          changePercent: Number.isFinite(changePercent) ? changePercent.toFixed(2) : '0.00',
+        },
+      }));
+    },
+  });
+
+  // Initial load via REST; WebSocket events handle normal live updates.
   useEffect(() => {
-    const load = () => {
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 10_000);
-      fetch(`${API_BASE}/api/bots`, { signal: ctrl.signal })
-        .then((r) => r.json())
-        .then((d: { bots?: BotRow[] }) => { clearTimeout(t); setBots(d.bots ?? []); })
-        .catch(() => clearTimeout(t));
-    };
-    void load();
-    const id = setInterval(load, 15_000);
+    void loadBots();
+    if (!botsWs.isFallbackPolling) return;
+    const id = setInterval(loadBots, 30_000);
     return () => clearInterval(id);
-  }, []);
+  }, [botsWs.isFallbackPolling]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     fetch(`${API_BASE}/api/market/tracked`)
@@ -197,7 +260,7 @@ export default function Dashboard() {
   }, [walletView]);
 
   useEffect(() => {
-    if (walletView === null || trackedTickers.length === 0) return;
+    if (!marketWs.isFallbackPolling || walletView === null || trackedTickers.length === 0) return;
 
     const wsUrl = MINI_TICKER_WS[walletView];
     const ws = new WebSocket(wsUrl);
@@ -235,7 +298,7 @@ export default function Dashboard() {
     };
 
     return () => ws.close();
-  }, [trackedTickers, walletView]);
+  }, [trackedTickers, walletView, marketWs.isFallbackPolling]);
 
   const walletWithValues = wallet.map((item) => {
     let usdPrice = 0;

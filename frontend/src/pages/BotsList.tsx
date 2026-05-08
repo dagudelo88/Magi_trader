@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { API_BASE } from '../config';
 import { BOT_TEMPLATES, SUPPORTED_SYMBOLS, type BotTemplate } from '../botTemplates';
+import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
 
 interface BotRow {
   bot_id: string;
@@ -124,12 +125,47 @@ export default function BotsList() {
     }
   };
 
+  const botsWs = useMagiWebSocket({
+    path: '/ws/bots',
+    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
+      const data = message.data;
+      if (message.type === 'bot_status' && typeof data.bot_id === 'string') {
+        setBots((prev) =>
+          prev.map((bot) =>
+            bot.bot_id === data.bot_id
+              ? { ...bot, status: String(data.status ?? bot.status) }
+              : bot,
+          ),
+        );
+        return;
+      }
+      if (message.type === 'trading_settings' && typeof data.execution_mode === 'string') {
+        setExecutionMode(data.execution_mode);
+        return;
+      }
+      if (message.type === 'bots_changed' && data.action === 'deleted' && typeof data.bot_id === 'string') {
+        setBots((prev) => prev.filter((bot) => bot.bot_id !== data.bot_id));
+        return;
+      }
+      if (['bots_changed', 'bot_updated', 'trade_executed'].includes(message.type)) {
+        void load();
+      }
+    },
+  });
+
   useEffect(() => {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 10_000);
     void load(ctrl.signal).then(() => clearTimeout(t));
 
-    // Refresh bot statuses every 15 s; strategy defaults only need one load
+    if (!botsWs.isFallbackPolling) {
+      return () => {
+        ctrl.abort();
+        clearTimeout(t);
+      };
+    }
+
+    // WebSocket fallback only: keep REST alive, but at a much lower cadence.
     const pollCtrl = { current: new AbortController() };
     const id = setInterval(() => {
       pollCtrl.current = new AbortController();
@@ -138,14 +174,14 @@ export default function BotsList() {
         .then((r) => r.json())
         .then((d: { bots?: BotRow[] }) => { clearTimeout(pt); setBots(d.bots ?? []); })
         .catch(() => clearTimeout(pt));
-    }, 15_000);
+    }, 30_000);
 
     return () => {
       ctrl.abort();
       pollCtrl.current.abort();
       clearInterval(id);
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [botsWs.isFallbackPolling]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Focus budget field when configure step opens
   useEffect(() => {

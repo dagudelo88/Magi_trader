@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel
@@ -54,6 +54,7 @@ from trading.strategies.registry import (
     strategy_names,
     strategy_catalog,
 )
+from services.websocket_manager import publish_bot_event, publish_bots_event, ws_manager
 
 _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_backend_dir, ".."))
@@ -167,6 +168,7 @@ async def lifespan(_app: FastAPI):
     from services.bot_runner import run_async as _bot_runner_async
     from services.data_collector import run_async as _data_collector_async
     init_db()
+    ws_manager.bind_loop(asyncio.get_running_loop())
     # Pause any bots that were left running — the user must explicitly start them.
     conn = get_db_connection()
     try:
@@ -217,6 +219,53 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+async def _websocket_channel_loop(websocket: WebSocket, channel: str) -> None:
+    await ws_manager.connect(websocket, channel)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                message = {}
+            if message.get("type") == "ping":
+                await websocket.send_json(
+                    {
+                        "type": "pong",
+                        "timestamp": int(time.time() * 1000),
+                        "data": {"channel": channel},
+                    }
+                )
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await ws_manager.disconnect(websocket, channel)
+
+
+@app.websocket("/ws/bots")
+async def ws_bots(websocket: WebSocket):
+    """Real-time bot list/status/overview updates."""
+    await _websocket_channel_loop(websocket, "bots")
+
+
+@app.websocket("/ws/bot/{bot_id}")
+async def ws_bot_detail(websocket: WebSocket, bot_id: str):
+    """Real-time detail updates for one bot."""
+    await _websocket_channel_loop(websocket, f"bot:{bot_id}")
+
+
+@app.websocket("/ws/market")
+async def ws_market(websocket: WebSocket):
+    """Lightweight tracked-market ticker updates from the backend collector."""
+    await _websocket_channel_loop(websocket, "market")
+
+
+@app.get("/ws/health")
+def ws_health():
+    """Connection counts for WebSocket observability."""
+    return ws_manager.health()
 
 # Data collector runs as an asyncio.Task inside lifespan — always active.
 _DATA_COLLECTOR_MANAGED = True
@@ -453,7 +502,9 @@ class TradingSettingsBody(BaseModel):
 @app.put("/api/settings/trading")
 def put_trading_settings(body: TradingSettingsBody):
     try:
-        return apply_execution_mode(body.execution_mode, body.confirmation_phrase)
+        result = apply_execution_mode(body.execution_mode, body.confirmation_phrase)
+        publish_bots_event("trading_settings", result)
+        return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -465,7 +516,9 @@ class HaltBody(BaseModel):
 @app.put("/api/settings/trading/halt")
 def put_trading_halt(body: HaltBody):
     set_global_halt(body.halted)
-    return trading_settings_snapshot()
+    snap = trading_settings_snapshot()
+    publish_bots_event("trading_settings", snap)
+    return snap
 
 
 # --- Bots ---
@@ -549,6 +602,7 @@ def post_create_bot(body: CreateBotBody):
         bot = create_bot(body.name, body.symbol, body.strategy, params_json)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+    publish_bots_event("bots_changed", {"action": "created", "bot": bot})
     return {"bot": bot}
 
 
@@ -565,6 +619,7 @@ def patch_bot(bot_id: str, body: UpdateBotBody):
         msg = str(e)
         code = 409 if "running" in msg else 404
         raise HTTPException(status_code=code, detail=msg) from e
+    publish_bot_event(bot_id, "bot_updated", {"bot": bot})
     return {"bot": bot}
 
 
@@ -576,6 +631,7 @@ def delete_bot_endpoint(bot_id: str):
         msg = str(e)
         code = 409 if "running" in msg else 404
         raise HTTPException(status_code=code, detail=msg) from e
+    publish_bots_event("bots_changed", {"action": "deleted", "bot_id": bot_id})
 
 
 class BotExecutionModeBody(BaseModel):
@@ -595,6 +651,7 @@ def put_bot_execution_mode(bot_id: str, body: BotExecutionModeBody):
         msg = str(e)
         code = 409 if "stop" in msg or "running" in msg else 404
         raise HTTPException(status_code=code, detail=msg) from e
+    publish_bot_event(bot_id, "bot_updated", {"bot": bot})
     return {"bot": bot}
 
 
@@ -916,7 +973,9 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
     finally:
         conn.close()
 
-    return {
+    payload = {
         "bot_id": bot_id,
         "status": body.status,
     }
+    publish_bot_event(bot_id, "bot_status", payload)
+    return payload
