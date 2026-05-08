@@ -77,6 +77,7 @@ export default function BotsList() {
   const [executionMode, setExecutionMode] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyBotId, setBusyBotId] = useState<string | null>(null);
+  const [bulkBusy, setBulkBusy] = useState<'resume' | 'pause' | null>(null);
 
   // Strategy defaults fetched from backend — keyed by strategy name.
   // This is the single source of truth for all strategy params.
@@ -249,6 +250,52 @@ export default function BotsList() {
     }
   };
 
+  const resumeAll = async () => {
+    const targets = bots.filter((b) => b.status === 'paused');
+    if (targets.length === 0) return;
+    setBulkBusy('resume');
+    setError(null);
+    try {
+      await Promise.all(
+        targets.map((b) =>
+          fetch(`${API_BASE}/api/bots/${b.bot_id}/status`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'running' }),
+          }),
+        ),
+      );
+      await load();
+    } catch {
+      setError('Failed to resume all bots');
+    } finally {
+      setBulkBusy(null);
+    }
+  };
+
+  const pauseAll = async () => {
+    const targets = bots.filter((b) => b.status === 'running');
+    if (targets.length === 0) return;
+    setBulkBusy('pause');
+    setError(null);
+    try {
+      await Promise.all(
+        targets.map((b) =>
+          fetch(`${API_BASE}/api/bots/${b.bot_id}/status`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ status: 'paused' }),
+          }),
+        ),
+      );
+      await load();
+    } catch {
+      setError('Failed to pause all bots');
+    } finally {
+      setBulkBusy(null);
+    }
+  };
+
   const handleDelete = async (bot: BotRow) => {
     if (!window.confirm(`Delete "${bot.name}"? This permanently removes all its orders and logs.`))
       return;
@@ -316,13 +363,31 @@ export default function BotsList() {
             </p>
           )}
         </div>
-        <button
-          type="button"
-          onClick={openCreate}
-          className="px-4 py-2 bg-primary text-black rounded text-sm font-bold hover:brightness-110 transition-all"
-        >
-          + Create New Bot
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => void resumeAll()}
+            disabled={bulkBusy !== null || !bots.some((b) => b.status === 'paused')}
+            className="px-4 py-2 bg-green-700 text-white rounded text-sm font-bold hover:bg-green-600 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {bulkBusy === 'resume' ? 'Resuming…' : '▶ Resume All'}
+          </button>
+          <button
+            type="button"
+            onClick={() => void pauseAll()}
+            disabled={bulkBusy !== null || !bots.some((b) => b.status === 'running')}
+            className="px-4 py-2 bg-amber-600 text-white rounded text-sm font-bold hover:bg-amber-500 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {bulkBusy === 'pause' ? 'Pausing…' : '⏸ Pause All'}
+          </button>
+          <button
+            type="button"
+            onClick={openCreate}
+            className="px-4 py-2 bg-primary text-black rounded text-sm font-bold hover:brightness-110 transition-all"
+          >
+            + Create New Bot
+          </button>
+        </div>
       </div>
 
       {error && (
