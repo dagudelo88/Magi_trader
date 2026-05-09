@@ -1,38 +1,7 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { API_BASE } from '../config';
-import { TRACKED_TICKER_SYMBOLS_FALLBACK } from '../trackedMarketsFallback';
-import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
-
-interface Ticker {
-  symbol: string;
-  price: string;
-  change: string;
-  changePercent: string;
-}
-
-interface WalletItem {
-  asset: string;
-  free: number;
-  used: number;
-  total: number;
-  value?: number;
-}
-
-interface BotRow {
-  bot_id: string;
-  name: string;
-  symbol: string;
-  strategy: string;
-  strategy_params_json: string | null;
-  status: string;
-  execution_mode: string;
-  started_at: number | null;
-  initial_budget_quote: number | null;
-  realized_pnl_quote: number | null;
-  win_rate_pct: number | null;
-  closed_trades: number | null;
-}
+import { useRealtimeStore, type NetworkView, type WalletItem } from '../stores/realtimeStore';
 
 function formatUptime(startedAtSec: number | null, status: string): string {
   if (status !== 'running' || startedAtSec == null) return '—';
@@ -83,133 +52,22 @@ function parseStrategyLabel(strategy: string, paramsJson: string | null): string
   return strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-type NetworkView = 'testnet' | 'live';
-
-const MINI_TICKER_WS: Record<NetworkView, string> = {
-  testnet: 'wss://stream.testnet.binance.vision/ws/!miniTicker@arr',
-  live: 'wss://stream.binance.com:9443/ws/!miniTicker@arr',
-};
-
 export default function Dashboard() {
   const navigate = useNavigate();
-  const [tickers, setTickers] = useState<Record<string, Ticker>>({});
+  const tickers = useRealtimeStore((state) => state.marketTickers);
+  const trackedTickers = useRealtimeStore((state) => state.trackedTickers);
+  const bots = useRealtimeStore((state) => state.bots);
+  const botExecutionMode = useRealtimeStore((state) => state.tradingSettings?.execution_mode ?? null);
   const [wallet, setWallet] = useState<WalletItem[]>([]);
-  const [trackedTickers, setTrackedTickers] = useState<string[]>([]);
-  const [walletView, setWalletView] = useState<NetworkView | null>(null);
-  const [botExecutionMode, setBotExecutionMode] = useState<string | null>(null);
+  const [selectedWalletView, setSelectedWalletView] = useState<NetworkView | null>(null);
+  const walletView: NetworkView = selectedWalletView ?? (botExecutionMode === 'live' ? 'live' : 'testnet');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [bots, setBots] = useState<BotRow[]>([]);
-  const walletRef = useRef<WalletItem[]>([]);
-  walletRef.current = wallet;
-
-  const loadBots = () => {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), 10_000);
-    fetch(`${API_BASE}/api/bots`, { signal: ctrl.signal })
-      .then((r) => r.json())
-      .then((d: { bots?: BotRow[] }) => { clearTimeout(t); setBots(d.bots ?? []); })
-      .catch(() => clearTimeout(t));
-  };
-
-  const botsWs = useMagiWebSocket({
-    path: '/ws/bots',
-    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
-      const data = message.data;
-      if (message.type === 'bot_status' && typeof data.bot_id === 'string') {
-        setBots((prev) =>
-          prev.map((bot) =>
-            bot.bot_id === data.bot_id
-              ? { ...bot, status: String(data.status ?? bot.status) }
-              : bot,
-          ),
-        );
-        return;
-      }
-      if (message.type === 'trading_settings' && typeof data.execution_mode === 'string') {
-        setBotExecutionMode(data.execution_mode);
-        setWalletView(data.execution_mode === 'live' ? 'live' : 'testnet');
-        return;
-      }
-      if (message.type === 'bots_changed' && data.action === 'deleted' && typeof data.bot_id === 'string') {
-        setBots((prev) => prev.filter((bot) => bot.bot_id !== data.bot_id));
-        return;
-      }
-      if (['bots_changed', 'bot_updated', 'trade_executed'].includes(message.type)) {
-        void loadBots();
-      }
-    },
-  });
-
-  const marketWs = useMagiWebSocket({
-    path: '/ws/market',
-    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
-      if (message.type !== 'market_tick') return;
-      const symbol = typeof message.data.stream_id === 'string'
-        ? message.data.stream_id.toUpperCase()
-        : String(message.data.symbol ?? '').replace('/', '');
-      if (!symbol) return;
-
-      const holdings = walletRef.current;
-      const isTracked = trackedTickers.includes(symbol);
-      const isWalletAssetPair = holdings.some((w) => symbol === `${w.asset}USDT`);
-      if (!isTracked && !isWalletAssetPair) return;
-
-      const price = Number(message.data.last_price);
-      const change = Number(message.data.price_change);
-      const changePercent = Number(message.data.price_change_percent);
-      if (!Number.isFinite(price)) return;
-
-      setTickers((prev) => ({
-        ...prev,
-        [symbol]: {
-          symbol,
-          price: price.toFixed(2),
-          change: Number.isFinite(change) ? change.toFixed(2) : '0.00',
-          changePercent: Number.isFinite(changePercent) ? changePercent.toFixed(2) : '0.00',
-        },
-      }));
-    },
-  });
-
-  // Initial load via REST; WebSocket events handle normal live updates.
-  useEffect(() => {
-    void loadBots();
-    if (!botsWs.isFallbackPolling) return;
-    const id = setInterval(loadBots, 30_000);
-    return () => clearInterval(id);
-  }, [botsWs.isFallbackPolling]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/market/tracked`)
-      .then((r) => r.json())
-      .then((d: { ticker_symbols?: string[] }) =>
-        setTrackedTickers(Array.isArray(d.ticker_symbols) ? d.ticker_symbols : TRACKED_TICKER_SYMBOLS_FALLBACK)
-      )
-      .catch(() => setTrackedTickers(TRACKED_TICKER_SYMBOLS_FALLBACK));
-  }, []);
-
-  useEffect(() => {
-    fetch(`${API_BASE}/api/settings/trading`)
-      .then((r) => r.json())
-      .then((s: { execution_mode?: string }) => {
-        setWalletView(s.execution_mode === 'live' ? 'live' : 'testnet');
-      })
-      .catch(() => setWalletView('testnet'));
-  }, []);
-
-  useEffect(() => {
-    if (walletView === null) return;
-
     // Only show the full-page spinner on the very first load.
     // Subsequent re-fetches (walletView switch etc.) update silently so the
     // UI never goes blank while waiting for the Binance balance call.
-    const firstLoad = wallet.length === 0;
-    if (firstLoad) {
-      setLoading(true);
-      setError(null);
-    }
-
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
 
@@ -235,9 +93,6 @@ export default function Dashboard() {
         if (data.balances) {
           setWallet(data.balances);
         }
-        if (data.execution_mode) {
-          setBotExecutionMode(data.execution_mode);
-        }
         setLoading(false);
       })
       .catch((err: Error) => {
@@ -252,53 +107,7 @@ export default function Dashboard() {
       });
 
     return () => { clearTimeout(timeout); controller.abort(); };
-  }, [walletView]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (walletView === null) return;
-    setTickers({});
   }, [walletView]);
-
-  useEffect(() => {
-    if (!marketWs.isFallbackPolling || walletView === null || trackedTickers.length === 0) return;
-
-    const wsUrl = MINI_TICKER_WS[walletView];
-    const ws = new WebSocket(wsUrl);
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (!Array.isArray(data)) return;
-
-        setTickers((prev) => {
-          const next = { ...prev };
-          let updated = false;
-          const holdings = walletRef.current;
-
-          data.forEach((t: { s: string; c: string; o: string }) => {
-            const isTracked = trackedTickers.includes(t.s);
-            const isWalletAssetPair = holdings.some((w) => t.s === `${w.asset}USDT`);
-
-            if (isTracked || isWalletAssetPair) {
-              next[t.s] = {
-                symbol: t.s,
-                price: parseFloat(t.c).toFixed(2),
-                change: (parseFloat(t.c) - parseFloat(t.o)).toFixed(2),
-                changePercent: (((parseFloat(t.c) - parseFloat(t.o)) / parseFloat(t.o)) * 100).toFixed(2),
-              };
-              updated = true;
-            }
-          });
-
-          return updated ? next : prev;
-        });
-      } catch {
-        // ignore JSON parse errors
-      }
-    };
-
-    return () => ws.close();
-  }, [trackedTickers, walletView, marketWs.isFallbackPolling]);
 
   const walletWithValues = wallet.map((item) => {
     let usdPrice = 0;
@@ -315,7 +124,7 @@ export default function Dashboard() {
 
   const totalWalletValue = walletWithValues.reduce((acc, curr) => acc + (curr.value || 0), 0);
 
-  const viewLabel = walletView === 'live' ? 'Mainnet' : walletView === 'testnet' ? 'Testnet' : '…';
+  const viewLabel = walletView === 'live' ? 'Mainnet' : 'Testnet';
 
   // Bot aggregates
   const runningBots   = bots.filter((b) => b.status === 'running');
@@ -341,7 +150,7 @@ export default function Dashboard() {
           <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Total Value (Est)</h3>
             <div className="text-2xl font-mono font-bold">
-              {error || walletView === null
+              {error
                 ? '---'
                 : `$${totalWalletValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </div>
@@ -429,7 +238,7 @@ export default function Dashboard() {
                         <td className="px-4 py-2.5 text-gray-400 font-mono text-xs">{bot.symbol}</td>
                         <td className="px-4 py-2.5">
                           <span className="text-xs font-mono text-primary/90 bg-primary/10 border border-primary/20 px-2 py-0.5 rounded">
-                            {parseStrategyLabel(bot.strategy, bot.strategy_params_json)}
+                            {parseStrategyLabel(bot.strategy, bot.strategy_params_json ?? null)}
                           </span>
                         </td>
                         <td className="px-4 py-2.5">
@@ -459,7 +268,7 @@ export default function Dashboard() {
                           {bot.closed_trades ?? 0}
                         </td>
                         <td className="px-4 py-2.5 text-right font-mono text-xs text-gray-400">
-                          {formatUptime(bot.started_at, bot.status)}
+                          {formatUptime(bot.started_at ?? null, bot.status)}
                         </td>
                       </tr>
                     );
@@ -497,7 +306,7 @@ export default function Dashboard() {
                 <button
                   type="button"
                   aria-pressed={walletView === 'testnet'}
-                  onClick={() => setWalletView('testnet')}
+                  onClick={() => setSelectedWalletView('testnet')}
                   className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${
                     walletView === 'testnet'
                       ? 'bg-primary text-white'
@@ -509,7 +318,7 @@ export default function Dashboard() {
                 <button
                   type="button"
                   aria-pressed={walletView === 'live'}
-                  onClick={() => setWalletView('live')}
+                  onClick={() => setSelectedWalletView('live')}
                   className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${
                     walletView === 'live'
                       ? 'bg-red-600 text-white'
@@ -528,7 +337,7 @@ export default function Dashboard() {
               </p>
             )}
             <div className="flex-1 overflow-auto pr-2">
-              {walletView === null || loading ? (
+              {loading ? (
                 <div className="text-gray-400 py-4 flex items-center gap-2">
                   <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                   Loading balances…
@@ -624,7 +433,7 @@ export default function Dashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {(trackedTickers.length ? trackedTickers : TRACKED_TICKER_SYMBOLS_FALLBACK).map((symbol) => {
+                  {trackedTickers.map((symbol) => {
                     const data = tickers[symbol];
                     const isPositive = data && parseFloat(data.changePercent) >= 0;
 

@@ -2,19 +2,27 @@ import { useEffect, useRef } from 'react';
 import { createChart, ColorType, CandlestickSeries } from 'lightweight-charts';
 import type { IChartApi, ISeriesApi, Time } from 'lightweight-charts';
 
+type Candle = {
+  time: Time;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+};
+
 export function TradingChart({ 
   symbol,
   data, // Optional initial historical data: { time: string, open: number, high: number, low: number, close: number }[]
   latestTick // The newest websocket tick to append: { price: number, time: Date }
 }: {
   symbol: string;
-  data?: any[];
+  data?: Candle[];
   latestTick?: { price: number, time: Date };
 }) {
   const chartContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const currentCandleRef = useRef<any>(null);
+  const currentCandleRef = useRef<Candle | null>(null);
 
   useEffect(() => {
     if (!chartContainerRef.current) return;
@@ -92,7 +100,7 @@ export function TradingChart({
         chartRef.current.remove();
       }
     };
-  }, []);
+  }, [data, latestTick?.price]);
 
   // Update logic: This runs every time a new tick arrives
   useEffect(() => {

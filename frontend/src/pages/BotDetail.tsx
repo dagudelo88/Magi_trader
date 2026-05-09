@@ -4,19 +4,10 @@ import { Copy, ChevronDown, Info } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
 import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
+import { useRealtimeStore } from '../stores/realtimeStore';
 
 /** Pixels from bottom to consider the user "at" the latest log line. */
 const LOG_BOTTOM_THRESHOLD_PX = 72;
-
-interface BotRecord {
-  bot_id: string;
-  name: string;
-  symbol: string;
-  strategy: string;
-  status: string;
-  execution_mode: string;
-  strategy_params_json: string | null;
-}
 
 interface BotLogRow {
   log_id: number;
@@ -27,67 +18,7 @@ interface BotLogRow {
   message: string;
 }
 
-interface BotOrderStats {
-  total_orders: number;
-  buy_count: number;
-  sell_count: number;
-  last_order_at_ms: number | null;
-}
-
-interface StrategyHealth {
-  realized_pnl_quote: number;
-  unrealized_pnl_quote: number | null;
-  open_base_position: number;
-  open_cost_basis_quote: number;
-  closed_trades: number;
-  winning_trades: number;
-  losing_trades: number;
-  breakeven_trades: number;
-  win_rate_pct: number | null;
-  max_drawdown_quote: number;
-  max_drawdown_pct: number | null;
-  quote_currency: string;
-  mark_price: number | null;
-  total_pnl_quote: number;
-  initial_budget_quote: number | null;
-  current_capital_quote: number | null;
-  pnl_return_on_budget_pct: number | null;
-  max_drawdown_vs_budget_pct: number | null;
-  base_value_quote: number | null;
-  quote_remaining: number | null;
-  base_alloc_pct: number | null;
-  quote_alloc_pct: number | null;
-}
-
-interface BotOrderRow {
-  order_row_id: number;
-  bot_id: string;
-  execution_mode: string;
-  exchange_order_id: string | null;
-  symbol: string;
-  side: string;
-  order_type: string;
-  amount: number | null;
-  cost: number | null;
-  average: number | null;
-  filled: number | null;
-  status: string | null;
-  created_at: number;
-  display_price?: number | null;
-  display_status?: string;
-}
-
-interface ClosedTrade {
-  timestamp: number | null;
-  quantity: number;
-  entry_price: number | null;
-  exit_price: number | null;
-  cost_basis_quote: number;
-  proceeds_quote: number;
-  realized_pnl: number;
-  outcome: 'win' | 'loss' | 'flat';
-  quote_currency: string;
-}
+const EMPTY_LOGS: BotLogRow[] = [];
 
 const _pad = (n: number, len = 2) => String(n).padStart(len, '0');
 
@@ -551,13 +482,20 @@ function PortfolioDistribution({
 export default function BotDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
-  const [bot, setBot] = useState<BotRecord | null>(null);
-  const [logs, setLogs] = useState<BotLogRow[]>([]);
-  const [orderStats, setOrderStats] = useState<BotOrderStats | null>(null);
-  const [orders, setOrders] = useState<BotOrderRow[]>([]);
-  const [strategyHealth, setStrategyHealth] = useState<StrategyHealth | null>(null);
-  const [executionMode, setExecutionMode] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const detail = useRealtimeStore((state) => (id ? state.botDetailsById[id] : undefined));
+  const loadBotDetail = useRealtimeStore((state) => state.loadBotDetail);
+  const loadTradeSummary = useRealtimeStore((state) => state.loadTradeSummary);
+  const loadVoterSignals = useRealtimeStore((state) => state.loadVoterSignals);
+  const handleBotDetailMessage = useRealtimeStore((state) => state.handleBotDetailMessage);
+  const setChannelStatus = useRealtimeStore((state) => state.setChannelStatus);
+  const bot = detail?.bot ?? null;
+  const logs = detail?.logs ?? EMPTY_LOGS;
+  const orderStats = detail?.orderStats ?? null;
+  const orders = detail?.orders ?? [];
+  const strategyHealth = detail?.strategyHealth ?? null;
+  const executionMode = detail?.executionMode ?? null;
+  const [actionError, setActionError] = useState<string | null>(null);
+  const error = actionError ?? detail?.error ?? null;
   const [busy, setBusy] = useState(false);
   const [budgetDraft, setBudgetDraft] = useState('');
   const [budgetBusy, setBudgetBusy] = useState(false);
@@ -570,37 +508,19 @@ export default function BotDetail() {
   const [logsCopied, setLogsCopied] = useState(false);
   const logScrollRef = useRef<HTMLDivElement>(null);
   const logScrollRafRef = useRef<number | null>(null);
-  const detailRefreshTimerRef = useRef<number | null>(null);
 
   // Trade summary (FIFO per-trade PnL)
   const [historyView, setHistoryView] = useState<'fills' | 'summary'>('fills');
-  const [tradeSummary, setTradeSummary] = useState<ClosedTrade[] | null>(null);
-  const [tradeSummaryLoading, setTradeSummaryLoading] = useState(false);
-  const [liveVoterSignals, setLiveVoterSignals] = useState<LiveVoterSignal[]>([]);
-  const [voterSignalsUpdatedAt, setVoterSignalsUpdatedAt] = useState<number | null>(null);
+  const tradeSummary = detail?.tradeSummary ?? null;
+  const tradeSummaryLoading = detail?.tradeSummaryLoading ?? false;
+  const liveVoterSignals = detail?.liveVoterSignals ?? [];
+  const voterSignalsUpdatedAt = detail?.voterSignalsUpdatedAt ?? null;
 
   const refresh = useCallback(async () => {
     if (!id) return;
-    setError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/bots/${id}`);
-      if (res.status === 404) {
-        setBot(null);
-        setError('Bot not found');
-        return;
-      }
-      if (!res.ok) throw new Error('Failed to load bot');
-      const data = await res.json();
-      setBot(data.bot);
-      setLogs(data.logs || []);
-      setOrderStats(data.order_stats ?? null);
-      setOrders(data.orders || []);
-      setStrategyHealth(data.strategy_health ?? null);
-      setExecutionMode(data.execution_mode ?? null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Load failed');
-    }
-  }, [id]);
+    setActionError(null);
+    await loadBotDetail(id);
+  }, [id, loadBotDetail]);
 
   useEffect(() => {
     refresh();
@@ -608,77 +528,21 @@ export default function BotDetail() {
 
   const fetchTradeSummary = useCallback(async () => {
     if (!id) return;
-    setTradeSummaryLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/bots/${id}/trade-summary`);
-      if (!res.ok) return;
-      const data = await res.json() as { trades: ClosedTrade[] };
-      setTradeSummary(data.trades ?? []);
-    } catch {
-      // Non-fatal — summary degrades gracefully
-    } finally {
-      setTradeSummaryLoading(false);
-    }
-  }, [id]);
-
-  const scheduleDetailRefresh = useCallback(() => {
-    if (detailRefreshTimerRef.current != null) return;
-    detailRefreshTimerRef.current = window.setTimeout(() => {
-      detailRefreshTimerRef.current = null;
-      void refresh();
-      if (historyView === 'summary') {
-        void fetchTradeSummary();
-      }
-    }, 1_000);
-  }, [fetchTradeSummary, historyView, refresh]);
+    await loadTradeSummary(id);
+  }, [id, loadTradeSummary]);
 
   const detailWs = useMagiWebSocket({
     path: `/ws/bot/${id}`,
     enabled: Boolean(id),
     onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
-      const data = message.data;
-      if (message.type === 'bot_log' && data.log && typeof data.log === 'object') {
-        const log = data.log as BotLogRow;
-        setLogs((prev) => [log, ...prev.filter((item) => item.log_id !== log.log_id)].slice(0, 150));
-        return;
-      }
-      // Batched log event: multiple log lines sent as one message to reduce WS traffic.
-      // Logs arrive in chronological order; prepend newest-first to match the store's order.
-      if (message.type === 'bot_log_batch' && Array.isArray(data.logs)) {
-        const batchLogs = (data.logs as BotLogRow[]).slice().reverse();
-        setLogs((prev) => {
-          const existingIds = new Set(prev.map((l) => l.log_id));
-          const newLogs = batchLogs.filter((l) => !existingIds.has(l.log_id));
-          return [...newLogs, ...prev].slice(0, 150);
-        });
-        return;
-      }
-      if (message.type === 'voter_signals' && Array.isArray(data.voter_signals)) {
-        setLiveVoterSignals(data.voter_signals as LiveVoterSignal[]);
-        setVoterSignalsUpdatedAt(Date.now());
-        return;
-      }
-      if (message.type === 'bot_status' && typeof data.status === 'string') {
-        setBot((prev) => (prev ? { ...prev, status: data.status as string } : prev));
-        return;
-      }
-      if (message.type === 'bot_updated' && data.bot && typeof data.bot === 'object') {
-        setBot(data.bot as BotRecord);
-        return;
-      }
-      if (['trade_executed', 'trade_rejected', 'wallet_update'].includes(message.type)) {
-        scheduleDetailRefresh();
-      }
+      if (id) handleBotDetailMessage(id, message);
     },
   });
 
   useEffect(() => {
-    return () => {
-      if (detailRefreshTimerRef.current != null) {
-        window.clearTimeout(detailRefreshTimerRef.current);
-      }
-    };
-  }, []);
+    if (!id) return;
+    setChannelStatus(`/ws/bot/${id}`, detailWs.status);
+  }, [detailWs.status, id, setChannelStatus]);
 
   useEffect(() => {
     if (historyView === 'summary') {
@@ -798,24 +662,11 @@ export default function BotDetail() {
 
   useEffect(() => {
     if (!id || !isEnsemble) return;
-
-    const fetchVoterSignals = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/bots/${id}/voter-signals`);
-        if (!res.ok) return;
-        const data = (await res.json()) as { voter_signals: LiveVoterSignal[] };
-        setLiveVoterSignals(data.voter_signals ?? []);
-        setVoterSignalsUpdatedAt(Date.now());
-      } catch {
-        // Non-fatal — cards degrade gracefully to static display
-      }
-    };
-
-    void fetchVoterSignals();
+    void loadVoterSignals(id);
     if (!detailWs.isFallbackPolling) return;
-    const timer = setInterval(() => void fetchVoterSignals(), 30_000);
+    const timer = setInterval(() => void loadVoterSignals(id), 30_000);
     return () => clearInterval(timer);
-  }, [id, isEnsemble, detailWs.isFallbackPolling]);
+  }, [id, isEnsemble, detailWs.isFallbackPolling, loadVoterSignals]);
 
   const forkNewBotInstance = async () => {
     if (!id) return;
@@ -823,7 +674,7 @@ export default function BotDetail() {
       'Create a new bot instance from this one? This bot\u2019s orders and logs stay here forever; the new bot gets a new id and starts with empty history. The exchange is unchanged.';
     if (!window.confirm(msg)) return;
     setForkBusy(true);
-    setError(null);
+    setActionError(null);
     try {
       const payload: Record<string, unknown> = {};
       if (forkNameDraft.trim()) payload.name = forkNameDraft.trim();
@@ -833,7 +684,7 @@ export default function BotDetail() {
         else {
           const n = Number.parseFloat(trimmed);
           if (!Number.isFinite(n) || n < 0) {
-            setError('Budget must be empty (clear) or a non-negative number when applying on fork.');
+            setActionError('Budget must be empty (clear) or a non-negative number when applying on fork.');
             setForkBusy(false);
             return;
           }
@@ -852,7 +703,7 @@ export default function BotDetail() {
       if (!newId) throw new Error('No new_bot_id in response');
       navigate(`/bots/${newId}`);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Fork failed');
+      setActionError(e instanceof Error ? e.message : 'Fork failed');
     } finally {
       setForkBusy(false);
     }
@@ -866,7 +717,7 @@ export default function BotDetail() {
         ? { initial_budget_quote: null }
         : { initial_budget_quote: Number.parseFloat(trimmed) };
     if (trimmed !== '' && !Number.isFinite(body.initial_budget_quote as number)) {
-      setError('Initial budget must be a number');
+      setActionError('Initial budget must be a number');
       return;
     }
     if (
@@ -874,11 +725,11 @@ export default function BotDetail() {
       typeof body.initial_budget_quote === 'number' &&
       body.initial_budget_quote < 0
     ) {
-      setError('Initial budget cannot be negative');
+      setActionError('Initial budget cannot be negative');
       return;
     }
     setBudgetBusy(true);
-    setError(null);
+    setActionError(null);
     try {
       const res = await fetch(`${API_BASE}/api/bots/${id}/strategy-params`, {
         method: 'PATCH',
@@ -890,7 +741,7 @@ export default function BotDetail() {
         throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to save budget');
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Save failed');
+      setActionError(e instanceof Error ? e.message : 'Save failed');
     } finally {
       setBudgetBusy(false);
     }
@@ -899,7 +750,7 @@ export default function BotDetail() {
   const promoteBot = async (targetMode: 'testnet' | 'live') => {
     if (!id) return;
     setPromoteBusy(true);
-    setError(null);
+    setActionError(null);
     try {
       const res = await fetch(`${API_BASE}/api/bots/${id}/execution-mode`, {
         method: 'PUT',
@@ -911,7 +762,7 @@ export default function BotDetail() {
       setShowPromoteModal(false);
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Update failed');
+      setActionError(e instanceof Error ? e.message : 'Update failed');
     } finally {
       setPromoteBusy(false);
     }
@@ -920,7 +771,7 @@ export default function BotDetail() {
   const setStatus = async (status: 'running' | 'stopped' | 'paused') => {
     if (!id) return;
     setBusy(true);
-    setError(null);
+    setActionError(null);
     try {
       const res = await fetch(`${API_BASE}/api/bots/${id}/status`, {
         method: 'PUT',
@@ -931,7 +782,7 @@ export default function BotDetail() {
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Update failed');
+      setActionError(e instanceof Error ? e.message : 'Update failed');
     } finally {
       setBusy(false);
     }
@@ -1115,7 +966,7 @@ export default function BotDetail() {
               limit={chartConfig.limit}
               fastPeriod={chartConfig.fastPeriod}
               slowPeriod={chartConfig.slowPeriod}
-              liveOhlcvPollMs={CHART_OHLCV_POLL_INTERVAL_MS}
+              liveOhlcvPollMs={detailWs.isFallbackPolling ? CHART_OHLCV_POLL_INTERVAL_MS : 0}
             />
           ) : null}
 
@@ -1633,7 +1484,7 @@ export default function BotDetail() {
                   className="flex-1 py-3 bg-red-600 hover:bg-red-500 text-white text-[11px] font-black uppercase tracking-widest rounded disabled:opacity-40 transition-all">
                   {promoteBusy ? 'Promoting…' : 'Yes, Go Live with Real Funds'}
                 </button>
-                <button type="button" onClick={() => { setShowPromoteModal(false); setError(null); }}
+                <button type="button" onClick={() => { setShowPromoteModal(false); setActionError(null); }}
                   className="px-4 py-3 border border-border text-gray-400 text-[11px] font-bold uppercase tracking-widest rounded hover:border-gray-500 transition-all">
                   Cancel
                 </button>

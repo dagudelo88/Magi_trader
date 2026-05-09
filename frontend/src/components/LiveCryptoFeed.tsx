@@ -1,8 +1,4 @@
-import { useState, useEffect, useRef } from "react";
-import { API_BASE } from "../config";
-import { TRACKED_STREAM_IDS_FALLBACK } from "../trackedMarketsFallback";
-
-const UPDATE_INTERVAL_MS = 1000;
+import { useRealtimeStore } from "../stores/realtimeStore";
 
 type PriceData = {
   price: string;
@@ -10,121 +6,22 @@ type PriceData = {
 };
 
 export default function LiveCryptoFeed() {
-  const [prices, setPrices] = useState<Record<string, PriceData>>({});
-  const [streamIds, setStreamIds] = useState<string[]>([]);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
-  const [timeToNext, setTimeToNext] = useState(UPDATE_INTERVAL_MS);
-  
-  // Use a ref to buffer incoming WebSocket updates without triggering re-renders
-  const pendingPrices = useRef<Record<string, string>>({});
-  const previousPrices = useRef<Record<string, string>>({});
+  const marketTickers = useRealtimeStore((state) => state.marketTickers);
+  const streamIds = useRealtimeStore((state) => state.trackedStreamIds);
+  const marketUpdatedAt = useRealtimeStore((state) => state.marketUpdatedAt);
+  const lastUpdated = marketUpdatedAt ? new Date(marketUpdatedAt) : null;
 
-  useEffect(() => {
-    let cancelled = false;
-    fetch(`${API_BASE}/api/market/tracked`)
-      .then((r) => r.json())
-      .then((d: { stream_ids?: string[] }) => {
-        if (cancelled) return;
-        setStreamIds(Array.isArray(d.stream_ids) && d.stream_ids.length ? d.stream_ids : TRACKED_STREAM_IDS_FALLBACK);
-      })
-      .catch(() => {
-        if (!cancelled) setStreamIds(TRACKED_STREAM_IDS_FALLBACK);
-      });
-    return () => {
-      cancelled = true;
+  const prices = streamIds.reduce<Record<string, PriceData>>((acc, pair) => {
+    const symbol = pair.toUpperCase();
+    const ticker = marketTickers[symbol];
+    if (!ticker) return acc;
+    const change = Number(ticker.change);
+    acc[symbol] = {
+      price: ticker.price,
+      trend: change > 0 ? 'up' : change < 0 ? 'down' : 'flat',
     };
-  }, []);
-
-  useEffect(() => {
-    if (streamIds.length === 0) return;
-    let ignore = false;
-    const streams = streamIds.map((pair) => `${pair}@trade`).join("/");
-    const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams}`);
-
-    ws.onopen = () => {
-      if (!ignore) {
-        console.log("Connected to Binance WebSocket (Frontend - Trades)");
-      }
-    };
-
-    ws.onmessage = (event) => {
-      if (ignore) return;
-      try {
-        const data = JSON.parse(event.data);
-        if (data.stream && data.data) {
-          const symbol = data.data.s; // e.g. "BTCUSDT"
-          // 'p' in the @trade payload is the actual executed trade price
-          const lastPrice = parseFloat(data.data.p).toFixed(6);
-          pendingPrices.current[symbol] = lastPrice;
-        }
-      } catch (e) {
-        console.error("WebSocket message parsing error", e);
-      }
-    };
-
-    ws.onerror = (err) => {
-      if (!ignore) {
-        if (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) return;
-        console.error("WebSocket error:", err);
-      }
-    };
-
-    return () => {
-      ignore = true;
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-        ws.close();
-      }
-    };
-  }, [streamIds]);
-
-  // Timer and Batch Update Loop
-  useEffect(() => {
-    if (streamIds.length === 0) return;
-    const ids = streamIds;
-    const flushInterval = setInterval(() => {
-      // Flush buffered prices to state once per second
-      if (Object.keys(pendingPrices.current).length > 0) {
-        setPrices(prev => {
-          const nextState: Record<string, PriceData> = { ...prev };
-          
-          ids.forEach(pair => {
-            const symbol = pair.toUpperCase();
-            const newPrice = pendingPrices.current[symbol] || previousPrices.current[symbol];
-            
-            if (newPrice) {
-              const oldPrice = previousPrices.current[symbol];
-              let trend: 'up' | 'down' | 'flat' = 'flat';
-              
-              if (oldPrice) {
-                const newNum = parseFloat(newPrice);
-                const oldNum = parseFloat(oldPrice);
-                if (newNum > oldNum) trend = 'up';
-                else if (newNum < oldNum) trend = 'down';
-              }
-              
-              nextState[symbol] = { price: newPrice, trend };
-              previousPrices.current[symbol] = newPrice;
-            }
-          });
-          
-          return nextState;
-        });
-        setLastUpdated(new Date());
-      }
-      // Reset visual timer
-      setTimeToNext(UPDATE_INTERVAL_MS);
-    }, UPDATE_INTERVAL_MS);
-
-    // Visual progress bar for the next batch update
-    const timerInterval = setInterval(() => {
-      setTimeToNext(prev => Math.max(0, prev - 50));
-    }, 50);
-
-    return () => {
-      clearInterval(flushInterval);
-      clearInterval(timerInterval);
-    };
-  }, [streamIds]);
+    return acc;
+  }, {});
 
   const formatTime = (date: Date) => {
     const hhmmss = date.toLocaleTimeString(navigator.language, { hour12: false });
@@ -140,7 +37,7 @@ export default function LiveCryptoFeed() {
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
             <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
           </span>
-          Live Market Feed (Batch Sync)
+          Live Market Feed
         </h3>
         
         <div className="text-xs text-gray-400 flex items-center gap-4 bg-surface px-3 py-1.5 rounded-full border border-border">
@@ -148,23 +45,10 @@ export default function LiveCryptoFeed() {
             <svg className="w-3.5 h-3.5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
             {lastUpdated ? formatTime(lastUpdated) : "Syncing..."}
           </div>
-          <div className="w-px h-3 bg-border"></div>
-          <div className="flex items-center gap-2">
-            <span className="text-gray-500 font-semibold">T-MINUS</span>
-            <div className="w-16 h-1.5 bg-panel rounded-full overflow-hidden">
-              <div 
-                className="h-full bg-primary transition-all ease-linear" 
-                style={{ 
-                  width: `${(timeToNext / UPDATE_INTERVAL_MS) * 100}%`,
-                  transitionDuration: '50ms'
-                }}
-              ></div>
-            </div>
-          </div>
         </div>
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 overflow-y-auto">
-        {(streamIds.length ? streamIds : TRACKED_STREAM_IDS_FALLBACK).map((pair) => {
+        {streamIds.map((pair) => {
           const symbol = pair.toUpperCase();
           const data = prices[symbol];
           

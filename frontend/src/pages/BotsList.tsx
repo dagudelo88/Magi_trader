@@ -2,20 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { API_BASE } from '../config';
 import { BOT_TEMPLATES, SUPPORTED_SYMBOLS, type BotTemplate } from '../botTemplates';
-import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
-
-interface BotRow {
-  bot_id: string;
-  name: string;
-  symbol: string;
-  strategy: string;
-  status: string;
-  execution_mode: string;
-  initial_budget_quote: number | null;
-  realized_pnl_quote: number | null;
-  win_rate_pct: number | null;
-  closed_trades: number | null;
-}
+import { useRealtimeStore, type BotRow } from '../stores/realtimeStore';
 
 const STATUS_BADGE: Record<string, string> = {
   running: 'bg-green-500/20 text-green-400 border border-green-500/30',
@@ -74,8 +61,10 @@ interface EditForm {
 // ── Component ───────────────────────────────────────────────────────────────
 
 export default function BotsList() {
-  const [bots, setBots] = useState<BotRow[]>([]);
-  const [executionMode, setExecutionMode] = useState<string | null>(null);
+  const bots = useRealtimeStore((state) => state.bots);
+  const executionMode = useRealtimeStore((state) => state.tradingSettings?.execution_mode ?? null);
+  const loadBots = useRealtimeStore((state) => state.loadBots);
+  const removeBot = useRealtimeStore((state) => state.removeBot);
   const [error, setError] = useState<string | null>(null);
   const [busyBotId, setBusyBotId] = useState<string | null>(null);
   const [bulkBusy, setBulkBusy] = useState<'resume' | 'pause' | null>(null);
@@ -97,20 +86,9 @@ export default function BotsList() {
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
 
-  const load = async (signal?: AbortSignal) => {
+  const loadStrategies = async (signal?: AbortSignal) => {
     try {
-      const [botsRes, settingsRes, strategiesRes] = await Promise.all([
-        fetch(`${API_BASE}/api/bots`, { signal }),
-        fetch(`${API_BASE}/api/settings/trading`, { signal }),
-        fetch(`${API_BASE}/api/strategies`, { signal }),
-      ]);
-      if (!botsRes.ok) throw new Error('Failed to load bots');
-      const b = await botsRes.json();
-      setBots(b.bots ?? []);
-      if (settingsRes.ok) {
-        const s = await settingsRes.json();
-        setExecutionMode(s.execution_mode);
-      }
+      const strategiesRes = await fetch(`${API_BASE}/api/strategies`, { signal });
       if (strategiesRes.ok) {
         const s = await strategiesRes.json();
         const defaults: Record<string, StrategyDefaults> = {};
@@ -125,63 +103,15 @@ export default function BotsList() {
     }
   };
 
-  const botsWs = useMagiWebSocket({
-    path: '/ws/bots',
-    onMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => {
-      const data = message.data;
-      if (message.type === 'bot_status' && typeof data.bot_id === 'string') {
-        setBots((prev) =>
-          prev.map((bot) =>
-            bot.bot_id === data.bot_id
-              ? { ...bot, status: String(data.status ?? bot.status) }
-              : bot,
-          ),
-        );
-        return;
-      }
-      if (message.type === 'trading_settings' && typeof data.execution_mode === 'string') {
-        setExecutionMode(data.execution_mode);
-        return;
-      }
-      if (message.type === 'bots_changed' && data.action === 'deleted' && typeof data.bot_id === 'string') {
-        setBots((prev) => prev.filter((bot) => bot.bot_id !== data.bot_id));
-        return;
-      }
-      if (['bots_changed', 'bot_updated', 'trade_executed'].includes(message.type)) {
-        void load();
-      }
-    },
-  });
-
   useEffect(() => {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 10_000);
-    void load(ctrl.signal).then(() => clearTimeout(t));
-
-    if (!botsWs.isFallbackPolling) {
-      return () => {
-        ctrl.abort();
-        clearTimeout(t);
-      };
-    }
-
-    // WebSocket fallback only: keep REST alive, but at a much lower cadence.
-    const pollCtrl = { current: new AbortController() };
-    const id = setInterval(() => {
-      pollCtrl.current = new AbortController();
-      const pt = setTimeout(() => pollCtrl.current.abort(), 10_000);
-      fetch(`${API_BASE}/api/bots`, { signal: pollCtrl.current.signal })
-        .then((r) => r.json())
-        .then((d: { bots?: BotRow[] }) => { clearTimeout(pt); setBots(d.bots ?? []); })
-        .catch(() => clearTimeout(pt));
-    }, 30_000);
-
+    void loadStrategies(ctrl.signal).then(() => clearTimeout(t));
     return () => {
       ctrl.abort();
-      pollCtrl.current.abort();
-      clearInterval(id);
+      clearTimeout(t);
     };
-  }, [botsWs.isFallbackPolling]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // Focus budget field when configure step opens
   useEffect(() => {
@@ -259,7 +189,7 @@ export default function BotsList() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Create failed');
       closeCreate();
-      await load();
+      await loadBots();
     } catch (e) {
       setCreateError(e instanceof Error ? e.message : 'Create failed');
     } finally {
@@ -278,7 +208,7 @@ export default function BotsList() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
-      await load();
+      await loadBots();
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Update failed');
     } finally {
@@ -301,7 +231,7 @@ export default function BotsList() {
           }),
         ),
       );
-      await load();
+      await loadBots();
     } catch {
       setError('Failed to resume all bots');
     } finally {
@@ -324,7 +254,7 @@ export default function BotsList() {
           }),
         ),
       );
-      await load();
+      await loadBots();
     } catch {
       setError('Failed to pause all bots');
     } finally {
@@ -343,7 +273,7 @@ export default function BotsList() {
         const data = await res.json().catch(() => ({}));
         throw new Error(typeof data.detail === 'string' ? data.detail : 'Delete failed');
       }
-      setBots((prev) => prev.filter((b) => b.bot_id !== bot.bot_id));
+      removeBot(bot.bot_id);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Delete failed');
     } finally {
@@ -374,7 +304,7 @@ export default function BotsList() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
       setEditBotId(null);
-      await load();
+      await loadBots();
     } catch (e) {
       setEditError(e instanceof Error ? e.message : 'Update failed');
     } finally {

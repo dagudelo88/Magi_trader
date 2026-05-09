@@ -1,14 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { API_BASE } from '../config';
-
-interface TradingSettings {
-  execution_mode: string;
-  global_trading_halted: boolean;
-  live_confirmation_phrase: string;
-}
+import { useRealtimeStore, type TradingSettings } from '../stores/realtimeStore';
 
 export default function Settings() {
-  const [settings, setSettings] = useState<TradingSettings | null>(null);
+  const settings = useRealtimeStore((state) => state.tradingSettings) as TradingSettings | null;
+  const loadTradingSettings = useRealtimeStore((state) => state.loadTradingSettings);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [liveModalOpen, setLiveModalOpen] = useState(false);
@@ -21,7 +17,11 @@ export default function Settings() {
       const res = await fetch(`${API_BASE}/api/settings/trading`);
       if (!res.ok) throw new Error('Failed to load settings');
       const data = await res.json();
-      setSettings(data);
+      useRealtimeStore.setState({
+        tradingSettings: data,
+        settingsLoaded: true,
+        apiOk: true,
+      });
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : 'Load failed');
     }
@@ -45,7 +45,7 @@ export default function Settings() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not switch to testnet');
-      await load();
+      await loadTradingSettings();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Request failed');
     } finally {
@@ -70,7 +70,7 @@ export default function Settings() {
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not enable live trading');
       setLiveModalOpen(false);
       setConfirmInput('');
-      await load();
+      await loadTradingSettings();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Request failed');
     } finally {
@@ -89,7 +89,7 @@ export default function Settings() {
         body: JSON.stringify({ halted }),
       });
       if (!res.ok) throw new Error('Could not update halt state');
-      await load();
+      await loadTradingSettings();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Request failed');
     } finally {

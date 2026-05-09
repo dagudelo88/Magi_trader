@@ -1,48 +1,6 @@
-import { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { ShieldAlert, Terminal } from 'lucide-react';
-import { API_BASE } from '../../config';
-
-const HEALTH_POLL_MS = 6_000;
-
-function useApiHealth() {
-  const [latencyMs, setLatencyMs] = useState<number | null>(null);
-  const [apiOk, setApiOk] = useState<boolean | null>(null);
-  const [executionMode, setExecutionMode] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const check = async () => {
-      const t0 = performance.now();
-      try {
-        const res = await fetch(`${API_BASE}/api/settings/trading`);
-        const elapsed = Math.round(performance.now() - t0);
-        if (cancelled) return;
-        if (res.ok) {
-          const data = (await res.json()) as { execution_mode?: string };
-          setApiOk(true);
-          setLatencyMs(elapsed);
-          setExecutionMode(data.execution_mode ?? null);
-        } else {
-          setApiOk(false);
-          setLatencyMs(null);
-        }
-      } catch {
-        if (cancelled) return;
-        setApiOk(false);
-        setLatencyMs(null);
-      }
-    };
-    void check();
-    const t = window.setInterval(() => void check(), HEALTH_POLL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(t);
-    };
-  }, []);
-
-  return { latencyMs, apiOk, executionMode };
-}
+import { useRealtimeStore } from '../../stores/realtimeStore';
 
 const NAV = [
   { to: '/', label: 'OVERVIEW' },
@@ -54,7 +12,10 @@ const NAV = [
 
 export function TopNav() {
   const location = useLocation();
-  const { latencyMs, apiOk, executionMode } = useApiHealth();
+  const latencyMs = useRealtimeStore((state) => state.lastApiLatencyMs);
+  const apiOk = useRealtimeStore((state) => state.apiOk);
+  const executionMode = useRealtimeStore((state) => state.tradingSettings?.execution_mode ?? null);
+  const botsStatus = useRealtimeStore((state) => state.channelStatuses['/ws/bots']);
 
   const isActive = (path: string) => {
     if (path === '/bots') {
@@ -93,6 +54,13 @@ export function TopNav() {
             }`}
           >
             API: {apiOk === null ? '…' : apiOk ? 'OK' : 'ERR'}
+          </span>
+          <span
+            className={`font-label px-2 py-1 text-[10px] font-bold uppercase tracking-tighter ${
+              botsStatus === 'open' ? 'text-orange-400/70' : 'text-orange-900/50'
+            }`}
+          >
+            WS: {botsStatus?.toUpperCase() ?? '—'}
           </span>
           <span
             className={`font-label px-2 py-1 text-[10px] font-bold uppercase tracking-tighter ${
