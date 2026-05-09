@@ -67,6 +67,12 @@ _cycle_executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1,
     thread_name_prefix="bot-cycle",
 )
+_cycle_seq_lock = threading.Lock()
+_cycle_seq = 0
+_auth_exchange_cache: dict[str, Any] = {}
+_auth_exchange_cache_lock = threading.Lock()
+_last_ohlcv_cache_upsert: dict[tuple[str, str], float] = {}
+_last_ohlcv_cache_upsert_lock = threading.Lock()
 
 
 def _slow_cycle_breakdown_threshold_ms() -> float:
@@ -74,6 +80,87 @@ def _slow_cycle_breakdown_threshold_ms() -> float:
         return float(os.environ.get("SLOW_CYCLE_BREAKDOWN_MS", "1500"))
     except ValueError:
         return 1500.0
+
+
+def _slow_trade_breakdown_threshold_ms() -> float:
+    try:
+        return float(os.environ.get("SLOW_TRADE_BREAKDOWN_MS", "5000"))
+    except ValueError:
+        return 5000.0
+
+
+def _slow_cycle_print_threshold_ms(trade_executed: bool) -> float:
+    key = "SLOW_TRADE_CYCLE_MS" if trade_executed else "SLOW_NON_TRADE_CYCLE_MS"
+    default = "5000" if trade_executed else "1000"
+    try:
+        return float(os.environ.get(key, default))
+    except ValueError:
+        return float(default)
+
+
+def _stall_debug_enabled() -> bool:
+    raw = (os.environ.get("BOT_STALL_DEBUG_LOGS") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _next_cycle_seq() -> int:
+    global _cycle_seq
+    with _cycle_seq_lock:
+        _cycle_seq += 1
+        return _cycle_seq
+
+
+def _cycle_debug(cycle_id: int, message: str) -> None:
+    if not _stall_debug_enabled():
+        return
+    print(f"[bot_runner][cycle {cycle_id}] {message}", flush=True)
+
+
+def _ohlcv_cache_upsert_interval_sec() -> float:
+    try:
+        return float(os.environ.get("OHLCV_CACHE_UPSERT_INTERVAL_SEC", "60"))
+    except ValueError:
+        return 60.0
+
+
+def _should_upsert_ohlcv_cache(symbol: str, timeframe: str) -> bool:
+    interval = _ohlcv_cache_upsert_interval_sec()
+    if interval <= 0:
+        return False
+    key = (symbol, timeframe)
+    now = time.monotonic()
+    with _last_ohlcv_cache_upsert_lock:
+        last = _last_ohlcv_cache_upsert.get(key, 0.0)
+        if now - last < interval:
+            return False
+        _last_ohlcv_cache_upsert[key] = now
+    return True
+
+
+def min_running_bot_cooldown_remaining_sec() -> float | None:
+    """Return seconds until the next running bot is due for active work.
+
+    ``None`` means no running bots. ``0`` means at least one bot is due now or
+    has not traded yet, so MetaMagi should use only tiny cooperative batches.
+    """
+    bots = _load_running_bots()
+    if not bots:
+        return None
+    now = time.monotonic()
+    remaining_values: list[float] = []
+    for bot in bots:
+        bot_id = bot["bot_id"]
+        params = _merge_params(
+            bot.get("strategy") or "sma_cross",
+            bot.get("strategy_params_json"),
+        )
+        interval_key = float(params["min_trade_interval_sec"])
+        last = _last_trade_monotonic.get(bot_id, 0.0)
+        if last <= 0:
+            remaining_values.append(0.0)
+            continue
+        remaining_values.append(max(0.0, interval_key - (now - last)))
+    return min(remaining_values) if remaining_values else None
 
 
 _enhanced_diag_lock = threading.Lock()
@@ -245,7 +332,11 @@ def _emit_bot_event(
     try:
         publish_bot_event(bot_id, event_type, data, priority=priority)
     except Exception:
-        pass
+        print(
+            f"[bot_runner] publish_bot_event failed "
+            f"bot={bot_id} event={event_type}:\n{traceback.format_exc()}",
+            flush=True,
+        )
 
 
 def _format_meta(meta: dict) -> str:
@@ -290,7 +381,11 @@ def _get_features_snapshot(symbol: str) -> str | None:
         if row and row["features_json"]:
             return row["features_json"]
     except Exception:
-        pass
+        print(
+            f"[bot_runner] get_features_snapshot failed symbol={symbol}:\n"
+            f"{traceback.format_exc()}",
+            flush=True,
+        )
     return None
 
 
@@ -439,7 +534,11 @@ def _flush_log_queue() -> None:
     try:
         batch_insert_bot_logs(rows)
     except Exception:
-        pass
+        print(
+            f"[bot_runner] batch_insert_bot_logs failed rows={len(rows)}:\n"
+            f"{traceback.format_exc()}",
+            flush=True,
+        )
 
 
 def _queue_global_decision(decision: dict[str, Any]) -> None:
@@ -578,7 +677,11 @@ def _log_post_trade_balance(
             priority=True,
         )
     except Exception:
-        pass
+        print(
+            f"[bot_runner] post-trade balance refresh failed "
+            f"bot={bot_id} mode={execution_mode}:\n{traceback.format_exc()}",
+            flush=True,
+        )
 
 
 def _get_bot_position(bot_id: str, symbol: str) -> tuple[float, float]:
@@ -1008,7 +1111,7 @@ def _process_bot(
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
         finally:
             timings["trade_ms"] = (time.perf_counter() - t_trade0) * 1000.0
-            if timings["trade_ms"] > 500:
+            if timings["trade_ms"] > _slow_trade_breakdown_threshold_ms():
                 _log_slow_trade_breakdown(bot_id, "buy", trade_phase_ms, timings["trade_ms"])
 
     elif result.signal == "sell":
@@ -1171,7 +1274,7 @@ def _process_bot(
             _log(bot_id, "error", execution_mode, f"SELL failed: {e}\n{traceback.format_exc()}")
         finally:
             timings["trade_ms"] = (time.perf_counter() - t_trade0) * 1000.0
-            if timings["trade_ms"] > 500:
+            if timings["trade_ms"] > _slow_trade_breakdown_threshold_ms():
                 _log_slow_trade_breakdown(bot_id, "sell", trade_phase_ms, timings["trade_ms"])
 
     else:
@@ -1192,14 +1295,43 @@ def _build_exchanges_for_bots(bots: list[dict[str, Any]]) -> dict[str, Any]:
     for mode in modes_needed:
         if mode in exchanges:
             continue
+        with _auth_exchange_cache_lock:
+            cached = _auth_exchange_cache.get(mode)
+        if cached is not None:
+            exchanges[mode] = cached
+            continue
         try:
+            t0 = time.perf_counter()
             ex = build_binance_spot(mode)
             # ccxt timeout is in milliseconds.  15 s is generous for testnet
             # but still short enough that a dead connection unblocks quickly.
             ex.timeout = 15_000
+            try:
+                ex.load_markets()
+            except Exception:
+                print(
+                    f"[bot_runner] Auth exchange market preload failed "
+                    f"mode={mode}:\n{traceback.format_exc()}",
+                    flush=True,
+                )
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            print(
+                f"[bot_runner] Auth exchange ready mode={mode} "
+                f"markets_loaded={bool(getattr(ex, 'markets', None))} "
+                f"elapsed={elapsed_ms:.0f}ms",
+                flush=True,
+            )
+            with _auth_exchange_cache_lock:
+                _auth_exchange_cache[mode] = ex
             exchanges[mode] = ex
         except ValueError as e:
-            print(f"[bot_runner] Exchange config error for mode={mode}: {e}")
+            print(f"[bot_runner] Exchange config error for mode={mode}: {e}", flush=True)
+        except Exception:
+            print(
+                f"[bot_runner] Exchange setup failed for mode={mode}:\n"
+                f"{traceback.format_exc()}",
+                flush=True,
+            )
     return exchanges
 
 
@@ -1222,10 +1354,14 @@ async def run_async():
         except asyncio.TimeoutError:
             print(
                 "[bot_runner] Full cycle exceeded 120 s wall time — "
-                "skipping to next poll."
+                "the single cycle executor may be stuck behind a blocking call.",
+                flush=True,
             )
         except Exception:
-            pass
+            print(
+                f"[bot_runner] run_async loop error:\n{traceback.format_exc()}",
+                flush=True,
+            )
         await asyncio.sleep(POLL_SEC)
 
 
@@ -1275,7 +1411,9 @@ def _maybe_log_thread_pool_stats(
 
 def _run_one_cycle():
     """One polling cycle — extracted so both the async and sync entrypoints share it."""
+    cycle_id = _next_cycle_seq()
     _cycle_wall_t0 = time.perf_counter()
+    _cycle_debug(cycle_id, "start")
     full_phase_ms: dict[str, float] = {
         "load_bots_ms": 0.0,
         "exchange_setup_ms": 0.0,
@@ -1290,29 +1428,43 @@ def _run_one_cycle():
     }
 
     if is_global_halt():
+        _cycle_debug(cycle_id, "global halt")
         _throttled_print(
             "global_halt",
             "[bot_runner] Waiting: global trading halt is ON — no bot cycles.",
         )
         return
 
+    _cycle_debug(cycle_id, "load_bots begin")
     t_phase = time.perf_counter()
     bots = _load_running_bots()
     full_phase_ms["load_bots_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"load_bots done bots={len(bots)} elapsed={full_phase_ms['load_bots_ms']:.0f}ms",
+    )
     if not bots:
         _throttled_print(
             "no_running_bots",
             f"[bot_runner] Waiting: no bots with status=running in DB (sleep {POLL_SEC}s).",
         )
+        _cycle_debug(cycle_id, "end no running bots")
         return
 
     # Authenticated exchanges (per execution_mode) — used only for balance + orders.
+    _cycle_debug(cycle_id, "exchange_setup begin")
     t_phase = time.perf_counter()
     exchanges = _build_exchanges_for_bots(bots)
     # Single unauthenticated mainnet exchange — used for OHLCV + market metadata.
     public_ex = _get_public_exchange()
     full_phase_ms["exchange_setup_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"exchange_setup done modes={sorted(exchanges)} "
+        f"elapsed={full_phase_ms['exchange_setup_ms']:.0f}ms",
+    )
 
+    _cycle_debug(cycle_id, "params/cooldown begin")
     t_phase = time.perf_counter()
     params_by_bot_id: dict[str, dict[str, Any]] = {}
     active_bots: list[dict[str, Any]] = []
@@ -1323,8 +1475,14 @@ def _run_one_cycle():
         if time.monotonic() - _last_trade_monotonic.get(bot["bot_id"], 0.0) >= interval_key:
             active_bots.append(bot)
     full_phase_ms["params_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"params/cooldown done active={len(active_bots)} "
+        f"elapsed={full_phase_ms['params_ms']:.0f}ms",
+    )
 
     # Per-cycle snapshots keep the Decision phase focused on in-memory checks.
+    _cycle_debug(cycle_id, "market_metadata begin")
     t_phase = time.perf_counter()
     market_cache: dict[str, dict[str, Any]] = {}
     try:
@@ -1332,10 +1490,19 @@ def _run_one_cycle():
             public_ex.load_markets()
         for symbol in {bot["symbol"] for bot in active_bots}:
             market_cache[symbol] = public_ex.market(symbol)
-    except Exception as e:
-        print(f"[bot_runner] market metadata prefetch failed: {e}", flush=True)
+    except Exception:
+        print(
+            f"[bot_runner] market metadata prefetch failed:\n{traceback.format_exc()}",
+            flush=True,
+        )
     full_phase_ms["market_prefetch_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"market_metadata done markets={len(market_cache)} "
+        f"elapsed={full_phase_ms['market_prefetch_ms']:.0f}ms",
+    )
 
+    _cycle_debug(cycle_id, "balance_prefetch skipped")
     t_phase = time.perf_counter()
     balance_cache: dict[str, dict[str, Any]] = {}
     # Do not eagerly call fetch_balance here. Most cycles are HOLD, and wallet
@@ -1343,22 +1510,30 @@ def _run_one_cycle():
     # lazily use `_get_cached_balance()` only after a strategy emits a trade.
     full_phase_ms["balance_prefetch_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
+    _cycle_debug(cycle_id, "position_prefetch skipped")
     t_phase = time.perf_counter()
     position_cache: dict[tuple[str, str], tuple[float, float]] = {}
     # Position replay is only needed for budget-constrained BUY/SELL decisions.
     # Keep it lazy so HOLD cycles avoid DB order-history reads entirely.
     full_phase_ms["position_prefetch_ms"] = (time.perf_counter() - t_phase) * 1000.0
 
+    _cycle_debug(cycle_id, "features_snapshot begin")
     t_phase = time.perf_counter()
     features_cache: dict[str, str | None] = {
         symbol: _get_features_snapshot(symbol)
         for symbol in {bot["symbol"] for bot in active_bots}
     }
     full_phase_ms["features_prefetch_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"features_snapshot done symbols={len(features_cache)} "
+        f"elapsed={full_phase_ms['features_prefetch_ms']:.0f}ms",
+    )
 
     # ── Pre-fetch OHLCV once per unique (symbol, timeframe, limit) ────────────
     # All bots share the same mainnet candle data regardless of their execution_mode,
     # so signals are always computed from real market prices.
+    _cycle_debug(cycle_id, "ohlcv_prefetch begin")
     t_phase = time.perf_counter()
     ohlcv_cache: dict[tuple, list | None] = {}
     for bot in bots:
@@ -1380,13 +1555,23 @@ def _run_one_cycle():
                     symbol, timeframe=timeframe, limit=limit
                 )
                 ohlcv_cache[cache_key] = candles
-                # Persist candles for backtesting replay — failures are
-                # swallowed inside upsert_ohlcv_candles, never blocking trades.
-                upsert_ohlcv_candles(symbol, timeframe, candles)
-            except Exception as e:
-                print(f"[bot_runner] pre-fetch OHLCV failed {symbol} {timeframe}: {e}")
+                # Persist candles for backtesting replay on a throttle so live
+                # trading does not add a DB writer every 5-second bot cycle.
+                if _should_upsert_ohlcv_cache(symbol, timeframe):
+                    upsert_ohlcv_candles(symbol, timeframe, candles)
+            except Exception:
+                print(
+                    f"[bot_runner] pre-fetch OHLCV failed {symbol} {timeframe}:\n"
+                    f"{traceback.format_exc()}",
+                    flush=True,
+                )
                 ohlcv_cache[cache_key] = None  # bot will fall back to its own fetch
     full_phase_ms["ohlcv_prefetch_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"ohlcv_prefetch done keys={len(ohlcv_cache)} "
+        f"elapsed={full_phase_ms['ohlcv_prefetch_ms']:.0f}ms",
+    )
 
     # ── Dispatch all bots in parallel threads ─────────────────────────────────
     def _run_bot(bot: dict[str, Any]) -> None:
@@ -1436,16 +1621,25 @@ def _run_one_cycle():
             phase_ms["broadcast_ms"] = (time.perf_counter() - t_bc) * 1000.0
 
         cycle_ms = (time.perf_counter() - _cycle_t0) * 1000
-        monitor.record_bot_cycle(bot_id, cycle_ms)
+        trade_ms = float(phase_ms.get("trade_ms") or 0.0)
+        trade_executed = trade_ms > 0.0
+        monitor.record_bot_cycle(
+            bot_id,
+            cycle_ms,
+            trade_executed=trade_executed,
+            trade_ms=trade_ms,
+        )
 
         thresh = _slow_cycle_breakdown_threshold_ms()
         if cycle_ms > thresh:
             _log_slow_cycle_breakdown(bot_id, phase_ms, cycle_ms)
 
-        if cycle_ms > 500:
+        print_thresh = _slow_cycle_print_threshold_ms(trade_executed)
+        if cycle_ms > print_thresh:
             print(
                 f"[bot_runner] SLOW CYCLE bot={bot_id} symbol={symbol} "
-                f"→ {cycle_ms:.0f} ms",
+                f"kind={'trade' if trade_executed else 'non_trade'} "
+                f"→ {cycle_ms:.0f} ms (threshold={print_thresh:.0f}ms)",
                 flush=True,
             )
 
@@ -1485,6 +1679,10 @@ def _run_one_cycle():
     _CYCLE_TIMEOUT_SEC = 90
 
     max_workers = min(len(bots) * 2, 64)
+    _cycle_debug(
+        cycle_id,
+        f"dispatch begin bots={len(bots)} workers={max_workers}",
+    )
     pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=max_workers,
         thread_name_prefix="bot-worker",
@@ -1503,17 +1701,27 @@ def _run_one_cycle():
             bot_ids = ", ".join(futures[f] for f in not_done)
             print(
                 f"[bot_runner] Cycle timed out after {_CYCLE_TIMEOUT_SEC}s — "
-                f"{len(not_done)} bot(s) still running (network hang?): {bot_ids}"
+                f"{len(not_done)} bot(s) still running (network hang?): {bot_ids}",
+                flush=True,
             )
         for f in done:
             try:
                 f.result()
             except Exception:
-                pass
+                print(
+                    f"[bot_runner] Bot worker future failed "
+                    f"bot={futures.get(f, '<unknown>')}:\n{traceback.format_exc()}",
+                    flush=True,
+                )
     finally:
         # Non-blocking shutdown: don't wait for hung threads.
         pool.shutdown(wait=False)
     full_phase_ms["dispatch_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"dispatch done done={len(done)} timed_out={len(not_done)} "
+        f"elapsed={full_phase_ms['dispatch_ms']:.0f}ms",
+    )
 
     _maybe_log_thread_pool_stats(
         running_bots=len(bots),
@@ -1524,6 +1732,7 @@ def _run_one_cycle():
     )
 
     # Flush queued write-heavy telemetry after worker hot paths complete.
+    _cycle_debug(cycle_id, "flush begin")
     t_phase = time.perf_counter()
     _flush_voter_feedback_queue()
     _flush_decision_queue()
@@ -1534,6 +1743,10 @@ def _run_one_cycle():
     # the next cycle's flush, which is acceptable.
     _flush_log_queue()
     full_phase_ms["flush_ms"] = (time.perf_counter() - t_phase) * 1000.0
+    _cycle_debug(
+        cycle_id,
+        f"flush done elapsed={full_phase_ms['flush_ms']:.0f}ms",
+    )
 
     # ── Observability ─────────────────────────────────────────────────────────
     wall_ms = (time.perf_counter() - _cycle_wall_t0) * 1000
@@ -1550,6 +1763,7 @@ def _run_one_cycle():
     )
     monitor.maybe_log_memory(running_bots=len(bots))
     monitor.maybe_log_cycle_trend()
+    _cycle_debug(cycle_id, f"end wall={wall_ms:.0f}ms")
 
 
 def main():

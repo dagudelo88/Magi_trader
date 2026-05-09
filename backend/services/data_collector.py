@@ -77,6 +77,9 @@ MARKET_BROADCAST_MIN_INTERVAL_SEC = 2.0
 # Doubled from 5 → 10 s to further reduce DB contention with 4+ bots running.
 # Override with the TICK_BATCH_SEC environment variable.
 TICK_BATCH_SEC: int = int(os.environ.get("TICK_BATCH_SEC", "10"))
+MAX_PENDING_TICK_ROWS: int = int(
+    os.environ.get("MAX_PENDING_TICK_ROWS", "2000")
+)
 
 # ── Per-symbol state ────────────────────────────────────────────────────────
 
@@ -320,7 +323,7 @@ def _build_tick_rows(timestamp: int) -> list[tuple]:
     return rows
 
 
-def _flush_ticks(pending_rows: list[tuple]) -> None:
+def _flush_ticks(pending_rows: list[tuple]) -> bool:
     """Write accumulated tick rows to the database in one connection + commit.
 
     Batching TICK_BATCH_SEC seconds of rows into a single write reduces SQLite
@@ -328,10 +331,11 @@ def _flush_ticks(pending_rows: list[tuple]) -> None:
     without losing any time-series resolution in the stored data.
     """
     if not pending_rows:
-        return
+        return True
 
     t0 = time.perf_counter()
     conn = get_db_connection()
+    ok = True
     try:
         conn.executemany(
             """
@@ -345,6 +349,7 @@ def _flush_ticks(pending_rows: list[tuple]) -> None:
         )
         conn.commit()
     except Exception as exc:
+        ok = False
         _dc_logger.error("[data_collector] market_ticks flush failed: %s", exc)
     finally:
         conn.close()
@@ -357,8 +362,11 @@ def _flush_ticks(pending_rows: list[tuple]) -> None:
         pass
     if elapsed_ms > 500:
         _dc_logger.warning(
-            "[data_collector] SLOW flush_ticks: %d rows → %.0f ms", len(pending_rows), elapsed_ms
+            "[data_collector] SLOW flush_ticks: %d rows → %.0f ms",
+            len(pending_rows),
+            elapsed_ms,
         )
+    return ok
 
 
 async def _data_logger() -> None:
@@ -386,9 +394,26 @@ async def _data_logger() -> None:
 
             # Flush to DB once per TICK_BATCH_SEC seconds.
             if tick_counter >= TICK_BATCH_SEC:
-                _flush_ticks(pending_rows)
-                pending_rows = []
-                tick_counter = 0
+                rows_to_flush = list(pending_rows)
+                flushed = await asyncio.to_thread(_flush_ticks, rows_to_flush)
+                if flushed:
+                    pending_rows = []
+                    tick_counter = 0
+                else:
+                    if len(pending_rows) > MAX_PENDING_TICK_ROWS:
+                        dropped = len(pending_rows) - MAX_PENDING_TICK_ROWS
+                        pending_rows = pending_rows[-MAX_PENDING_TICK_ROWS:]
+                        _dc_logger.warning(
+                            "[data_collector] Dropped %d pending market_tick "
+                            "rows after repeated DB flush failures",
+                            dropped,
+                        )
+                    _dc_logger.warning(
+                        "[data_collector] Retaining %d pending market_tick "
+                        "rows for retry",
+                        len(pending_rows),
+                    )
+                    tick_counter = max(1, TICK_BATCH_SEC - 1)
 
         except Exception as exc:
             _dc_logger.error("[data_collector] Logger error: %s", exc)

@@ -343,6 +343,26 @@ def get_db_connection() -> _PooledConnection:
     """
     return _get_pool().acquire()
 
+
+def get_direct_db_connection(timeout_ms: int = 15_000) -> sqlite3.Connection:
+    """Open a non-pooled connection for low-priority background jobs.
+
+    MetaMagi uses this with a very short busy timeout so it yields instead of
+    blocking runtime writers for the pool's normal 15 second timeout.
+    """
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=max(0.001, timeout_ms / 1000.0),
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=10000")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute(f"PRAGMA busy_timeout={max(1, int(timeout_ms))}")
+    return conn
+
 def _enable_wal_once() -> None:
     """
     Switch the database to WAL journal mode the first time it is initialised.
@@ -497,6 +517,10 @@ def init_db():
     # Indexes for faster time-series queries
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_ticks_timestamp ON market_ticks(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_market_ticks_asset ON market_ticks(target_asset)")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_ticks_asset_ts "
+        "ON market_ticks(target_asset, timestamp)"
+    )
 
     # Order book snapshots
     cursor.execute("""
@@ -1317,108 +1341,157 @@ def get_voter_feedback_batch(hours: int = 24) -> list[dict[str, Any]]:
         conn.close()
 
 
-def label_voter_feedback_forward_roc(lookback_minutes: int = 60) -> int:
-    """
-    Fill ``forward_roc_30s`` and ``forward_roc_5m`` for unlabeled
-    ``voter_feedback`` rows by joining against ``market_ticks``.
+def _roc_for_window(
+    cur: sqlite3.Cursor,
+    target_asset: str,
+    timestamp_ms: int,
+    window_ms: int,
+) -> float | None:
+    """Return forward ROC for one feedback row/window using indexed lookups."""
+    cur.execute(
+        """
+        SELECT target_price FROM market_ticks
+        WHERE target_asset = ?
+          AND timestamp <= ?
+        ORDER BY timestamp DESC
+        LIMIT 1
+        """,
+        (target_asset, timestamp_ms),
+    )
+    base = cur.fetchone()
+    cur.execute(
+        """
+        SELECT target_price FROM market_ticks
+        WHERE target_asset = ?
+          AND timestamp >= ?
+        ORDER BY timestamp ASC
+        LIMIT 1
+        """,
+        (target_asset, timestamp_ms + window_ms),
+    )
+    fwd = cur.fetchone()
+    if not base or not fwd:
+        return None
+    base_price = float(base["target_price"] or 0)
+    fwd_price = float(fwd["target_price"] or 0)
+    if base_price <= 0:
+        return None
+    return (fwd_price - base_price) / base_price
 
-    Implemented as two correlated-subquery UPDATE statements so the entire
-    labeling pass completes in a single round-trip per asset group — no Python
-    loop per row.  This is critical because the data collector writes to
-    ``market_ticks`` every second; the old N-queries-per-row design caused
-    severe lock contention in SQLite's default journal mode.
 
-    Returns the number of rows updated.
-    Pure SQLite — no Binance API calls.
+def label_voter_feedback_forward_roc_batch(
+    *,
+    lookback_minutes: int = 180,
+    batch_size: int = 50,
+    busy_timeout_ms: int = 250,
+) -> dict[str, Any]:
+    """Label one small voter_feedback batch without monopolizing SQLite.
+
+    The previous implementation ran two broad UPDATE statements over a large
+    window and held SQLite's writer lock long enough to freeze live bots. This
+    function does indexed reads first, then commits one tiny update batch.
     """
     cutoff_ms = int((time.time() - lookback_minutes * 60) * 1000)
     # Leave a 5-minute gap at the trailing edge so both forward windows (30s
     # and 5m) have time to arrive in market_ticks before we attempt labeling.
     trailing_gap_ms = 300_000
     upper_ms = int(time.time() * 1000) - trailing_gap_ms
-
-    conn = get_db_connection()
+    t0 = time.perf_counter()
+    result: dict[str, Any] = {
+        "selected": 0,
+        "updated_30s": 0,
+        "updated_5m": 0,
+        "db_busy": False,
+        "elapsed_ms": 0.0,
+    }
+    conn = get_direct_db_connection(timeout_ms=busy_timeout_ms)
     try:
         cur = conn.cursor()
-
-        # ── forward_roc_30s ──────────────────────────────────────────────────
-        # For each unlabeled row, find the closest market_tick at or after
-        # (timestamp + 30 000 ms) for the same asset, compute ROC inline.
         cur.execute(
             """
-            UPDATE voter_feedback
-            SET forward_roc_30s = (
-                SELECT
-                    CASE
-                        WHEN base_t.target_price > 0
-                        THEN (fwd_t.target_price - base_t.target_price)
-                             / base_t.target_price
-                        ELSE NULL
-                    END
-                FROM market_ticks AS base_t
-                JOIN market_ticks AS fwd_t
-                  ON fwd_t.target_asset = voter_feedback.target_asset
-                 AND fwd_t.timestamp = (
-                         SELECT MIN(timestamp) FROM market_ticks
-                         WHERE target_asset = voter_feedback.target_asset
-                           AND timestamp >= voter_feedback.timestamp + 30000
-                     )
-                WHERE base_t.target_asset = voter_feedback.target_asset
-                  AND base_t.timestamp = (
-                         SELECT MAX(timestamp) FROM market_ticks
-                         WHERE target_asset = voter_feedback.target_asset
-                           AND timestamp <= voter_feedback.timestamp
-                     )
-                LIMIT 1
-            )
-            WHERE forward_roc_30s IS NULL
+            SELECT feedback_id, timestamp, target_asset,
+                   forward_roc_30s, forward_roc_5m
+            FROM voter_feedback
+            WHERE (forward_roc_30s IS NULL OR forward_roc_5m IS NULL)
               AND timestamp >= ?
               AND timestamp <= ?
+            ORDER BY timestamp ASC
+            LIMIT ?
             """,
-            (cutoff_ms, upper_ms),
+            (cutoff_ms, upper_ms, max(1, batch_size)),
         )
-        updated_30s = cur.rowcount
-
-        # ── forward_roc_5m ───────────────────────────────────────────────────
-        cur.execute(
-            """
-            UPDATE voter_feedback
-            SET forward_roc_5m = (
-                SELECT
-                    CASE
-                        WHEN base_t.target_price > 0
-                        THEN (fwd_t.target_price - base_t.target_price)
-                             / base_t.target_price
-                        ELSE NULL
-                    END
-                FROM market_ticks AS base_t
-                JOIN market_ticks AS fwd_t
-                  ON fwd_t.target_asset = voter_feedback.target_asset
-                 AND fwd_t.timestamp = (
-                         SELECT MIN(timestamp) FROM market_ticks
-                         WHERE target_asset = voter_feedback.target_asset
-                           AND timestamp >= voter_feedback.timestamp + 300000
-                     )
-                WHERE base_t.target_asset = voter_feedback.target_asset
-                  AND base_t.timestamp = (
-                         SELECT MAX(timestamp) FROM market_ticks
-                         WHERE target_asset = voter_feedback.target_asset
-                           AND timestamp <= voter_feedback.timestamp
-                     )
-                LIMIT 1
+        rows = [dict(row) for row in cur.fetchall()]
+        result["selected"] = len(rows)
+        updates: list[tuple[float | None, float | None, int]] = []
+        for row in rows:
+            roc_30s = row["forward_roc_30s"]
+            roc_5m = row["forward_roc_5m"]
+            if roc_30s is None:
+                roc_30s = _roc_for_window(
+                    cur,
+                    row["target_asset"],
+                    int(row["timestamp"]),
+                    30_000,
+                )
+            if roc_5m is None:
+                roc_5m = _roc_for_window(
+                    cur,
+                    row["target_asset"],
+                    int(row["timestamp"]),
+                    300_000,
+                )
+            if roc_30s is not None or roc_5m is not None:
+                updates.append((roc_30s, roc_5m, int(row["feedback_id"])))
+                if row["forward_roc_30s"] is None and roc_30s is not None:
+                    result["updated_30s"] += 1
+                if row["forward_roc_5m"] is None and roc_5m is not None:
+                    result["updated_5m"] += 1
+        if updates:
+            cur.executemany(
+                """
+                UPDATE voter_feedback
+                SET forward_roc_30s = COALESCE(?, forward_roc_30s),
+                    forward_roc_5m = COALESCE(?, forward_roc_5m)
+                WHERE feedback_id = ?
+                """,
+                updates,
             )
-            WHERE forward_roc_5m IS NULL
-              AND timestamp >= ?
-              AND timestamp <= ?
-            """,
-            (cutoff_ms, upper_ms),
-        )
-        updated_5m = cur.rowcount
-
-        conn.commit()
-        return max(updated_30s, updated_5m)
+            conn.commit()
+        return result
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            result["db_busy"] = True
+            return result
+        raise
     finally:
+        result["elapsed_ms"] = (time.perf_counter() - t0) * 1000.0
         conn.close()
+
+
+def label_voter_feedback_forward_roc(lookback_minutes: int = 60) -> int:
+    """Compatibility wrapper: label bounded batches instead of one huge write."""
+    total = 0
+    deadline = time.monotonic() + float(
+        os.environ.get("METAMAGI_MANUAL_LABEL_MAX_SECONDS", "30")
+    )
+    while time.monotonic() < deadline:
+        batch = label_voter_feedback_forward_roc_batch(
+            lookback_minutes=lookback_minutes,
+            batch_size=int(os.environ.get("METAMAGI_LABEL_BATCH_SIZE", "100")),
+            busy_timeout_ms=int(
+                os.environ.get("METAMAGI_DB_BUSY_TIMEOUT_MS", "500")
+            ),
+        )
+        if batch.get("db_busy") or int(batch.get("selected") or 0) == 0:
+            break
+        updated = max(
+            int(batch.get("updated_30s") or 0),
+            int(batch.get("updated_5m") or 0),
+        )
+        if updated == 0:
+            break
+        total += updated
+    return total
 
 
 def create_bot(

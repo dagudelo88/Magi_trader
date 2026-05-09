@@ -81,14 +81,20 @@ def get_process_memory_mb() -> tuple[float, float] | None:
     except Exception:
         return None
 
+
 # ── Warning thresholds ─────────────────────────────────────────────────────
 
 # DB: count slow ops above LOG threshold; emit WARNING above WARN threshold.
 _SLOW_DB_LOG_MS: float = 200.0
 _SLOW_DB_WARN_MS: float = 500.0
 
-# Bot cycle: WARNING when a single bot's full cycle exceeds this.
-_SLOW_CYCLE_MS: float = 500.0
+# Bot cycles: non-trade cycles should stay quick; trade cycles include external
+# exchange order placement and need a separate threshold.
+_SLOW_NON_TRADE_CYCLE_MS: float = _parse_float_env(
+    "SLOW_NON_TRADE_CYCLE_MS",
+    1000.0,
+)
+_SLOW_TRADE_CYCLE_MS: float = _parse_float_env("SLOW_TRADE_CYCLE_MS", 5000.0)
 
 # WS broadcast: WARNING when sending to one channel takes longer than this.
 _SLOW_WS_MS: float = 100.0
@@ -99,8 +105,11 @@ _HEALTH_INTERVAL_SEC: float = 60.0
 # Memory log interval (RSS / VMS diagnostics).
 _MEMORY_LOG_INTERVAL_SEC: float = _parse_float_env("MEMORY_LOG_INTERVAL_SEC", 60.0)
 
-# Compare average of last 10 bot cycles vs the previous sampling window (~10 minutes).
-_CYCLE_TREND_INTERVAL_SEC: float = _parse_float_env("CYCLE_TREND_INTERVAL_SEC", 600.0)
+# Compare average of last 10 bot cycles vs the previous sampling window.
+_CYCLE_TREND_INTERVAL_SEC: float = _parse_float_env(
+    "CYCLE_TREND_INTERVAL_SEC",
+    600.0,
+)
 
 
 class PerformanceMonitor:
@@ -185,25 +194,39 @@ class PerformanceMonitor:
 
     # ── Bot cycle timing ─────────────────────────────────────────────────────
 
-    def record_bot_cycle(self, bot_id: str, duration_ms: float) -> None:
+    def record_bot_cycle(
+        self,
+        bot_id: str,
+        duration_ms: float,
+        *,
+        trade_executed: bool = False,
+        trade_ms: float = 0.0,
+    ) -> None:
         """Record the wall-clock duration for one bot's complete processing cycle."""
+        threshold_ms = (
+            _SLOW_TRADE_CYCLE_MS if trade_executed else _SLOW_NON_TRADE_CYCLE_MS
+        )
+        cycle_kind = "trade" if trade_executed else "non_trade"
         with self._lock:
             self.bot_cycles += 1
             self.bot_total_ms += duration_ms
             self._cycle_samples.append(duration_ms)
             self._bot_last_ms[bot_id] = round(duration_ms, 1)
-            if duration_ms > _SLOW_CYCLE_MS:
+            if duration_ms > threshold_ms:
                 self.bot_slow_cycles += 1
                 self._slow_ops.append({
                     "kind": "bot_cycle",
                     "bot_id": bot_id,
+                    "cycle_kind": cycle_kind,
                     "ms": round(duration_ms, 1),
+                    "trade_ms": round(trade_ms, 1),
                     "at": round(time.time()),
                 })
-        if duration_ms > _SLOW_CYCLE_MS:
+        if duration_ms > threshold_ms:
             logger.warning(
-                "[SLOW BOT] bot=%s → %.0f ms  (warn threshold: %.0f ms)",
-                bot_id, duration_ms, _SLOW_CYCLE_MS,
+                "[SLOW BOT] bot=%s kind=%s → %.0f ms  "
+                "(warn threshold: %.0f ms, trade_ms: %.0f ms)",
+                bot_id, cycle_kind, duration_ms, threshold_ms, trade_ms,
             )
 
     # ── WS broadcast timing ──────────────────────────────────────────────────

@@ -88,31 +88,161 @@ async def _meta_training_loop() -> None:
 
     from database import (
         get_voter_feedback_batch,
-        label_voter_feedback_forward_roc,
+        label_voter_feedback_forward_roc_batch,
     )
+    from services.bot_runner import min_running_bot_cooldown_remaining_sec
     from trading.metatrader import get_metatrader
 
     logger = logging.getLogger("meta_training_loop")
     metatrader = get_metatrader()
 
-    INTERVAL_SEC = 1800  # 30 minutes
+    LABEL_INTERVAL_SEC = float(os.getenv("METAMAGI_LABEL_INTERVAL_SEC", "30"))
+    TRAIN_INTERVAL_SEC = float(
+        os.getenv("METAMAGI_TRAIN_INTERVAL_SEC", "1800")
+    )
+    LABEL_LOOKBACK_MINUTES = int(
+        os.getenv("METAMAGI_LABEL_LOOKBACK_MINUTES", "180")
+    )
+    LABEL_BATCH_SIZE = int(os.getenv("METAMAGI_LABEL_BATCH_SIZE", "50"))
+    ACTIVE_LABEL_BATCH_SIZE = int(
+        os.getenv("METAMAGI_ACTIVE_LABEL_BATCH_SIZE", "10")
+    )
+    LABEL_MAX_SECONDS = float(os.getenv("METAMAGI_LABEL_MAX_SECONDS", "2"))
+    ACTIVE_LABEL_MAX_SECONDS = float(
+        os.getenv("METAMAGI_ACTIVE_LABEL_MAX_SECONDS", "0.5")
+    )
+    LABEL_MAX_BATCHES = int(os.getenv("METAMAGI_LABEL_MAX_BATCHES", "10"))
+    LABEL_BATCH_SLEEP_SEC = (
+        float(os.getenv("METAMAGI_LABEL_BATCH_SLEEP_MS", "200")) / 1000.0
+    )
+    MIN_COOLDOWN_SEC = float(
+        os.getenv("METAMAGI_MIN_BOT_COOLDOWN_REMAINING_SEC", "10")
+    )
+    DB_BUSY_TIMEOUT_MS = int(os.getenv("METAMAGI_DB_BUSY_TIMEOUT_MS", "250"))
+    TRAINING_ENABLED = (
+        os.getenv("METAMAGI_TRAINING_ENABLED", "0").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    last_train_mono = time.monotonic()
+    training_disabled_logged = False
 
     while True:
         try:
-            await asyncio.sleep(INTERVAL_SEC)
+            await asyncio.sleep(LABEL_INTERVAL_SEC)
+            loop = asyncio.get_event_loop()
+            run_started = time.monotonic()
+            cooldown_remaining = min_running_bot_cooldown_remaining_sec()
+            if cooldown_remaining is None:
+                batch_size = LABEL_BATCH_SIZE
+                max_seconds = LABEL_MAX_SECONDS
+                cooldown_desc = "no_running_bots"
+            elif cooldown_remaining >= MIN_COOLDOWN_SEC:
+                batch_size = LABEL_BATCH_SIZE
+                max_seconds = min(LABEL_MAX_SECONDS, cooldown_remaining * 0.5)
+                cooldown_desc = f"cooldown={cooldown_remaining:.1f}s"
+            else:
+                # Still make progress beside always-on bots, but keep the
+                # transaction tiny when a bot is due soon or no cooldown
+                # exists.
+                batch_size = ACTIVE_LABEL_BATCH_SIZE
+                max_seconds = ACTIVE_LABEL_MAX_SECONDS
+                cooldown_desc = f"bot_due_soon={cooldown_remaining:.1f}s"
 
-            # 1. Fill forward_roc_30s / forward_roc_5m from stored market_ticks.
-            # Use a 48-hour window so rows accumulated between restarts are
-            # always reachable even if multiple training cycles were missed.
-            labeled_count = label_voter_feedback_forward_roc(
-                lookback_minutes=2880
-            )
             logger.info(
-                "MetaMagi: labeled %d voter_feedback rows.", labeled_count
+                "MetaMagi: label run starting batch_size=%d max_seconds=%.1f "
+                "lookback=%dmin busy_timeout=%dms %s",
+                batch_size,
+                max_seconds,
+                LABEL_LOOKBACK_MINUTES,
+                DB_BUSY_TIMEOUT_MS,
+                cooldown_desc,
+            )
+            batches = 0
+            selected_total = 0
+            updated_30s_total = 0
+            updated_5m_total = 0
+            stop_reason = "max_seconds"
+            while batches < LABEL_MAX_BATCHES:
+                if time.monotonic() - run_started >= max_seconds:
+                    stop_reason = "max_seconds"
+                    break
+                batch_started = time.perf_counter()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: label_voter_feedback_forward_roc_batch(
+                        lookback_minutes=LABEL_LOOKBACK_MINUTES,
+                        batch_size=batch_size,
+                        busy_timeout_ms=DB_BUSY_TIMEOUT_MS,
+                    ),
+                )
+                batches += 1
+                selected = int(result.get("selected") or 0)
+                updated_30s = int(result.get("updated_30s") or 0)
+                updated_5m = int(result.get("updated_5m") or 0)
+                elapsed_ms = float(result.get("elapsed_ms") or 0.0)
+                selected_total += selected
+                updated_30s_total += updated_30s
+                updated_5m_total += updated_5m
+                logger.info(
+                    "MetaMagi: label batch done selected=%d "
+                    "updated_30s=%d updated_5m=%d elapsed=%.0fms",
+                    selected,
+                    updated_30s,
+                    updated_5m,
+                    elapsed_ms,
+                )
+                if result.get("db_busy"):
+                    stop_reason = "db_busy"
+                    break
+                if selected == 0:
+                    stop_reason = "no_rows"
+                    break
+                if updated_30s == 0 and updated_5m == 0:
+                    stop_reason = "no_updatable_rows"
+                    break
+                if (time.perf_counter() - batch_started) * 1000.0 > 500:
+                    logger.warning(
+                        "MetaMagi: slow label batch elapsed=%.0fms",
+                        (time.perf_counter() - batch_started) * 1000.0,
+                    )
+                await asyncio.sleep(LABEL_BATCH_SLEEP_SEC)
+            else:
+                stop_reason = "max_batches"
+            logger.info(
+                "MetaMagi: label run stopped reason=%s batches=%d "
+                "selected=%d updated_30s=%d updated_5m=%d",
+                stop_reason,
+                batches,
+                selected_total,
+                updated_30s_total,
+                updated_5m_total,
             )
 
-            # 2. Pull last 24 h of feedback (now with forward ROC filled).
-            batch = get_voter_feedback_batch(hours=24)
+            if not TRAINING_ENABLED:
+                if not training_disabled_logged:
+                    logger.info(
+                        "MetaMagi: training disabled "
+                        "(set METAMAGI_TRAINING_ENABLED=1 to enable)."
+                    )
+                    training_disabled_logged = True
+                continue
+
+            if time.monotonic() - last_train_mono < TRAIN_INTERVAL_SEC:
+                continue
+            last_train_mono = time.monotonic()
+
+            # Pull last 24 h of feedback (including rows labeled over time).
+            t0 = time.perf_counter()
+            batch = await loop.run_in_executor(
+                None,
+                lambda: get_voter_feedback_batch(hours=24),
+            )
+            batch_ms = (time.perf_counter() - t0) * 1000.0
+            logger.info(
+                "MetaMagi: fetched %d feedback rows in %.0fms.",
+                len(batch),
+                batch_ms,
+            )
             if not batch:
                 logger.info(
                     "MetaMagi: no voter_feedback data yet — skipping."
@@ -120,12 +250,18 @@ async def _meta_training_loop() -> None:
                 continue
 
             # 3. Update EMA-based voter weights.
+            t0 = time.perf_counter()
             updated_weights = metatrader.train_step(batch)
+            train_ms = (time.perf_counter() - t0) * 1000.0
             if updated_weights:
                 weight_str = "  ".join(
                     f"{v}={w:.3f}" for v, w in sorted(updated_weights.items())
                 )
-                logger.info("MetaMagi: updated weights — %s", weight_str)
+                logger.info(
+                    "MetaMagi: updated weights in %.0fms — %s",
+                    train_ms,
+                    weight_str,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -133,6 +269,61 @@ async def _meta_training_loop() -> None:
             logger.exception(
                 "MetaMagi training loop error — will retry next cycle."
             )
+
+
+async def _event_loop_lag_monitor() -> None:
+    """Log when the FastAPI event loop is blocked long enough to affect WS/API."""
+    import asyncio
+    import logging
+
+    logger = logging.getLogger("event_loop_lag")
+    interval = float(os.getenv("EVENT_LOOP_LAG_INTERVAL_SEC", "5"))
+    warn_ms = float(os.getenv("EVENT_LOOP_LAG_WARN_MS", "1000"))
+    expected = time.monotonic() + interval
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            now = time.monotonic()
+            lag_ms = max(0.0, (now - expected) * 1000.0)
+            if lag_ms >= warn_ms:
+                logger.warning(
+                    "Event loop lag detected: %.0fms "
+                    "(interval=%.1fs threshold=%.0fms)",
+                    lag_ms,
+                    interval,
+                    warn_ms,
+                )
+            expected = now + interval
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Event loop lag monitor error — continuing.")
+
+
+def _supervise_task(task: Any, name: str) -> None:
+    """Print any unexpected background task exit to the terminal."""
+    logger = logging.getLogger("lifespan")
+
+    def _done(done_task: Any) -> None:
+        if done_task.cancelled():
+            logger.info("Background task cancelled: %s", name)
+            return
+        try:
+            exc = done_task.exception()
+        except Exception:
+            logger.exception("Failed inspecting background task: %s", name)
+            return
+        if exc is not None:
+            logger.error(
+                "Background task crashed: %s",
+                name,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return
+        logger.warning("Background task exited unexpectedly without error: %s", name)
+
+    task.add_done_callback(_done)
 
 
 async def _db_cleanup_loop() -> None:
@@ -265,15 +456,32 @@ async def lifespan(_app: FastAPI):
         conn.commit()
     finally:
         conn.close()
-    bot_task = asyncio.create_task(_bot_runner_async())
-    collector_task = asyncio.create_task(_data_collector_async())
-    meta_task = asyncio.create_task(_meta_training_loop())
-    cleanup_task = asyncio.create_task(_db_cleanup_loop())
-    watchdog_task = asyncio.create_task(_watchdog_loop())
+    bot_task = asyncio.create_task(_bot_runner_async(), name="bot_runner")
+    collector_task = asyncio.create_task(_data_collector_async(), name="data_collector")
+    meta_task = asyncio.create_task(_meta_training_loop(), name="meta_training_loop")
+    cleanup_task = asyncio.create_task(_db_cleanup_loop(), name="db_cleanup_loop")
+    watchdog_task = asyncio.create_task(_watchdog_loop(), name="watchdog_loop")
+    lag_task = asyncio.create_task(_event_loop_lag_monitor(), name="event_loop_lag")
+    for task, name in (
+        (bot_task, "bot_runner"),
+        (collector_task, "data_collector"),
+        (meta_task, "meta_training_loop"),
+        (cleanup_task, "db_cleanup_loop"),
+        (watchdog_task, "watchdog_loop"),
+        (lag_task, "event_loop_lag"),
+    ):
+        _supervise_task(task, name)
     try:
         yield
     finally:
-        for t in (bot_task, collector_task, meta_task, cleanup_task, watchdog_task):
+        for t in (
+            bot_task,
+            collector_task,
+            meta_task,
+            cleanup_task,
+            watchdog_task,
+            lag_task,
+        ):
             t.cancel()
             try:
                 await t

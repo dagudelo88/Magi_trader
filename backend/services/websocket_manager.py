@@ -84,6 +84,23 @@ class ConnectionManager:
         self._last_sent: dict[tuple[str, str], float] = {}
         self._heartbeat_task: asyncio.Task | None = None
 
+    @staticmethod
+    def _log_task_failure(task: Any, label: str) -> None:
+        """Surface fire-and-forget async failures in the terminal."""
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except Exception:
+            logger.exception("WS background task inspection failed for %s", label)
+            return
+        if exc is not None:
+            logger.error(
+                "WS background task failed: %s",
+                label,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
     def bind_loop(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
         """Bind the FastAPI loop so worker threads can schedule broadcasts."""
         self._loop = loop or asyncio.get_running_loop()
@@ -92,6 +109,9 @@ class ConnectionManager:
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = self._loop.create_task(
                 self._heartbeat_loop(), name="ws-heartbeat"
+            )
+            self._heartbeat_task.add_done_callback(
+                lambda task: self._log_task_failure(task, "ws-heartbeat")
             )
 
     async def _heartbeat_loop(self) -> None:
@@ -188,9 +208,13 @@ class ConnectionManager:
             try:
                 await websocket.send_text(payload)
             except (RuntimeError, ConnectionResetError, OSError) as exc:
-                # Log at DEBUG — dropped connections are expected during client
-                # refreshes and should not pollute production logs.
-                logger.debug("WS send failed on channel %r: %s", channel, exc)
+                logger.warning(
+                    "WS send failed channel=%r event=%r priority=%s: %s",
+                    channel,
+                    event_type,
+                    priority,
+                    exc,
+                )
                 stale.append(websocket)
 
         broadcast_ms = (time.perf_counter() - _t0) * 1000
@@ -198,7 +222,7 @@ class ConnectionManager:
             from services.monitoring import monitor as _mon  # noqa: PLC0415
             _mon.record_ws_broadcast(channel, len(targets), broadcast_ms)
         except Exception:
-            pass
+            logger.exception("WS broadcast timing record failed")
 
         if stale:
             async with self._lock:
@@ -225,6 +249,12 @@ class ConnectionManager:
         """
         loop = self._loop
         if loop is None or loop.is_closed():
+            logger.warning(
+                "WS publish dropped because event loop is unavailable "
+                "channel=%r event=%r",
+                channel,
+                event_type,
+            )
             return
 
         coro = self.broadcast(channel, event_type, data, priority=priority)
@@ -234,9 +264,21 @@ class ConnectionManager:
             running_loop = None
 
         if running_loop is loop:
-            loop.create_task(coro)
+            task = loop.create_task(coro)
+            task.add_done_callback(
+                lambda done: self._log_task_failure(
+                    done,
+                    f"publish channel={channel!r} event={event_type!r}",
+                )
+            )
         else:
-            asyncio.run_coroutine_threadsafe(coro, loop)
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            future.add_done_callback(
+                lambda done: self._log_task_failure(
+                    done,
+                    f"publish channel={channel!r} event={event_type!r}",
+                )
+            )
 
 
 ws_manager = ConnectionManager()
