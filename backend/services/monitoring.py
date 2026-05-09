@@ -16,10 +16,15 @@ Import the module-level ``monitor`` singleton anywhere in the backend:
 
     monitor.record_bot_cycle(bot_id, elapsed_ms)
     monitor.maybe_log_health(running_bots=n, ws_clients=c)
+
+    monitor.maybe_log_memory(running_bots=n)
+    monitor.maybe_log_cycle_trend()
 """
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import threading
 import time
 from collections import deque
@@ -27,6 +32,54 @@ from contextlib import contextmanager
 from typing import Any
 
 logger = logging.getLogger("monitoring")
+
+
+def _parse_float_env(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _secs_to_ago_phrase(seconds: float) -> str:
+    """Compact English phrase for elapsed interval (health / trend logs)."""
+    sec = round(seconds)
+    if sec >= 3540:
+        return f"{sec / 3600:.1f}h ago"
+    if sec >= 90:
+        m = round(sec / 60)
+        return f"{int(m)}min ago"
+    return f"{sec}s ago"
+
+
+def get_process_memory_mb() -> tuple[float, float] | None:
+    """Return ``(rss_mb, vms_mb)`` for the current process.
+
+    Prefer **psutil** (cross-platform RSS + VMS).  Falls back to the standard
+    library ``resource`` module on Unix when psutil is missing.
+
+    ``vms_mb`` may be ``0.0`` for the ``resource`` fallback.
+    """
+    try:
+        import psutil  # optional but listed in backend/requirements.txt
+
+        info = psutil.Process().memory_info()
+        rss = info.rss / (1024.0 * 1024.0)
+        vms = getattr(info, "vms", 0.0) / (1024.0 * 1024.0)
+        return (rss, vms)
+    except Exception:
+        pass
+    try:
+        import resource  # Unix only — not built on Windows
+
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        maxrss = float(ru.ru_maxrss)
+        # Linux/macOS semantics differ historically; heuristic:
+        rss_bytes = maxrss if sys.platform == "darwin" else maxrss * 1024.0
+        rss_mb = rss_bytes / (1024.0 * 1024.0)
+        return (rss_mb, 0.0)
+    except Exception:
+        return None
 
 # ── Warning thresholds ─────────────────────────────────────────────────────
 
@@ -42,6 +95,12 @@ _SLOW_WS_MS: float = 100.0
 
 # Health summary cadence.
 _HEALTH_INTERVAL_SEC: float = 60.0
+
+# Memory log interval (RSS / VMS diagnostics).
+_MEMORY_LOG_INTERVAL_SEC: float = _parse_float_env("MEMORY_LOG_INTERVAL_SEC", 60.0)
+
+# Compare average of last 10 bot cycles vs the previous sampling window (~10 minutes).
+_CYCLE_TREND_INTERVAL_SEC: float = _parse_float_env("CYCLE_TREND_INTERVAL_SEC", 600.0)
 
 
 class PerformanceMonitor:
@@ -76,6 +135,16 @@ class PerformanceMonitor:
         self._last_heartbeat: float = 0.0
         self._heartbeat_bots: int = 0
         self._heartbeat_clients: int = 0
+
+        # ── Periodic memory diagnostics ────────────────────────────────────────
+        self._last_memory_log_mono: float = 0.0
+
+        # Rolling bot-cycle samples for rolling-window averages (every cycle).
+        self._cycle_samples: deque[float] = deque(maxlen=10_000)
+
+        # Last-10-cycle trend vs baseline from the previous interval.
+        self._last_trend_log_mono: float = 0.0
+        self._cycle_trend_baseline_avg_ms: float | None = None
 
     # ── DB timing ────────────────────────────────────────────────────────────
 
@@ -121,6 +190,7 @@ class PerformanceMonitor:
         with self._lock:
             self.bot_cycles += 1
             self.bot_total_ms += duration_ms
+            self._cycle_samples.append(duration_ms)
             self._bot_last_ms[bot_id] = round(duration_ms, 1)
             if duration_ms > _SLOW_CYCLE_MS:
                 self.bot_slow_cycles += 1
@@ -241,6 +311,93 @@ class PerformanceMonitor:
             "Avg DB: %.0fms | Avg cycle: %.0fms | WS broadcasts: %d | Total slow: %d",
             running_bots, ws_clients, db_ops, db_slow,
             avg_db, avg_cycle, ws_bc, slow_total,
+        )
+
+    def maybe_log_memory(self, running_bots: int = 0) -> None:
+        """Emit process memory + uptime at most once per configured interval.
+
+        Interval reads ``MEMORY_LOG_INTERVAL_SEC`` each call (default 60).
+        """
+        interval = max(
+            5.0,
+            _parse_float_env("MEMORY_LOG_INTERVAL_SEC", _MEMORY_LOG_INTERVAL_SEC),
+        )
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_memory_log_mono < interval:
+                return
+            self._last_memory_log_mono = now
+            uptime_s = int(time.time() - self._start)
+        mem = get_process_memory_mb()
+        if mem is None:
+            logger.info(
+                "[MEMORY] RSS: n/a | VMS: n/a | Bots: %d | Uptime: %ds  "
+                "(install psutil for RSS/VMS on this platform)",
+                running_bots, uptime_s,
+            )
+            return
+        rss_mb, vms_mb = mem
+        logger.info(
+            "[MEMORY] RSS: %.1f MB | VMS: %.1f MB | Bots: %d | Uptime: %ds",
+            rss_mb,
+            vms_mb,
+            running_bots,
+            uptime_s,
+        )
+
+    def maybe_log_cycle_trend(self) -> None:
+        """Every ~10 minutes, compare avg of last 10 cycles vs the prior window."""
+        interval = max(
+            60.0,
+            _parse_float_env(
+                "CYCLE_TREND_INTERVAL_SEC",
+                _CYCLE_TREND_INTERVAL_SEC,
+            ),
+        )
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_trend_log_mono < interval:
+                return
+            self._last_trend_log_mono = now
+            samples = list(self._cycle_samples)
+            baseline = self._cycle_trend_baseline_avg_ms
+            if len(samples) >= 10:
+                last_n = samples[-10:]
+                avg_now = sum(last_n) / 10.0
+                self._cycle_trend_baseline_avg_ms = avg_now
+            else:
+                avg_now = None
+
+        # Log outside lock.
+        if avg_now is None:
+            logger.info(
+                "[TREND] Insufficient cycles for last-10 average (have %d, need 10)",
+                len(samples),
+            )
+            return
+        avg_rounded = int(round(avg_now))
+        if baseline is None:
+            logger.info(
+                "[TREND] Last 10 cycles avg: %dms "
+                "(baseline established — compares to prior window next sample)",
+                avg_rounded,
+            )
+            return
+        base_rounded = int(round(baseline))
+        if baseline > 0:
+            pct = ((avg_now - baseline) / baseline) * 100.0
+        else:
+            pct = 0.0
+        if pct >= 0:
+            drift = "+%.0f%% slower" % pct
+        else:
+            drift = "%.0f%% faster" % (-pct)
+        logger.info(
+            "[TREND] Last 10 cycles avg: %dms (was %dms %s) → %s",
+            avg_rounded,
+            base_rounded,
+            _secs_to_ago_phrase(interval),
+            drift,
         )
 
 

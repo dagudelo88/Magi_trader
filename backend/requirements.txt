@@ -6,3 +6,4 @@ pyarrow
 fastparquet
 websockets
 python-dotenv
+psutil>=5.9.0

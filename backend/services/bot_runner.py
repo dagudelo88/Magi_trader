@@ -64,6 +64,56 @@ _last_trade_monotonic: dict[str, float] = {}
 
 POLL_SEC = 5
 
+
+def _slow_cycle_breakdown_threshold_ms() -> float:
+    try:
+        return float(os.environ.get("SLOW_CYCLE_BREAKDOWN_MS", "1500"))
+    except ValueError:
+        return 1500.0
+
+
+_enhanced_diag_lock = threading.Lock()
+_enhanced_diag_logged = False
+
+
+def log_enhanced_diagnostics_banner() -> None:
+    """Emit once per process startup (embedded runner + standalone __main__)."""
+    global _enhanced_diag_logged
+    with _enhanced_diag_lock:
+        if _enhanced_diag_logged:
+            return
+        _enhanced_diag_logged = True
+    print(
+        "[bot_runner] Enhanced Memory + Cycle Breakdown Logging ENABLED",
+        flush=True,
+    )
+
+
+def _log_slow_cycle_breakdown(bot_id: str, phase_ms: dict[str, float], total_ms: float) -> None:
+    """Structured multi-line timing split for diagnosing slow cycles."""
+    f = phase_ms.get("fetch_ms") or 0.0
+    s = phase_ms.get("strategy_ms") or 0.0
+    d = phase_ms.get("decision_ms") or 0.0
+    t = phase_ms.get("trade_ms") or 0.0
+    b = phase_ms.get("broadcast_ms") or 0.0
+    summed = f + s + d + t + b
+    print(
+        f"[SLOW CYCLE BREAKDOWN] bot={bot_id}\n"
+        f"  Fetch candles: {f:6.0f}ms\n"
+        f"  Strategy calc: {s:6.0f}ms\n"
+        f"  Decision:      {d:6.0f}ms\n"
+        f"  Trade exec:    {t:6.0f}ms\n"
+        f"  Broadcast:     {b:6.0f}ms\n"
+        f"  Total (wall):  {total_ms:6.0f}ms"
+        + (
+            f"\n  (phase sum:     {summed:6.0f}ms differs from wall — thread/setup overhead)"
+            if abs(summed - total_ms) > 150
+            else ""
+        ),
+        flush=True,
+    )
+
+
 _last_throttled_bot_info: dict[str, float] = {}
 _last_throttled_print: dict[str, float] = {}
 
@@ -422,12 +472,17 @@ def _process_bot(
     execution_mode: str,
     prefetched_ohlcv: list | None = None,
     public_ex=None,
+    phase_ms: dict[str, float] | None = None,
 ) -> None:
     """
     ex         – authenticated exchange (testnet/live) for balance + orders.
     public_ex  – unauthenticated mainnet exchange for OHLCV + market metadata.
-                 Falls back to `ex` when not provided (legacy path).
+                 Falls back to ``ex`` when not provided (legacy path).
     """
+    timings = phase_ms if phase_ms is not None else {}
+    for _k in ("fetch_ms", "strategy_ms", "decision_ms", "trade_ms"):
+        timings.setdefault(_k, 0.0)
+
     bot_id = bot["bot_id"]
     symbol = bot["symbol"]
     strategy_name = bot.get("strategy") or "sma_cross"
@@ -488,6 +543,7 @@ def _process_bot(
     timeframe = str(params.get("ohlcv_timeframe", "5m"))
     limit = int(params.get("ohlcv_limit", 50))
 
+    t_fetch0 = time.perf_counter()
     if prefetched_ohlcv is not None:
         # Shared candle data fetched once for all bots on this symbol/timeframe.
         ohlcv = prefetched_ohlcv
@@ -500,7 +556,10 @@ def _process_bot(
             ohlcv = data_ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
             _log(bot_id, "error", execution_mode, f"fetch_ohlcv failed: {e}")
+            timings["fetch_ms"] = (time.perf_counter() - t_fetch0) * 1000.0
             return
+
+    timings["fetch_ms"] = (time.perf_counter() - t_fetch0) * 1000.0
 
     if not ohlcv:
         _log(bot_id, "warn", execution_mode,
@@ -515,9 +574,11 @@ def _process_bot(
         f"Market: last_close={last_close:.4f}  candles={len(ohlcv)}",
     )
 
+    t_strat0 = time.perf_counter()
     try:
         strategy = get_strategy(strategy_name)
     except ValueError as e:
+        timings["strategy_ms"] = (time.perf_counter() - t_strat0) * 1000.0
         _log(bot_id, "error", execution_mode, f"Unknown strategy {strategy_name!r}: {e}")
         return
 
@@ -535,6 +596,17 @@ def _process_bot(
             "meta": result.meta if isinstance(result.meta, dict) else {},
         },
     )
+    timings["strategy_ms"] = (time.perf_counter() - t_strat0) * 1000.0
+
+    t_dec0 = time.perf_counter()
+    decision_closed = False
+
+    def _close_decision() -> None:
+        nonlocal decision_closed
+        if decision_closed:
+            return
+        timings["decision_ms"] = (time.perf_counter() - t_dec0) * 1000.0
+        decision_closed = True
 
     # Log per-voter votes for MetaMagi feedback on every tick (ensemble only).
     # Must happen before any early return so HOLD ticks are also recorded.
@@ -553,6 +625,7 @@ def _process_bot(
             _log(bot_id, "info", execution_mode, f"Signal: HOLD — {meta_str}")
         _queue_decision("HOLD", None, False)
         _flush_decisions()
+        _close_decision()
         return
 
     meta_str = _format_meta(result.meta)
@@ -566,6 +639,7 @@ def _process_bot(
         market = data_ex.market(symbol)
     except Exception as e:
         _log(bot_id, "error", execution_mode, f"market metadata failed: {e}")
+        _close_decision()
         return
 
     limits = market.get("limits") or {}
@@ -576,6 +650,7 @@ def _process_bot(
         balance = ex.fetch_balance()
     except Exception as e:
         _log(bot_id, "error", execution_mode, f"fetch_balance failed: {e}")
+        _close_decision()
         return
 
     base_cur, quote_cur = market["base"], market["quote"]
@@ -600,6 +675,7 @@ def _process_bot(
                 _log(bot_id, "warn", execution_mode,
                      f"BUY skipped — budget exhausted "
                      f"({remaining_budget:.4f} {quote_cur} remaining < exchange min {min_cost} {quote_cur})")
+                _close_decision()
                 return
             # Ideal spend = fraction of remaining budget, capped by available funds.
             # Use 2% buffer on the minimum so price slippage between snapshot and fill
@@ -617,9 +693,11 @@ def _process_bot(
             if spend < min_spend:
                 _log(bot_id, "warn", execution_mode,
                      f"BUY skipped — spend {spend:.4f} {quote_cur} below exchange minimum {min_cost} {quote_cur}")
+                _close_decision()
                 return
         if last_close <= 0:
             _log(bot_id, "warn", execution_mode, "BUY skipped — last_close is zero")
+            _close_decision()
             return
 
         # Compute the buy quantity from spend, then apply lot-size precision.
@@ -650,6 +728,7 @@ def _process_bot(
 
         if qty_prec <= 0:
             _log(bot_id, "warn", execution_mode, "BUY skipped — quantity rounds to zero")
+            _close_decision()
             return
 
         actual_spend = qty_prec * last_close
@@ -657,6 +736,8 @@ def _process_bot(
         _log(bot_id, "info", execution_mode,
              f"BUY order: spending ~{actual_spend:.4f} {quote_cur} "
              f"({quote_fraction*100:.1f}% of {budget_ref:.4f} {quote_cur} remaining) @ ~{last_close:.2f}")
+        _close_decision()
+        t_trade0 = time.perf_counter()
         try:
             order = ex.create_order(symbol, "market", "buy", qty_prec)
             _last_trade_monotonic[bot_id] = time.monotonic()
@@ -702,6 +783,8 @@ def _process_bot(
                 priority=True,
             )
             _log(bot_id, "error", execution_mode, f"BUY failed: {e}\n{traceback.format_exc()}")
+        finally:
+            timings["trade_ms"] = (time.perf_counter() - t_trade0) * 1000.0
 
     elif result.signal == "sell":
         base_fraction = float(params["base_fraction"])
@@ -713,6 +796,7 @@ def _process_bot(
             if open_base <= 1e-12:
                 _log(bot_id, "info", execution_mode,
                      "SELL skipped — no open position in this bot's budget")
+                _close_decision()
                 return
             # Cap by what the exchange actually holds (safety net)
             sell_amt = min(open_base * base_fraction, free_base)
@@ -724,6 +808,7 @@ def _process_bot(
         if min_amt and sell_amt < min_amt:
             _log(bot_id, "warn", execution_mode,
                  f"SELL skipped — amount {sell_amt:.8f} {base_cur} below exchange minimum {min_amt}")
+            _close_decision()
             return
 
         # Minimum notional check — mirrors the BUY side: bump up to the minimum
@@ -746,12 +831,14 @@ def _process_bot(
                     _log(bot_id, "warn", execution_mode,
                          f"SELL skipped — full position notional {full_notional:.4f} {quote_cur}"
                          f" below exchange minimum {min_cost} {quote_cur}")
+                    _close_decision()
                     return
 
         sell_prec = ex.amount_to_precision(symbol, sell_amt)
         if float(sell_prec) <= 0:
             _log(bot_id, "warn", execution_mode,
                  f"SELL skipped — rounded amount is zero (raw {sell_amt:.8f} {base_cur})")
+            _close_decision()
             return
 
         # Final notional guard after precision rounding.
@@ -785,6 +872,7 @@ def _process_bot(
                             _log(bot_id, "warn", execution_mode,
                                  f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
                                  f" below exchange minimum {min_cost} {quote_cur} and cannot bump further")
+                            _close_decision()
                             return
             except Exception:
                 pass  # fall through to the old margin approach below
@@ -800,11 +888,14 @@ def _process_bot(
                     _log(bot_id, "warn", execution_mode,
                          f"SELL skipped — post-rounding notional {final_notional:.4f} {quote_cur}"
                          f" below exchange minimum {min_cost} {quote_cur} and cannot bump further")
+                    _close_decision()
                     return
 
         _log(bot_id, "info", execution_mode,
              f"SELL order: selling {sell_prec} {base_cur} "
              f"(notional ~{final_notional:.4f} {quote_cur}) @ ~{last_close:.2f}")
+        _close_decision()
+        t_trade0 = time.perf_counter()
         try:
             order = ex.create_order(symbol, "market", "sell", float(sell_prec))
             _last_trade_monotonic[bot_id] = time.monotonic()
@@ -850,6 +941,12 @@ def _process_bot(
                 priority=True,
             )
             _log(bot_id, "error", execution_mode, f"SELL failed: {e}\n{traceback.format_exc()}")
+        finally:
+            timings["trade_ms"] = (time.perf_counter() - t_trade0) * 1000.0
+
+    else:
+        # Strategies should only emit hold / buy / sell; close the slice anyway.
+        _close_decision()
 
     # Flush any queued decision for this cycle (BUY or SELL branch).
     # HOLD already flushed before its early return; early exits before order
@@ -883,6 +980,7 @@ async def run_async():
     """Async entry-point embedded as an asyncio task in uvicorn's lifespan."""
     import asyncio
     loop = asyncio.get_event_loop()
+    log_enhanced_diagnostics_banner()
     print("Bot runner started — polling for running bots.")
     while True:
         try:
@@ -986,19 +1084,40 @@ def _run_one_cycle():
         limit = int(params.get("ohlcv_limit", 50))
         prefetched = ohlcv_cache.get((symbol, timeframe, limit))
 
+        phase_ms: dict[str, float] = {
+            "fetch_ms": 0.0,
+            "strategy_ms": 0.0,
+            "decision_ms": 0.0,
+            "trade_ms": 0.0,
+            "broadcast_ms": 0.0,
+        }
+
         _cycle_t0 = time.perf_counter()
         try:
-            _process_bot(ex, bot, mode, prefetched_ohlcv=prefetched, public_ex=public_ex)
+            _process_bot(
+                ex,
+                bot,
+                mode,
+                prefetched_ohlcv=prefetched,
+                public_ex=public_ex,
+                phase_ms=phase_ms,
+            )
         except Exception:
             _log(bot_id, "error", mode, f"Unhandled: {traceback.format_exc()}")
         finally:
             # Flush all WS log entries collected during this bot's cycle as a
             # single batch event.  Must run even if _process_bot raised so logs
             # from the error path still reach the UI.
+            t_bc = time.perf_counter()
             _flush_ws_log_buffer(bot_id)
+            phase_ms["broadcast_ms"] = (time.perf_counter() - t_bc) * 1000.0
 
         cycle_ms = (time.perf_counter() - _cycle_t0) * 1000
         monitor.record_bot_cycle(bot_id, cycle_ms)
+
+        thresh = _slow_cycle_breakdown_threshold_ms()
+        if cycle_ms > thresh:
+            _log_slow_cycle_breakdown(bot_id, phase_ms, cycle_ms)
 
         if cycle_ms > 500:
             print(
@@ -1084,10 +1203,13 @@ def _run_one_cycle():
         running_bots=len(bots),
         ws_clients=ws_manager.connected_count(),
     )
+    monitor.maybe_log_memory(running_bots=len(bots))
+    monitor.maybe_log_cycle_trend()
 
 
 def main():
     """Synchronous blocking loop — used only when running as __main__ (standalone/legacy)."""
+    log_enhanced_diagnostics_banner()
     print("Bot runner started — polling for running bots.")
     while True:
         try:
