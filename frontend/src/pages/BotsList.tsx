@@ -164,7 +164,7 @@ export default function BotsList() {
       `${createConfig.template.name} · ${createConfig.symbol.replace('/', '_')}`;
     const budget = Number.parseFloat(createConfig.budget.trim());
     if (!Number.isFinite(budget) || budget <= 0) {
-      setCreateError('Budget is required and must be a positive number.');
+      setCreateError('Initial capital is required and must be a positive number.');
       budgetRef.current?.focus();
       return;
     }
@@ -429,7 +429,7 @@ export default function BotsList() {
                     {bot.strategy.toUpperCase()} · {bot.symbol}
                     {bot.initial_budget_quote != null && (
                       <span className="ml-2 text-gray-500">
-                        Budget: {bot.initial_budget_quote.toLocaleString()} USDT
+                        Initial capital: {bot.initial_budget_quote.toLocaleString()} USDT
                       </span>
                     )}
                   </p>
@@ -683,7 +683,7 @@ export default function BotsList() {
 
                 <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
                   <span>
-                    Initial Budget (USDT)
+                    Initial Capital (USDT)
                     <span className="ml-1 text-red-400">*</span>
                   </span>
                   <input
@@ -904,7 +904,7 @@ export default function BotsList() {
                 </select>
               </label>
               <p className="text-[10px] text-gray-600">
-                To change the budget, open the bot detail → Capital &amp; New Instance.
+                To change initial capital, open the bot detail → Initial Capital &amp; New Instance.
               </p>
               <div className="flex gap-2 pt-1">
                 <button type="submit" disabled={editBusy}

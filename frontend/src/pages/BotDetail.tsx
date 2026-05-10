@@ -88,6 +88,13 @@ function formatQuoteAmount(n: number, maxFrac = 6) {
   return n.toLocaleString(undefined, { maximumFractionDigits: maxFrac });
 }
 
+function formatQuoteAmountFixed(n: number, frac = 6) {
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: frac,
+    maximumFractionDigits: frac,
+  });
+}
+
 function pnlToneClass(n: number) {
   if (n > 1e-8) return 'text-magi-tertiary phosphor-green';
   if (n < -1e-8) return 'text-red-400';
@@ -903,7 +910,7 @@ export default function BotDetail() {
         else {
           const n = Number.parseFloat(trimmed);
           if (!Number.isFinite(n) || n < 0) {
-            setActionError('Budget must be empty (clear) or a non-negative number when applying on fork.');
+            setActionError('Initial capital must be empty (clear) or a non-negative number when applying on fork.');
             setForkBusy(false);
             return;
           }
@@ -936,7 +943,7 @@ export default function BotDetail() {
         ? { initial_budget_quote: null }
         : { initial_budget_quote: Number.parseFloat(trimmed) };
     if (trimmed !== '' && !Number.isFinite(body.initial_budget_quote as number)) {
-      setActionError('Initial budget must be a number');
+      setActionError('Initial capital must be a number');
       return;
     }
     if (
@@ -944,7 +951,7 @@ export default function BotDetail() {
       typeof body.initial_budget_quote === 'number' &&
       body.initial_budget_quote < 0
     ) {
-      setActionError('Initial budget cannot be negative');
+      setActionError('Initial capital cannot be negative');
       return;
     }
     setBudgetBusy(true);
@@ -957,7 +964,7 @@ export default function BotDetail() {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok)
-        throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to save budget');
+        throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to save initial capital');
       await refresh();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Save failed');
@@ -1070,7 +1077,7 @@ export default function BotDetail() {
     if (budgetTrimmed !== '') {
       const parsedBudget = Number.parseFloat(budgetTrimmed);
       if (!Number.isFinite(parsedBudget) || parsedBudget < 0) {
-        setConfigError('Initial budget must be empty or a non-negative number.');
+        setConfigError('Initial capital must be empty or a non-negative number.');
         return;
       }
       budget = parsedBudget;
@@ -1174,6 +1181,17 @@ export default function BotDetail() {
         : `${formatQuoteAmount(strategyHealth.max_drawdown_quote)} ${qc}`
       : '—';
   const netPnl = strategyHealth?.total_pnl_quote ?? null;
+  const pnlBreakdownLabel = strategyHealth != null
+    ? `R ${formatQuoteAmount(strategyHealth.realized_pnl_quote)} · U ${
+        strategyHealth.unrealized_pnl_quote != null
+          ? formatQuoteAmount(strategyHealth.unrealized_pnl_quote)
+          : '—'
+      }${
+        strategyHealth.pnl_return_on_budget_pct != null
+          ? ` · ROI ${formatQuoteAmount(strategyHealth.pnl_return_on_budget_pct, 2)}%`
+          : ''
+      }`
+    : '—';
   const recordedOrderCount = orderStats?.total_orders ?? 0;
   const yoloMode = bot?.risk_settings?.yolo_mode ?? false;
   const configInputClass =
@@ -1213,6 +1231,13 @@ export default function BotDetail() {
                 <Settings size={13} />
                 CONFIG
               </button>
+              <Link
+                to="/bots"
+                className="flex items-center rounded border border-magi-tertiary/60 bg-magi-tertiary/15 px-2.5 py-1 text-[10px] font-black uppercase tracking-widest text-magi-tertiary shadow-[0_0_10px_rgba(0,231,58,0.12)] transition-colors hover:bg-magi-tertiary/25 hover:text-magi-on-bg active:bg-magi-tertiary/35"
+                title="Back to the bot list"
+              >
+                Bot List
+              </Link>
               <span
                 className={`font-label inline-flex items-center border px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
                   botExecMode === 'live'
@@ -1234,7 +1259,7 @@ export default function BotDetail() {
                   className="font-label inline-flex items-center border border-red-400/60 bg-red-500/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-widest text-red-300"
                   title="YOLO mode is bypassing risk protection blockers for this bot."
                 >
-                  YOLO RISK OFF
+                  YOLO ACTIVE
                 </span>
               )}
               <span className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">
@@ -1270,15 +1295,15 @@ export default function BotDetail() {
             </div>
           )}
 
-          {/* Capital & Budget */}
+          {/* Initial capital */}
           <details className="border-b border-magi-grid/20 open:border-magi-primary/20" open>
             <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/80 hover:text-magi-primary">
-              Capital &amp; New Instance
+              Initial Capital &amp; New Instance
             </summary>
             <div className="border-t border-magi-grid/20 px-4 py-4 flex flex-col gap-4">
               <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
                 <label className="flex flex-col gap-1.5 uppercase tracking-wider">
-                  <span className="text-magi-muted/50">Initial budget ({qc})</span>
+                  <span className="text-magi-muted/50">Initial capital ({qc})</span>
                   <input
                     type="text"
                     inputMode="decimal"
@@ -1294,7 +1319,7 @@ export default function BotDetail() {
                   onClick={() => void saveInitialBudget()}
                   className="rounded border border-magi-primary/40 bg-magi-primary/15 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/25 disabled:opacity-40"
                 >
-                  {budgetBusy ? '…' : 'Save budget'}
+                  {budgetBusy ? '…' : 'Save initial capital'}
                 </button>
               </div>
               <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
@@ -1315,7 +1340,7 @@ export default function BotDetail() {
                     onChange={(e) => setForkApplyBudget(e.target.checked)}
                     className="mt-0.5 border-magi-grid/40"
                   />
-                  <span>Apply budget on fork</span>
+                  <span>Apply initial capital on fork</span>
                 </label>
                 <button
                   type="button"
@@ -1355,12 +1380,12 @@ export default function BotDetail() {
             />
           ) : null}
 
-          {/* Metrics strip — shows Current Capital when budget is set */}
+          {/* Metrics strip — shows Current Capital when initial capital is set */}
           {strategyHealth?.initial_budget_quote != null && (
             <div className="border-b border-magi-grid/15 bg-magi-primary/5 px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-1">
               <div className="flex items-baseline gap-2">
                 <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/60">
-                  Budget
+                  Initial Capital
                 </span>
                 <span className="font-headline text-sm font-bold text-magi-muted/80">
                   {formatQuoteAmount(strategyHealth.initial_budget_quote, 2)} {qc}
@@ -1379,7 +1404,7 @@ export default function BotDetail() {
                   }`}
                 >
                   {strategyHealth.current_capital_quote != null
-                    ? `${formatQuoteAmount(strategyHealth.current_capital_quote, 2)} ${qc}`
+                    ? `${formatQuoteAmountFixed(strategyHealth.current_capital_quote)} ${qc}`
                     : '—'}
                 </span>
               </div>
@@ -1449,15 +1474,7 @@ export default function BotDetail() {
                 {netPnl != null ? `${formatQuoteAmount(netPnl)} ${qc}` : '—'}
               </p>
               <p className="font-label text-[9px] tracking-wide text-magi-muted/55">
-                {strategyHealth?.pnl_return_on_budget_pct != null
-                  ? `ROI ${formatQuoteAmount(strategyHealth.pnl_return_on_budget_pct, 2)}% vs budget`
-                  : strategyHealth != null
-                    ? `R ${formatQuoteAmount(strategyHealth.realized_pnl_quote)} · U ${
-                        strategyHealth.unrealized_pnl_quote != null
-                          ? formatQuoteAmount(strategyHealth.unrealized_pnl_quote)
-                          : '—'
-                      }`
-                    : '—'}
+                {pnlBreakdownLabel}
               </p>
             </div>
 
@@ -1466,7 +1483,7 @@ export default function BotDetail() {
               <p className="font-headline text-2xl font-black text-red-400">{drawdownLabel}</p>
               <p className="font-label text-[9px] tracking-wide text-magi-muted/55">
                 {strategyHealth?.max_drawdown_vs_budget_pct != null
-                  ? `${formatQuoteAmount(strategyHealth.max_drawdown_vs_budget_pct, 2)}% of budget`
+                  ? `${formatQuoteAmount(strategyHealth.max_drawdown_vs_budget_pct, 2)}% of initial capital`
                   : 'vs peak realized PnL'}
               </p>
             </div>
@@ -1873,10 +1890,6 @@ export default function BotDetail() {
               className="font-headline min-h-10 min-w-0 flex-1 bg-magi-hot px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
               TERMINATE
             </button>
-            <Link to="/bots"
-              className="font-headline flex min-h-10 min-w-0 flex-1 items-center justify-center border-l-2 border-black/20 px-3 text-center text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 sm:flex-none sm:px-6 sm:text-[10px] warning-stripe">
-              BOT_LIST
-            </Link>
           </div>
         </div>
       </footer>
@@ -2098,7 +2111,7 @@ export default function BotDetail() {
                   </div>
 
                   <label className={`${configLabelClass} max-w-xs`}>
-                    Initial budget ({qc})
+                    Initial capital ({qc})
                     <input
                       type="text"
                       inputMode="decimal"
@@ -2339,10 +2352,10 @@ export default function BotDetail() {
               <div className="rounded-lg border border-border bg-black/20 px-4 py-3 text-[11px] text-gray-400">
                 <span className="font-bold text-white">Bot:</span> {bot?.name} · {bot?.symbol}<br />
                 <span className="font-bold text-white">Strategy:</span> {bot?.strategy?.toUpperCase()}<br />
-                <span className="font-bold text-white">Budget:</span>{' '}
+                <span className="font-bold text-white">Initial capital:</span>{' '}
                 {strategyHealth?.initial_budget_quote != null
                   ? `${strategyHealth.initial_budget_quote.toLocaleString()} USDT`
-                  : 'not set — set a budget before going live'}
+                  : 'not set — set initial capital before going live'}
               </div>
               {error && (
                 <p className="text-red-400 text-xs border border-red-500/40 bg-red-950/20 rounded p-2">{error}</p>

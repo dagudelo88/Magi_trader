@@ -26,7 +26,7 @@ import time
 from collections import defaultdict
 from typing import Any
 
-from fastapi import WebSocket
+from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -207,6 +207,13 @@ class ConnectionManager:
         for websocket in targets:
             try:
                 await websocket.send_text(payload)
+            except WebSocketDisconnect:
+                logger.debug(
+                    "WS client disconnected during send channel=%r event=%r",
+                    channel,
+                    event_type,
+                )
+                stale.append(websocket)
             except (RuntimeError, ConnectionResetError, OSError) as exc:
                 logger.warning(
                     "WS send failed channel=%r event=%r priority=%s: %s",
@@ -226,9 +233,12 @@ class ConnectionManager:
 
         if stale:
             async with self._lock:
+                connections = self._channels.get(channel)
+                if connections is None:
+                    return
                 for websocket in stale:
-                    self._channels[channel].discard(websocket)
-                if not self._channels[channel]:
+                    connections.discard(websocket)
+                if not connections:
                     self._channels.pop(channel, None)
 
     def publish(

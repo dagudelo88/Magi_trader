@@ -44,7 +44,7 @@ export const BOT_TEMPLATES: BotTemplate[] = [
     name: 'Magi — Swing Trading',
     tagline: 'Committee · 1h · directional_net · high conviction',
     description:
-      'Trend + breakout voters on 1-hour bars. High threshold requires a clear net directional edge. Trades rarely but with maximum confidence. Best for larger budgets.',
+      'Trend + breakout voters on 1-hour bars. High threshold requires a clear net directional edge. Trades rarely but with maximum confidence. Best for larger initial capital.',
     defaultSymbol: 'BTC/USDT',
   },
   // ── Magi Lag Ensemble ────────────────────────────────────────────────────
@@ -72,7 +72,7 @@ export const BOT_TEMPLATES: BotTemplate[] = [
     name: 'Magi Lag — Low Frequency',
     tagline: 'BTC-Alt Lag · 15m · directional_net · high conviction',
     description:
-      'Three high-reliability lag voters on 15-minute bars. Equivalent to 2/3 majority but resistant to all-hold bias. Best for larger budgets.',
+      'Three high-reliability lag voters on 15-minute bars. Equivalent to 2/3 majority but resistant to all-hold bias. Best for larger initial capital.',
     defaultSymbol: 'ETH/USDT',
   },
 ];

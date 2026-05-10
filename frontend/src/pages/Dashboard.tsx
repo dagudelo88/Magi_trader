@@ -182,7 +182,7 @@ export default function Dashboard() {
                 : `${pnlPositive ? '+' : ''}${totalPnl.toFixed(4)} USDT`}
             </div>
             <p className="text-xs mt-1 text-gray-500">
-              {totalTrades} closed trades · budget {totalBudget.toLocaleString()} USDT
+              {totalTrades} closed trades · initial capital {totalBudget.toLocaleString()} USDT
             </p>
           </div>
 
@@ -213,7 +213,7 @@ export default function Dashboard() {
                     <th className="px-4 py-2 text-left font-semibold">Pair</th>
                     <th className="px-4 py-2 text-left font-semibold">Strategy</th>
                     <th className="px-4 py-2 text-left font-semibold">Status</th>
-                    <th className="px-4 py-2 text-right font-semibold">Budget</th>
+                    <th className="px-4 py-2 text-right font-semibold">Initial Capital</th>
                     <th className="px-4 py-2 text-right font-semibold">Realized P&L</th>
                     <th className="px-4 py-2 text-right font-semibold">Win Rate</th>
                     <th className="px-4 py-2 text-right font-semibold">Trades</th>
