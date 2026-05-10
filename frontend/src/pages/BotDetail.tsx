@@ -290,6 +290,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
   const { voters, voterWeights, consensusMode, consensusThreshold } = ensemble;
   const maxWeight = Math.max(...voters.map((v) => voterWeights[v] ?? 1.0), 1);
   const isDirectionalNet = consensusMode === 'directional_net';
+  const compactVoterGrid = voters.length > 9;
 
   const signalMap = Object.fromEntries(liveSignals.map((s) => [s.voter_name, s]));
   const hasLiveData = liveSignals.length > 0;
@@ -317,7 +318,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
     : `≥${(consensusThreshold * 100).toFixed(0)}%`;
 
   return (
-    <div className="border-b border-magi-grid/15 px-4 py-5">
+    <div className={`border-b border-magi-grid/15 px-4 ${compactVoterGrid ? 'py-4' : 'py-5'}`}>
       {/* Section header */}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
@@ -353,7 +354,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
 
       {/* Consensus visualisation */}
       {hasLiveData && (
-        <div className="mb-4">
+        <div className={compactVoterGrid ? 'mb-3' : 'mb-4'}>
           {isDirectionalNet ? (
             // directional_net: centered bar showing (buy_w - sell_w) / total_w
             // Center = 0, left = sell pressure, right = buy pressure
@@ -431,7 +432,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
       )}
 
       {/* Voter grid */}
-      <div className="grid grid-cols-2 gap-2">
+      <div className={`grid gap-2 ${compactVoterGrid ? 'grid-cols-3' : 'grid-cols-2'}`}>
         {voters.map((voterId) => {
           const meta = VOTER_META[voterId] ?? { label: voterId, role: 'Other' };
           const roleColor = ROLE_COLORS[meta.role] ?? 'text-magi-muted border-magi-grid/30 bg-magi-grid/5';
@@ -444,20 +445,28 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
           return (
             <div
               key={voterId}
-              className={`relative flex flex-col gap-2 rounded border px-3 py-2.5 transition-colors ${
+              className={`relative flex flex-col rounded border transition-colors ${
                 signalStyle ?? roleColor
-              }`}
+              } ${compactVoterGrid ? 'gap-1.5 px-2 py-2' : 'gap-2 px-3 py-2.5'}`}
             >
               {sig && (
-                <span className={`absolute right-2 top-2 h-2 w-2 rounded-full ${SIGNAL_DOT[sig]}`} />
+                <span className={`absolute rounded-full ${SIGNAL_DOT[sig]} ${
+                  compactVoterGrid ? 'right-1.5 top-1.5 h-1.5 w-1.5' : 'right-2 top-2 h-2 w-2'
+                }`} />
               )}
-              <div className="flex items-start justify-between gap-1 min-w-0 pr-3">
-                <p className="truncate font-label text-[11px] font-black leading-tight">
+              <div className={`flex min-w-0 items-start justify-between gap-1 ${
+                compactVoterGrid ? 'pr-2' : 'pr-3'
+              }`}>
+                <p className={`truncate font-label font-black leading-tight ${
+                  compactVoterGrid ? 'text-[9px]' : 'text-[11px]'
+                }`}>
                   {meta.label}
                 </p>
               </div>
               {sig ? (
-                <span className={`self-start rounded border px-2 py-0.5 font-label text-[10px] font-black uppercase tracking-wider ${signalStyle}`}>
+                <span className={`self-start rounded border font-label font-black uppercase tracking-wider ${signalStyle} ${
+                  compactVoterGrid ? 'px-1 py-0.5 text-[8px]' : 'px-2 py-0.5 text-[10px]'
+                }`}>
                   {sig}
                   {live.confidence != null && (
                     <span className="ml-1 opacity-70 font-normal normal-case">
@@ -466,18 +475,20 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
                   )}
                 </span>
               ) : (
-                <span className="font-label text-[9px] font-bold uppercase tracking-wide opacity-50">
+                <span className={`font-label font-bold uppercase tracking-wide opacity-50 ${
+                  compactVoterGrid ? 'text-[8px]' : 'text-[9px]'
+                }`}>
                   {meta.role}
                 </span>
               )}
-              <div className="flex items-center gap-1.5">
-                <div className="h-1 flex-1 overflow-hidden rounded-full bg-current opacity-20">
+              <div className={`flex items-center ${compactVoterGrid ? 'gap-1' : 'gap-1.5'}`}>
+                <div className={`${compactVoterGrid ? 'h-0.5' : 'h-1'} flex-1 overflow-hidden rounded-full bg-current opacity-20`}>
                   <div
                     className="h-full rounded-full bg-current opacity-80 transition-all"
                     style={{ width: `${weightPct}%` }}
                   />
                 </div>
-                <span className="shrink-0 font-mono text-[9px] opacity-50">
+                <span className={`shrink-0 font-mono opacity-50 ${compactVoterGrid ? 'text-[8px]' : 'text-[9px]'}`}>
                   {weight.toFixed(1)}×
                 </span>
               </div>
@@ -487,7 +498,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
       </div>
 
       {lastUpdated != null && (
-        <p className="mt-2 font-label text-[8px] text-magi-muted/30 text-right">
+        <p className={`font-label text-[8px] text-magi-muted/30 text-right ${compactVoterGrid ? 'mt-1.5' : 'mt-2'}`}>
           updated {new Date(lastUpdated).toLocaleTimeString()}
         </p>
       )}
@@ -1209,6 +1220,58 @@ export default function BotDetail() {
             </div>
           )}
 
+          {/* Stats grid */}
+          <div className="grid grid-cols-2 gap-3 border-b border-magi-grid/15 px-4 py-4">
+            <div className="flex flex-col items-center gap-1.5 rounded border border-magi-grid/20 bg-magi-container-low px-3 py-3 text-center shadow-[0_0_12px_rgba(255,255,255,0.02)]">
+              <p className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">Fills</p>
+              <p className="font-headline text-2xl font-black text-magi-primary phosphor-amber">
+                {recordedOrderCount}
+              </p>
+              <p className="font-label text-[10px] uppercase tracking-wide text-magi-muted/55">
+                B {orderStats?.buy_count ?? 0} · S {orderStats?.sell_count ?? 0}
+                {orderStats?.last_order_at_ms != null && (
+                  <span className="mt-0.5 block normal-case text-magi-muted/40">
+                    {formatLogTime(orderStats.last_order_at_ms)}
+                  </span>
+                )}
+              </p>
+            </div>
+
+            <div className="flex flex-col items-center gap-1.5 rounded border border-magi-grid/20 bg-magi-container-low px-3 py-3 text-center shadow-[0_0_12px_rgba(255,255,255,0.02)]">
+              <p className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">Win Rate</p>
+              <p className="font-headline text-2xl font-black text-magi-on-bg">{winRateLabel}</p>
+              <p className="font-label text-[10px] uppercase tracking-wide text-magi-muted/55">
+                {strategyHealth != null
+                  ? `${strategyHealth.winning_trades}W · ${strategyHealth.losing_trades}L / ${strategyHealth.closed_trades} exits`
+                  : '—'}
+              </p>
+            </div>
+
+            <div className="flex flex-col items-center gap-1.5 rounded border border-magi-grid/20 bg-magi-container-low px-3 py-3 text-center shadow-[0_0_12px_rgba(255,255,255,0.02)]">
+              <p className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">Net PnL</p>
+              <p
+                className={`font-headline text-2xl font-black ${
+                  netPnl != null ? pnlToneClass(netPnl) : 'text-magi-on-bg'
+                }`}
+              >
+                {netPnl != null ? `${formatQuoteAmount(netPnl)} ${qc}` : '—'}
+              </p>
+              <p className="font-label text-[10px] tracking-wide text-magi-muted/55">
+                {pnlBreakdownLabel}
+              </p>
+            </div>
+
+            <div className="flex flex-col items-center gap-1.5 rounded border border-magi-grid/20 bg-magi-container-low px-3 py-3 text-center shadow-[0_0_12px_rgba(255,255,255,0.02)]">
+              <p className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">Max Drawdown</p>
+              <p className="font-headline text-2xl font-black text-red-400">{drawdownLabel}</p>
+              <p className="font-label text-[10px] tracking-wide text-magi-muted/55">
+                {strategyHealth?.max_drawdown_vs_budget_pct != null
+                  ? `${formatQuoteAmount(strategyHealth.max_drawdown_vs_budget_pct, 2)}% of initial capital`
+                  : 'vs peak realized PnL'}
+              </p>
+            </div>
+          </div>
+
         </div>
 
         {/* ── CENTER: Chart + Stats + Execution history ─────── */}
@@ -1283,58 +1346,6 @@ export default function BotDetail() {
             />
           )}
 
-          {/* Stats grid */}
-          <div className="grid grid-cols-2 gap-px border-b border-magi-grid/15 bg-magi-grid/10 sm:grid-cols-4">
-            <div className="flex flex-col gap-1 bg-magi-container-low px-4 py-3">
-              <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">Fills</p>
-              <p className="font-headline text-2xl font-black text-magi-primary phosphor-amber">
-                {recordedOrderCount}
-              </p>
-              <p className="font-label text-[9px] uppercase tracking-wide text-magi-muted/55">
-                B {orderStats?.buy_count ?? 0} · S {orderStats?.sell_count ?? 0}
-                {orderStats?.last_order_at_ms != null && (
-                  <span className="mt-0.5 block normal-case text-magi-muted/40">
-                    {formatLogTime(orderStats.last_order_at_ms)}
-                  </span>
-                )}
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-1 bg-magi-container-low px-4 py-3">
-              <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">Win Rate</p>
-              <p className="font-headline text-2xl font-black text-magi-on-bg">{winRateLabel}</p>
-              <p className="font-label text-[9px] uppercase tracking-wide text-magi-muted/55">
-                {strategyHealth != null
-                  ? `${strategyHealth.winning_trades}W · ${strategyHealth.losing_trades}L / ${strategyHealth.closed_trades} exits`
-                  : '—'}
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-1 bg-magi-container-low px-4 py-3">
-              <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">Net PnL</p>
-              <p
-                className={`font-headline text-2xl font-black ${
-                  netPnl != null ? pnlToneClass(netPnl) : 'text-magi-on-bg'
-                }`}
-              >
-                {netPnl != null ? `${formatQuoteAmount(netPnl)} ${qc}` : '—'}
-              </p>
-              <p className="font-label text-[9px] tracking-wide text-magi-muted/55">
-                {pnlBreakdownLabel}
-              </p>
-            </div>
-
-            <div className="flex flex-col gap-1 bg-magi-container-low px-4 py-3">
-              <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">Max Drawdown</p>
-              <p className="font-headline text-2xl font-black text-red-400">{drawdownLabel}</p>
-              <p className="font-label text-[9px] tracking-wide text-magi-muted/55">
-                {strategyHealth?.max_drawdown_vs_budget_pct != null
-                  ? `${formatQuoteAmount(strategyHealth.max_drawdown_vs_budget_pct, 2)}% of initial capital`
-                  : 'vs peak realized PnL'}
-              </p>
-            </div>
-          </div>
-
           {/* Execution history table */}
           <div className="min-w-0 px-4 pt-4 pb-2 sm:px-6 sm:pt-5">
             {/* Header row: title + view toggle */}
@@ -1376,7 +1387,7 @@ export default function BotDetail() {
 
             {historyView === 'fills' ? (
               /* ── RAW FILLS TABLE (unchanged) ── */
-              <div className="max-h-[280px] overflow-auto">
+              <div className="max-h-[420px] overflow-auto">
                 <table className="w-full min-w-[36rem] text-left font-label text-[10px] sm:text-[11px]">
                   <thead className="sticky top-0 border-b border-magi-grid/10 bg-magi-bg uppercase text-magi-muted/40">
                     <tr>
@@ -1449,7 +1460,7 @@ export default function BotDetail() {
                     Entry price is the weighted average cost basis of the consumed lots.
                   </p>
                 </div>
-                <div className="max-h-[280px] overflow-auto">
+                <div className="max-h-[420px] overflow-auto">
                   {tradeSummaryLoading && tradeSummary === null ? (
                     <p className="py-4 font-label text-[10px] italic text-magi-muted/50">Loading…</p>
                   ) : (
