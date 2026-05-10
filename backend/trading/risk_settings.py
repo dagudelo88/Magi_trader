@@ -29,6 +29,7 @@ DEFAULT_RISK_SETTINGS: dict[str, Any] = {
     "volatility_threshold": None,
     "drawdown_action": "reduce",
     "drawdown_reduce_factor": 0.5,
+    "yolo_mode": False,
 }
 
 
@@ -171,6 +172,10 @@ def normalize_risk_settings(
         "volatility_threshold": volatility_threshold,
         "drawdown_action": drawdown_action,
         "drawdown_reduce_factor": drawdown_reduce_factor,
+        "yolo_mode": _as_bool(
+            source.get("yolo_mode"),
+            DEFAULT_RISK_SETTINGS["yolo_mode"],
+        ),
     }
 
 

@@ -632,6 +632,7 @@ def init_db():
             volatility_threshold REAL,
             drawdown_action TEXT NOT NULL DEFAULT 'reduce',
             drawdown_reduce_factor REAL NOT NULL DEFAULT 0.5,
+            yolo_mode INTEGER NOT NULL DEFAULT 0,
             consecutive_loss_baseline INTEGER NOT NULL DEFAULT 0,
             daily_loss_baseline_date TEXT,
             daily_loss_baseline_pnl REAL NOT NULL DEFAULT 0,
@@ -644,6 +645,7 @@ def init_db():
         )
     """)
     risk_state_migrations = [
+        ("yolo_mode", "INTEGER NOT NULL DEFAULT 0"),
         ("consecutive_loss_baseline", "INTEGER NOT NULL DEFAULT 0"),
         ("daily_loss_baseline_date", "TEXT"),
         ("daily_loss_baseline_pnl", "REAL NOT NULL DEFAULT 0"),
@@ -1088,9 +1090,12 @@ def fork_bot(
                     bot_id, base_risk_pct, dynamic_tiers_json, daily_loss_limit_pct,
                     max_drawdown_pct, consecutive_loss_limit, enable_daily_loss_limit,
                     enable_drawdown_protection, enable_consecutive_loss,
-                    enable_dynamic_sizing, enable_volatility_pause, volatility_threshold,
-                    drawdown_action, drawdown_reduce_factor, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    enable_dynamic_sizing, enable_volatility_pause,
+                    volatility_threshold, drawdown_action, drawdown_reduce_factor,
+                    yolo_mode, created_at, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
                 """,
                 (
                     new_id,
@@ -1107,6 +1112,7 @@ def fork_bot(
                     risk["volatility_threshold"],
                     risk["drawdown_action"],
                     risk["drawdown_reduce_factor"],
+                    risk.get("yolo_mode", 0),
                     now,
                     now,
                 ),
@@ -1676,9 +1682,12 @@ def upsert_bot_risk_settings(bot_id: str, settings: dict[str, Any]) -> dict[str,
                 bot_id, base_risk_pct, dynamic_tiers_json, daily_loss_limit_pct,
                 max_drawdown_pct, consecutive_loss_limit, enable_daily_loss_limit,
                 enable_drawdown_protection, enable_consecutive_loss,
-                enable_dynamic_sizing, enable_volatility_pause, volatility_threshold,
-                drawdown_action, drawdown_reduce_factor, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                enable_dynamic_sizing, enable_volatility_pause,
+                volatility_threshold, drawdown_action, drawdown_reduce_factor,
+                yolo_mode, created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             ON CONFLICT(bot_id) DO UPDATE SET
                 base_risk_pct = excluded.base_risk_pct,
                 dynamic_tiers_json = excluded.dynamic_tiers_json,
@@ -1693,6 +1702,7 @@ def upsert_bot_risk_settings(bot_id: str, settings: dict[str, Any]) -> dict[str,
                 volatility_threshold = excluded.volatility_threshold,
                 drawdown_action = excluded.drawdown_action,
                 drawdown_reduce_factor = excluded.drawdown_reduce_factor,
+                yolo_mode = excluded.yolo_mode,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1714,6 +1724,7 @@ def upsert_bot_risk_settings(bot_id: str, settings: dict[str, Any]) -> dict[str,
                 ),
                 str(settings.get("drawdown_action") or "reduce"),
                 float(settings.get("drawdown_reduce_factor") or 0.5),
+                1 if settings.get("yolo_mode") else 0,
                 now,
                 now,
             ),

@@ -217,6 +217,16 @@ function mergeBotStatus(bots: BotRow[], botId: string, status: string): BotRow[]
   return bots.map((bot) => (bot.bot_id === botId ? { ...bot, status } : bot));
 }
 
+export function botLogIdentity(log: BotLogRow): string {
+  return [
+    log.bot_id,
+    log.created_at,
+    log.execution_mode,
+    log.level,
+    log.message,
+  ].join('|');
+}
+
 export const useRealtimeStore = create<RealtimeState>((set, get) => ({
   bots: [],
   botsLoaded: false,
@@ -386,7 +396,12 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
             ...state.botDetailsById,
             [botId]: {
               ...detail,
-              logs: [log, ...detail.logs.filter((item) => item.log_id !== log.log_id)].slice(0, 150),
+              logs: [
+                log,
+                ...detail.logs.filter(
+                  (item) => botLogIdentity(item) !== botLogIdentity(log),
+                ),
+              ].slice(0, 150),
             },
           },
         };
@@ -398,8 +413,13 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
       const batchLogs = (data.logs as BotLogRow[]).slice().reverse();
       set((state) => {
         const detail = state.botDetailsById[botId] ?? emptyBotDetail();
-        const existingIds = new Set(detail.logs.map((log) => log.log_id));
-        const newLogs = batchLogs.filter((log) => !existingIds.has(log.log_id));
+        const seenLogKeys = new Set(detail.logs.map(botLogIdentity));
+        const newLogs = batchLogs.filter((log) => {
+          const key = botLogIdentity(log);
+          if (seenLogKeys.has(key)) return false;
+          seenLogKeys.add(key);
+          return true;
+        });
         return {
           botDetailsById: {
             ...state.botDetailsById,
@@ -439,6 +459,25 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
           botDetailsById: {
             ...state.botDetailsById,
             [botId]: { ...detail, bot: data.bot as BotRecord, loaded: true },
+          },
+        };
+      });
+      get().scheduleBotsRefresh();
+      return;
+    }
+
+    if (message.type === 'risk_settings_updated' && data.risk_settings && typeof data.risk_settings === 'object') {
+      set((state) => {
+        const detail = state.botDetailsById[botId] ?? emptyBotDetail();
+        return {
+          botDetailsById: {
+            ...state.botDetailsById,
+            [botId]: {
+              ...detail,
+              bot: detail.bot
+                ? { ...detail.bot, risk_settings: data.risk_settings as RiskSettings }
+                : detail.bot,
+            },
           },
         };
       });

@@ -215,6 +215,19 @@ def evaluate_trade_risk(
     )
     drawdown_baseline = float(state.get("drawdown_baseline_pct") or 0.0)
     risk_pct = dynamic_risk_pct(cfg, consensus_score)
+    volatility = recent_volatility_pct(ohlcv)
+
+    if cfg["yolo_mode"]:
+        return RiskDecision(
+            allowed=True,
+            size_multiplier=1.0,
+            risk_pct=risk_pct,
+            current_capital=current_capital,
+            daily_pnl=daily_pnl,
+            drawdown_pct=drawdown,
+            consecutive_losses=streak,
+            volatility_pct=volatility,
+        )
 
     if cfg["enable_daily_loss_limit"] and daily_pnl < 0:
         daily_loss_pct = (
@@ -275,7 +288,6 @@ def evaluate_trade_risk(
         if side.lower() == "buy":
             size_multiplier = float(cfg["drawdown_reduce_factor"])
 
-    volatility = recent_volatility_pct(ohlcv)
     if (
         cfg["enable_volatility_pause"]
         and volatility is not None

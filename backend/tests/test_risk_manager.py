@@ -122,6 +122,63 @@ class TestRiskManager(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertAlmostEqual(decision.size_multiplier, 0.5)
 
+    def test_yolo_bypasses_protections_but_keeps_dynamic_sizing(self) -> None:
+        now_ms = 1_700_000_100_000
+        settings = normalize_risk_settings(
+            {
+                **DEFAULT_RISK_SETTINGS,
+                "yolo_mode": True,
+                "daily_loss_limit_pct": 1,
+                "consecutive_loss_limit": 1,
+                "max_drawdown_pct": 1,
+                "drawdown_action": "pause",
+                "enable_volatility_pause": True,
+                "volatility_threshold": 0.01,
+            }
+        )
+        orders = [
+            _o(
+                "buy",
+                amount=1,
+                cost=1000,
+                average=1000,
+                created_at=now_ms - 2_000,
+            ),
+            _o(
+                "sell",
+                amount=1,
+                cost=900,
+                average=900,
+                created_at=now_ms - 1_000,
+            ),
+        ]
+        volatile_ohlcv = [
+            [now_ms - 60_000, 0, 0, 0, 100, 0],
+            [now_ms - 50_000, 0, 0, 0, 120, 0],
+            [now_ms - 40_000, 0, 0, 0, 90, 0],
+            [now_ms - 30_000, 0, 0, 0, 130, 0],
+        ]
+        decision = evaluate_trade_risk(
+            settings=settings,
+            orders_oldest_first=orders,
+            symbol="BTC/USDT",
+            initial_capital=1000,
+            mark_price=900,
+            consensus_score=0.80,
+            ohlcv=volatile_ohlcv,
+            side="buy",
+            now_ms=now_ms,
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertFalse(decision.should_pause)
+        self.assertAlmostEqual(decision.risk_pct or 0, 2.8)
+        self.assertAlmostEqual(decision.size_multiplier, 1.0)
+        self.assertLess(decision.daily_pnl or 0, 0)
+        self.assertGreaterEqual(decision.consecutive_losses, 1)
+        self.assertGreaterEqual(decision.drawdown_pct or 0, 1)
+        self.assertIsNotNone(decision.volatility_pct)
+
     def test_template_lag_is_more_conservative(self) -> None:
         classic = template_risk_defaults("magi_ensemble_mid")
         lag = template_risk_defaults("magi_lag_ensemble_mid")

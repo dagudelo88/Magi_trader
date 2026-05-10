@@ -4,7 +4,7 @@ import { Copy, ChevronDown, Info } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
 import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
-import { useRealtimeStore } from '../stores/realtimeStore';
+import { botLogIdentity, useRealtimeStore } from '../stores/realtimeStore';
 
 /** Pixels from bottom to consider the user "at" the latest log line. */
 const LOG_BOTTOM_THRESHOLD_PX = 72;
@@ -499,6 +499,7 @@ export default function BotDetail() {
   const [busy, setBusy] = useState(false);
   const [budgetDraft, setBudgetDraft] = useState('');
   const [budgetBusy, setBudgetBusy] = useState(false);
+  const [yoloBusy, setYoloBusy] = useState(false);
   const [forkApplyBudget, setForkApplyBudget] = useState(false);
   const [forkBusy, setForkBusy] = useState(false);
   const [forkNameDraft, setForkNameDraft] = useState('');
@@ -768,6 +769,35 @@ export default function BotDetail() {
     }
   };
 
+  const setYoloMode = async (enabled: boolean) => {
+    if (!id) return;
+    if (
+      enabled &&
+      !window.confirm(
+        'Enable YOLO mode?\n\nThis bypasses risk protection blockers for this bot. Trade sizing still uses the configured risk percent, but daily loss, drawdown, consecutive-loss, and volatility protections will not stop trades.',
+      )
+    ) {
+      return;
+    }
+    setYoloBusy(true);
+    setActionError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${id}/risk-settings/yolo`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ yolo_mode: enabled }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok)
+        throw new Error(typeof data.detail === 'string' ? data.detail : 'YOLO update failed');
+      await refresh();
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'YOLO update failed');
+    } finally {
+      setYoloBusy(false);
+    }
+  };
+
   const confirmRiskOverride = () =>
     window.confirm(
       'Resume bot trading?\n\nThis manually overrides active risk protections and resets the daily loss, drawdown, and consecutive-loss baselines from the current account state. Continue?',
@@ -828,6 +858,7 @@ export default function BotDetail() {
       : '—';
   const netPnl = strategyHealth?.total_pnl_quote ?? null;
   const recordedOrderCount = orderStats?.total_orders ?? 0;
+  const yoloMode = bot?.risk_settings?.yolo_mode ?? false;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-magi-bg text-magi-on-bg">
@@ -863,6 +894,14 @@ export default function BotDetail() {
                 />
                 {liveLabel}
               </span>
+              {yoloMode && (
+                <span
+                  className="font-label inline-flex items-center border border-red-400/60 bg-red-500/15 px-2 py-0.5 text-[10px] font-black uppercase tracking-widest text-red-300"
+                  title="YOLO mode is bypassing risk protection blockers for this bot."
+                >
+                  YOLO RISK OFF
+                </span>
+              )}
               <span className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">
                 {strategyTag}
               </span>
@@ -1349,8 +1388,11 @@ export default function BotDetail() {
               {logsChronological.length === 0 && (
                 <p className="opacity-60">[ — ] NO_TELEMETRY — start bot after keys configured.</p>
               )}
-              {logsChronological.map((log) => (
-                <p key={log.log_id} className={`mb-1.5 break-words ${logLineClass(log.level)}`}>
+              {logsChronological.map((log, index) => (
+                <p
+                  key={`${botLogIdentity(log)}:${index}`}
+                  className={`mb-1.5 break-words ${logLineClass(log.level)}`}
+                >
                   [{formatLogTime(log.created_at)}] [{log.execution_mode}] [{log.level}] {log.message}
                 </p>
               ))}
@@ -1429,6 +1471,45 @@ export default function BotDetail() {
             </div>
           </div>
           <div className="flex min-h-10 w-full flex-wrap gap-px sm:h-full sm:min-h-0 sm:w-auto sm:flex-nowrap">
+            <label
+              title={
+                yoloMode
+                  ? 'Disable YOLO mode and restore risk protection blockers'
+                  : 'Enable YOLO mode: bypass risk protection blockers while keeping risk sizing'
+              }
+              className={`font-headline flex min-h-10 min-w-0 flex-1 cursor-pointer items-center gap-2 border border-red-500/50 px-3 text-[9px] font-black uppercase tracking-widest transition-colors sm:flex-none sm:px-4 sm:text-[10px] ${
+                yoloMode
+                  ? 'bg-red-600 text-white hover:bg-red-500'
+                  : 'bg-red-950/30 text-red-300 hover:bg-red-900/50'
+              } ${busy || yoloBusy ? 'cursor-not-allowed opacity-50' : ''}`}
+            >
+              <input
+                type="checkbox"
+                role="switch"
+                checked={yoloMode}
+                disabled={busy || yoloBusy}
+                onChange={(event) => void setYoloMode(event.currentTarget.checked)}
+                className="sr-only"
+                aria-label="YOLO mode"
+              />
+              <span
+                aria-hidden="true"
+                className={`relative h-5 w-9 rounded-full border transition-colors ${
+                  yoloMode
+                    ? 'border-white/60 bg-black/35'
+                    : 'border-red-400/60 bg-black/30'
+                }`}
+              >
+                <span
+                  className={`absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full transition-transform ${
+                    yoloMode
+                      ? 'translate-x-[18px] bg-white'
+                      : 'translate-x-1 bg-red-300'
+                  }`}
+                />
+              </span>
+              <span>{yoloBusy ? 'YOLO …' : yoloMode ? 'YOLO ON' : 'YOLO OFF'}</span>
+            </label>
             {bot?.status === 'stopped' ? (
               <button type="button" disabled={busy} onClick={() => setStatus('running')}
                 className="font-headline min-h-10 min-w-0 flex-1 bg-magi-tertiary px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">

@@ -882,10 +882,15 @@ class RiskSettingsBody(BaseModel):
     volatility_threshold: float | None = None
     drawdown_action: str = "reduce"
     drawdown_reduce_factor: float = 0.5
+    yolo_mode: bool = False
 
 
 class RiskResetBody(BaseModel):
     source: str
+
+
+class RiskYoloBody(BaseModel):
+    yolo_mode: bool
 
 
 @app.get("/api/settings/risk-defaults")
@@ -924,6 +929,26 @@ def get_bot_risk_settings_endpoint(bot_id: str):
 def put_bot_risk_settings_endpoint(bot_id: str, body: RiskSettingsBody):
     try:
         settings = save_bot_risk_settings(bot_id, body.model_dump())
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from e
+    publish_bot_event(
+        bot_id,
+        "risk_settings_updated",
+        {"risk_settings": settings},
+    )
+    return {"risk_settings": settings}
+
+
+@app.patch("/api/bots/{bot_id}/risk-settings/yolo")
+def patch_bot_risk_yolo_endpoint(bot_id: str, body: RiskYoloBody):
+    try:
+        current = get_effective_bot_risk_settings(bot_id)
+        settings = save_bot_risk_settings(
+            bot_id,
+            {**current, "yolo_mode": body.yolo_mode},
+        )
     except ValueError as e:
         msg = str(e)
         code = 404 if "not found" in msg else 400

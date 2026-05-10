@@ -20,6 +20,7 @@ export interface RiskSettings {
   volatility_threshold: number | null;
   drawdown_action: DrawdownAction;
   drawdown_reduce_factor: number;
+  yolo_mode: boolean;
 }
 
 export const DEFAULT_DYNAMIC_TIERS: DynamicRiskTier[] = [
@@ -43,6 +44,7 @@ export const GLOBAL_RISK_DEFAULTS: RiskSettings = {
   volatility_threshold: null,
   drawdown_action: 'reduce',
   drawdown_reduce_factor: 0.5,
+  yolo_mode: false,
 };
 
 export function cloneRiskSettings(settings: RiskSettings): RiskSettings {
