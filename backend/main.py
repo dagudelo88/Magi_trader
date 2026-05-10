@@ -27,6 +27,7 @@ from database import (
     create_bot,
     delete_bot,
     get_db_connection,
+    get_bot_risk_settings,
     get_latest_voter_signals,
     get_pool_stats,
     init_db,
@@ -60,6 +61,14 @@ from trading.strategy_budget import (
     initial_budget_from_strategy_params_json,
     merge_strategy_params_json,
     parse_initial_budget_api_value,
+)
+from trading.risk_settings import (
+    db_row_to_risk_settings,
+    get_effective_bot_risk_settings,
+    get_global_risk_defaults,
+    save_bot_risk_settings,
+    set_global_risk_defaults,
+    template_risk_defaults,
 )
 from trading.strategies.registry import (
     get_strategy,
@@ -856,6 +865,94 @@ def put_trading_halt(body: HaltBody):
     return snap
 
 
+class RiskSettingsBody(BaseModel):
+    base_risk_pct: float
+    dynamic_tiers: list[dict[str, Any]]
+    daily_loss_limit_pct: float
+    max_drawdown_pct: float
+    consecutive_loss_limit: int
+    enable_daily_loss_limit: bool = True
+    enable_drawdown_protection: bool = True
+    enable_consecutive_loss: bool = True
+    enable_dynamic_sizing: bool = True
+    enable_volatility_pause: bool = False
+    volatility_threshold: float | None = None
+    drawdown_action: str = "reduce"
+    drawdown_reduce_factor: float = 0.5
+
+
+class RiskResetBody(BaseModel):
+    source: str
+
+
+@app.get("/api/settings/risk-defaults")
+def get_risk_defaults():
+    return {"risk_settings": get_global_risk_defaults()}
+
+
+@app.put("/api/settings/risk-defaults")
+def put_risk_defaults(body: RiskSettingsBody):
+    try:
+        settings = set_global_risk_defaults(body.model_dump())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    publish_bots_event("risk_defaults_changed", {"risk_settings": settings})
+    return {"risk_settings": settings}
+
+
+@app.get("/api/bots/{bot_id}/risk-settings")
+def get_bot_risk_settings_endpoint(bot_id: str):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM bots WHERE bot_id = ?", (bot_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Bot not found")
+    finally:
+        conn.close()
+    row = get_bot_risk_settings(bot_id)
+    return {
+        "risk_settings": get_effective_bot_risk_settings(bot_id),
+        "source": "bot" if row else "global",
+    }
+
+
+@app.put("/api/bots/{bot_id}/risk-settings")
+def put_bot_risk_settings_endpoint(bot_id: str, body: RiskSettingsBody):
+    try:
+        settings = save_bot_risk_settings(bot_id, body.model_dump())
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from e
+    publish_bot_event(bot_id, "risk_settings_updated", {"risk_settings": settings})
+    return {"risk_settings": settings}
+
+
+@app.post("/api/bots/{bot_id}/risk-settings/reset")
+def reset_bot_risk_settings_endpoint(bot_id: str, body: RiskResetBody):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT strategy FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        strategy_name = str(row["strategy"] or "")
+    finally:
+        conn.close()
+
+    if body.source == "global":
+        target = get_global_risk_defaults()
+    elif body.source == "template":
+        target = template_risk_defaults(strategy_name)
+    else:
+        raise HTTPException(status_code=400, detail="source must be global or template")
+    settings = save_bot_risk_settings(bot_id, target)
+    publish_bot_event(bot_id, "risk_settings_updated", {"risk_settings": settings})
+    return {"risk_settings": settings, "source": body.source}
+
+
 # --- Bots ---
 
 
@@ -890,6 +987,7 @@ def list_bots():
                 row["realized_pnl_quote"] = None
                 row["win_rate_pct"] = None
                 row["closed_trades"] = None
+            row["risk_settings"] = get_effective_bot_risk_settings(bot_id)
         return {"bots": rows}
     finally:
         conn.close()
@@ -901,6 +999,7 @@ class CreateBotBody(BaseModel):
     strategy: str = "sma_cross"  # defaults to original strategy for backward compat
     initial_budget_quote: float
     strategy_params: dict[str, Any] | None = None
+    risk_settings: dict[str, Any] | None = None
 
 
 @app.get("/api/strategies")
@@ -935,6 +1034,14 @@ def post_create_bot(body: CreateBotBody):
     params_json = json.dumps(params, default=str)
     try:
         bot = create_bot(body.name, body.symbol, body.strategy, params_json)
+        risk_settings = (
+            save_bot_risk_settings(bot["bot_id"], body.risk_settings)
+            if body.risk_settings
+            else save_bot_risk_settings(bot["bot_id"], get_global_risk_defaults())
+        )
+        bot["risk_settings"] = risk_settings
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     publish_bots_event("bots_changed", {"action": "created", "bot": bot})
@@ -1060,6 +1167,10 @@ def get_bot(bot_id: str):
         perf = compute_strategy_performance(orders_asc, sym, mark_price=mark_price)
         total_pnl = perf["realized_pnl_quote"] + (perf["unrealized_pnl_quote"] or 0.0)
         raw_params = bot_row.get("strategy_params_json")
+        bot_row["risk_settings"] = (
+            db_row_to_risk_settings(get_bot_risk_settings(bot_id))
+            or get_global_risk_defaults()
+        )
         budget = initial_budget_from_strategy_params_json(
             raw_params if isinstance(raw_params, str) else None
         )

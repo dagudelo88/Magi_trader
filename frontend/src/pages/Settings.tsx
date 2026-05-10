@@ -1,15 +1,174 @@
 import { useCallback, useEffect, useState } from 'react';
 import { API_BASE } from '../config';
 import { useRealtimeStore, type TradingSettings } from '../stores/realtimeStore';
+import {
+  cloneRiskSettings,
+  validateRiskSettings,
+  type DrawdownAction,
+  type RiskSettings,
+} from '../riskSettings';
+
+type RiskDraftSetter = (next: RiskSettings) => void;
+
+function numberValue(value: string): number | null {
+  if (value.trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function RiskFields({ value, onChange }: { value: RiskSettings; onChange: RiskDraftSetter }) {
+  const set = <K extends keyof RiskSettings>(key: K, next: RiskSettings[K]) => {
+    onChange({ ...value, [key]: next });
+  };
+  const inputClass = 'w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-primary';
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Base risk %</span>
+          <input
+            type="number"
+            min="0.1"
+            step="0.1"
+            value={value.base_risk_pct}
+            onChange={(e) => set('base_risk_pct', Number(e.target.value))}
+            className={inputClass}
+          />
+        </label>
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Daily loss %</span>
+          <input
+            type="number"
+            min="0.1"
+            step="0.1"
+            value={value.daily_loss_limit_pct}
+            onChange={(e) => set('daily_loss_limit_pct', Number(e.target.value))}
+            className={inputClass}
+          />
+        </label>
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Max drawdown %</span>
+          <input
+            type="number"
+            min="0.1"
+            step="0.1"
+            value={value.max_drawdown_pct}
+            onChange={(e) => set('max_drawdown_pct', Number(e.target.value))}
+            className={inputClass}
+          />
+        </label>
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Loss streak</span>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            value={value.consecutive_loss_limit}
+            onChange={(e) => set('consecutive_loss_limit', Number.parseInt(e.target.value, 10))}
+            className={inputClass}
+          />
+        </label>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+        {value.dynamic_tiers.map((tier, idx) => (
+          <label key={`${tier.min_score ?? 'min'}-${tier.max_score ?? 'max'}`} className="block">
+            <span className="block text-xs text-gray-500 mb-1">
+              {idx === 0 ? '< 0.40' : idx === 1 ? '0.40 - 0.70' : idx === 2 ? '0.70 - 0.85' : '> 0.85'} multiplier
+            </span>
+            <input
+              type="number"
+              min="0.1"
+              step="0.05"
+              value={tier.multiplier}
+              onChange={(e) => {
+                const dynamic_tiers = value.dynamic_tiers.map((candidate, tierIdx) =>
+                  tierIdx === idx ? { ...candidate, multiplier: Number(e.target.value) } : candidate,
+                );
+                onChange({ ...value, dynamic_tiers });
+              }}
+              className={inputClass}
+            />
+          </label>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Drawdown action</span>
+          <select
+            value={value.drawdown_action}
+            onChange={(e) => set('drawdown_action', e.target.value as DrawdownAction)}
+            className={inputClass}
+          >
+            <option value="reduce">Reduce position size</option>
+            <option value="pause">Pause bot</option>
+          </select>
+        </label>
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Drawdown reduce factor</span>
+          <input
+            type="number"
+            min="0.05"
+            max="1"
+            step="0.05"
+            value={value.drawdown_reduce_factor}
+            onChange={(e) => set('drawdown_reduce_factor', Number(e.target.value))}
+            className={inputClass}
+          />
+        </label>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs text-gray-400">
+        {[
+          ['enable_dynamic_sizing', 'Dynamic sizing'],
+          ['enable_daily_loss_limit', 'Daily loss limit'],
+          ['enable_drawdown_protection', 'Drawdown protection'],
+          ['enable_consecutive_loss', 'Consecutive loss breaker'],
+          ['enable_volatility_pause', 'Volatility pause'],
+        ].map(([key, label]) => (
+          <label key={key} className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={Boolean(value[key as keyof RiskSettings])}
+              onChange={(e) => set(key as keyof RiskSettings, e.target.checked as never)}
+            />
+            {label}
+          </label>
+        ))}
+        <label className="block">
+          <span className="block text-xs text-gray-500 mb-1">Volatility threshold %</span>
+          <input
+            type="number"
+            min="0.1"
+            step="0.1"
+            value={value.volatility_threshold ?? ''}
+            onChange={(e) => set('volatility_threshold', numberValue(e.target.value))}
+            className={inputClass}
+            placeholder="optional"
+          />
+        </label>
+      </div>
+    </div>
+  );
+}
 
 export default function Settings() {
   const settings = useRealtimeStore((state) => state.tradingSettings) as TradingSettings | null;
+  const bots = useRealtimeStore((state) => state.bots);
   const loadTradingSettings = useRealtimeStore((state) => state.loadTradingSettings);
+  const loadBots = useRealtimeStore((state) => state.loadBots);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [liveModalOpen, setLiveModalOpen] = useState(false);
   const [confirmInput, setConfirmInput] = useState('');
   const [actionError, setActionError] = useState<string | null>(null);
+  const [globalRisk, setGlobalRisk] = useState<RiskSettings | null>(null);
+  const [botRisk, setBotRisk] = useState<RiskSettings | null>(null);
+  const [riskSource, setRiskSource] = useState<string | null>(null);
+  const [selectedBotId, setSelectedBotId] = useState('');
+  const [riskSaving, setRiskSaving] = useState(false);
+  const [riskError, setRiskError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -22,6 +181,10 @@ export default function Settings() {
         settingsLoaded: true,
         apiOk: true,
       });
+      const riskRes = await fetch(`${API_BASE}/api/settings/risk-defaults`);
+      if (!riskRes.ok) throw new Error('Failed to load risk defaults');
+      const riskData = await riskRes.json();
+      setGlobalRisk(riskData.risk_settings as RiskSettings);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : 'Load failed');
     }
@@ -29,7 +192,37 @@ export default function Settings() {
 
   useEffect(() => {
     load();
-  }, [load]);
+    void loadBots();
+  }, [load, loadBots]);
+
+  useEffect(() => {
+    if (!selectedBotId && bots.length > 0) setSelectedBotId(bots[0].bot_id);
+  }, [bots, selectedBotId]);
+
+  useEffect(() => {
+    if (!selectedBotId) {
+      setBotRisk(null);
+      setRiskSource(null);
+      return;
+    }
+    let cancelled = false;
+    setRiskError(null);
+    fetch(`${API_BASE}/api/bots/${selectedBotId}/risk-settings`)
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to load bot risk');
+        if (!cancelled) {
+          setBotRisk(data.risk_settings as RiskSettings);
+          setRiskSource(typeof data.source === 'string' ? data.source : null);
+        }
+      })
+      .catch((e) => {
+        if (!cancelled) setRiskError(e instanceof Error ? e.message : 'Failed to load bot risk');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedBotId]);
 
   const useTestnet = settings?.execution_mode === 'testnet';
 
@@ -94,6 +287,78 @@ export default function Settings() {
       setActionError(e instanceof Error ? e.message : 'Request failed');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const saveGlobalRisk = async () => {
+    if (!globalRisk) return;
+    const validation = validateRiskSettings(globalRisk);
+    if (validation) {
+      setRiskError(validation);
+      return;
+    }
+    setRiskSaving(true);
+    setRiskError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/settings/risk-defaults`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(globalRisk),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not save global risk');
+      setGlobalRisk(data.risk_settings as RiskSettings);
+    } catch (e) {
+      setRiskError(e instanceof Error ? e.message : 'Risk save failed');
+    } finally {
+      setRiskSaving(false);
+    }
+  };
+
+  const saveBotRisk = async () => {
+    if (!botRisk || !selectedBotId) return;
+    const validation = validateRiskSettings(botRisk);
+    if (validation) {
+      setRiskError(validation);
+      return;
+    }
+    setRiskSaving(true);
+    setRiskError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${selectedBotId}/risk-settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(botRisk),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not save bot risk');
+      setBotRisk(data.risk_settings as RiskSettings);
+      setRiskSource('bot');
+    } catch (e) {
+      setRiskError(e instanceof Error ? e.message : 'Risk save failed');
+    } finally {
+      setRiskSaving(false);
+    }
+  };
+
+  const resetBotRisk = async (source: 'global' | 'template') => {
+    if (!selectedBotId) return;
+    setRiskSaving(true);
+    setRiskError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${selectedBotId}/risk-settings/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not reset bot risk');
+      setBotRisk(data.risk_settings as RiskSettings);
+      setRiskSource(source);
+    } catch (e) {
+      setRiskError(e instanceof Error ? e.message : 'Risk reset failed');
+    } finally {
+      setRiskSaving(false);
     }
   };
 
@@ -212,6 +477,114 @@ export default function Settings() {
                   </button>
                 )}
               </div>
+            </div>
+          </div>
+
+          <div className="bg-panel border border-border rounded-custom p-6">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <div>
+                <h3 className="text-lg font-bold text-white">Risk Management &amp; Position Sizing</h3>
+                <p className="text-xs text-gray-500 mt-1">
+                  Global defaults seed new bots; per-bot profiles control live sizing and protections.
+                </p>
+              </div>
+              {riskSource && (
+                <span className="text-[10px] uppercase tracking-widest text-primary/80 border border-primary/20 bg-primary/10 px-2 py-1 rounded">
+                  Bot source: {riskSource}
+                </span>
+              )}
+            </div>
+
+            {riskError && (
+              <div className="mb-4 p-3 rounded-custom border border-amber-500/40 bg-amber-500/10 text-amber-200 text-xs">
+                {riskError}
+              </div>
+            )}
+
+            <div className="space-y-6">
+              <section className="border border-border/70 bg-surface/40 rounded-custom p-4">
+                <div className="flex items-center justify-between gap-3 mb-4">
+                  <div>
+                    <h4 className="text-sm font-bold text-white">Global Default Risk Settings</h4>
+                    <p className="text-xs text-gray-500">
+                      Used when a bot is created without a template-specific profile.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!globalRisk || riskSaving}
+                    onClick={() => void saveGlobalRisk()}
+                    className="px-3 py-2 rounded-custom bg-primary text-black text-xs font-bold uppercase tracking-widest disabled:opacity-50"
+                  >
+                    Save defaults
+                  </button>
+                </div>
+                {globalRisk ? (
+                  <RiskFields
+                    value={globalRisk}
+                    onChange={(next) => setGlobalRisk(cloneRiskSettings(next))}
+                  />
+                ) : (
+                  <p className="text-sm text-gray-500">Loading defaults…</p>
+                )}
+              </section>
+
+              <section className="border border-border/70 bg-surface/40 rounded-custom p-4">
+                <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3 mb-4">
+                  <div className="flex-1">
+                    <h4 className="text-sm font-bold text-white">Per-Bot Risk Profile</h4>
+                    <p className="text-xs text-gray-500 mb-2">
+                      These settings apply only to the selected bot.
+                    </p>
+                    <select
+                      value={selectedBotId}
+                      onChange={(e) => setSelectedBotId(e.target.value)}
+                      className="w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-primary"
+                    >
+                      {bots.length === 0 ? (
+                        <option value="">No bots available</option>
+                      ) : (
+                        bots.map((bot) => (
+                          <option key={bot.bot_id} value={bot.bot_id}>
+                            {bot.name} · {bot.symbol}
+                          </option>
+                        ))
+                      )}
+                    </select>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={!botRisk || !selectedBotId || riskSaving}
+                      onClick={() => void resetBotRisk('global')}
+                      className="px-3 py-2 rounded-custom border border-border text-xs text-gray-300 hover:text-white disabled:opacity-50"
+                    >
+                      Reset to Global Defaults
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!botRisk || !selectedBotId || riskSaving}
+                      onClick={() => void resetBotRisk('template')}
+                      className="px-3 py-2 rounded-custom border border-primary/40 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
+                    >
+                      Reset to Template Defaults
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!botRisk || !selectedBotId || riskSaving}
+                      onClick={() => void saveBotRisk()}
+                      className="px-3 py-2 rounded-custom bg-primary text-black text-xs font-bold uppercase tracking-widest disabled:opacity-50"
+                    >
+                      Save bot risk
+                    </button>
+                  </div>
+                </div>
+                {botRisk ? (
+                  <RiskFields value={botRisk} onChange={(next) => setBotRisk(cloneRiskSettings(next))} />
+                ) : (
+                  <p className="text-sm text-gray-500">Select a bot to edit its risk profile.</p>
+                )}
+              </section>
             </div>
           </div>
         </div>

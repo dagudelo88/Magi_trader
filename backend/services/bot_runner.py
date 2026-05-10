@@ -55,6 +55,8 @@ from database import (
 from trading.app_settings import get_execution_mode, is_global_halt
 from trading.bot_performance import compute_strategy_performance
 from trading.exchange_factory import build_binance_spot, build_binance_public
+from trading.risk_manager import evaluate_trade_risk
+from trading.risk_settings import get_effective_bot_risk_settings
 from trading.strategies.registry import get_strategy, default_params_for
 from services.websocket_manager import publish_bot_event, ws_manager
 from services.monitoring import monitor
@@ -626,6 +628,22 @@ def _load_running_bots():
     return result
 
 
+def _pause_bot_for_risk(bot_id: str, execution_mode: str, reason: str) -> None:
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE bots SET status = 'paused' WHERE bot_id = ?", (bot_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    _log(bot_id, "warn", execution_mode, f"Risk protection paused bot — {reason}")
+    _emit_bot_event(
+        bot_id,
+        "bot_status_changed",
+        {"status": "paused", "reason": reason, "source": "risk_manager"},
+        priority=True,
+    )
+
+
 def _merge_params(strategy_name: str, raw: str | None) -> dict[str, Any]:
     base = default_params_for(strategy_name)
     if not raw:
@@ -986,9 +1004,64 @@ def _process_bot(
         f"Wallet before trade: {base_cur}={free_base:.8f}  {quote_cur}={free_quote:.4f}",
     )
 
+    consensus_score: float | None = None
+    if isinstance(result.meta, dict):
+        raw_score = result.meta.get("consensus_score")
+        try:
+            consensus_score = float(raw_score) if raw_score is not None else None
+        except (TypeError, ValueError):
+            consensus_score = None
+    if consensus_score is None:
+        consensus_score = _signal_confidence
+
+    initial_budget_for_risk = float(params.get("initial_budget_quote") or 0)
+    if initial_budget_for_risk <= 0:
+        initial_budget_for_risk = max(0.0, free_quote)
+    try:
+        risk_settings = get_effective_bot_risk_settings(bot_id)
+        orders_for_risk = fetch_bot_orders_chronological(bot_id)
+        risk_decision = evaluate_trade_risk(
+            settings=risk_settings,
+            orders_oldest_first=orders_for_risk,
+            symbol=symbol,
+            initial_capital=initial_budget_for_risk,
+            mark_price=last_close,
+            consensus_score=consensus_score,
+            ohlcv=ohlcv,
+            side=str(result.signal),
+        )
+    except Exception as e:
+        _log(bot_id, "error", execution_mode, f"Risk check failed: {e}")
+        _close_decision()
+        return
+
+    if not risk_decision.allowed:
+        reason = risk_decision.reason or "risk protection triggered"
+        if risk_decision.should_pause:
+            _pause_bot_for_risk(bot_id, execution_mode, reason)
+        else:
+            _log(bot_id, "warn", execution_mode, f"Trade skipped — {reason}")
+        _queue_decision(str(result.signal).upper(), _signal_confidence, False)
+        _close_decision()
+        return
+
+    _log(
+        bot_id,
+        "info",
+        execution_mode,
+        "Risk: "
+        f"capital={risk_decision.current_capital or initial_budget_for_risk:.4f} {quote_cur} "
+        f"risk={risk_decision.risk_pct or 0.0:.2f}% "
+        f"size_mult={risk_decision.size_multiplier:.2f} "
+        f"dd={risk_decision.drawdown_pct or 0.0:.2f}% "
+        f"daily_pnl={risk_decision.daily_pnl or 0.0:.4f}",
+    )
+
     if result.signal == "buy":
-        quote_fraction = float(params["quote_fraction"])
         initial_budget = float(params.get("initial_budget_quote") or 0)
+        risk_pct = float(risk_decision.risk_pct or 0.0)
+        capital_ref = max(0.0, float(risk_decision.current_capital or initial_budget_for_risk))
+        target_spend = capital_ref * (risk_pct / 100.0) * float(risk_decision.size_multiplier)
 
         if initial_budget > 0:
             # Budget-constrained: only trade within the configured budget
@@ -1008,7 +1081,7 @@ def _process_bot(
             # Use 2% buffer on the minimum so price slippage between snapshot and fill
             # can't push the executed notional below the exchange minimum.
             min_spend = min_cost * 1.02 if min_cost > 0 else 0.0
-            spend = min(quote_fraction * remaining_budget, remaining_budget, free_quote)
+            spend = min(target_spend, remaining_budget, free_quote)
             if spend < min_spend:
                 spend = min_spend
             _log(bot_id, "info", execution_mode,
@@ -1016,7 +1089,7 @@ def _process_bot(
         else:
             # No budget configured — use exchange wallet as fallback
             min_spend = min_cost * 1.02 if min_cost > 0 else 0.0
-            spend = free_quote * quote_fraction
+            spend = min(target_spend, free_quote)
             if spend < min_spend:
                 _log(bot_id, "warn", execution_mode,
                      f"BUY skipped — spend {spend:.4f} {quote_cur} below exchange minimum {min_cost} {quote_cur}")
@@ -1051,7 +1124,8 @@ def _process_bot(
         budget_ref = remaining_budget if initial_budget > 0 else free_quote
         _log(bot_id, "info", execution_mode,
              f"BUY order: spending ~{actual_spend:.4f} {quote_cur} "
-             f"({quote_fraction*100:.1f}% of {budget_ref:.4f} {quote_cur} remaining) @ ~{last_close:.2f}")
+             f"({risk_pct:.2f}% risk of {capital_ref:.4f} {quote_cur}; "
+             f"cap_ref={budget_ref:.4f}) @ ~{last_close:.2f}")
         _close_decision()
         t_trade0 = time.perf_counter()
         trade_phase_ms: dict[str, float] = {}

@@ -3,6 +3,12 @@ import { Link } from 'react-router-dom';
 import { API_BASE } from '../config';
 import { BOT_TEMPLATES, SUPPORTED_SYMBOLS, type BotTemplate } from '../botTemplates';
 import { useRealtimeStore, type BotRow } from '../stores/realtimeStore';
+import {
+  effectiveRiskPct,
+  templateRiskDefaults,
+  validateRiskSettings,
+  type RiskSettings,
+} from '../riskSettings';
 
 const STATUS_BADGE: Record<string, string> = {
   running: 'bg-green-500/20 text-green-400 border border-green-500/30',
@@ -30,6 +36,7 @@ interface CreateConfig {
   budget: string;
   /** Active voter list for ensemble templates (ignored for non-ensemble). */
   voters: string[];
+  riskSettings: RiskSettings;
 }
 
 /** All strategies that can act as voters (leaf strategies only — no ensembles). */
@@ -142,6 +149,7 @@ export default function BotsList() {
       symbol: tpl.defaultSymbol,
       budget: '',
       voters: defaultVoters,
+      riskSettings: templateRiskDefaults(tpl.strategy),
     });
     setCreateError(null);
     setCreateStep('configure');
@@ -166,6 +174,11 @@ export default function BotsList() {
       setCreateError('Select at least 2 voters for an ensemble bot.');
       return;
     }
+    const riskError = validateRiskSettings(createConfig.riskSettings);
+    if (riskError) {
+      setCreateError(riskError);
+      return;
+    }
 
     setCreateBusy(true);
     try {
@@ -184,6 +197,7 @@ export default function BotsList() {
           strategy: createConfig.template.strategy,
           initial_budget_quote: budget,
           strategy_params: strategyParams,
+          risk_settings: createConfig.riskSettings,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -575,6 +589,7 @@ export default function BotsList() {
                     )}
                     {' '}· buy {createConfig.params.quote_fraction !== undefined ? `${(createConfig.params.quote_fraction as number) * 100}%` : '…'}
                     · sell {createConfig.params.base_fraction !== undefined ? `${(createConfig.params.base_fraction as number) * 100}%` : '…'}
+                    · risk {createConfig.riskSettings.base_risk_pct}% base
                   </span>
                 </div>
 
@@ -665,6 +680,162 @@ export default function BotsList() {
                     Capital allocated to this bot. Used to track ROI and max drawdown.
                   </span>
                 </label>
+
+                <div className="rounded-lg border border-[#2a2a2a] bg-black/25 p-4">
+                  <div className="mb-3 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[11px] font-black uppercase tracking-widest text-primary">
+                        Risk Profile
+                      </p>
+                      <p className="mt-1 text-[10px] text-gray-500">
+                        Pre-filled from the selected template. You can tune it now or later in CONFIG.
+                      </p>
+                    </div>
+                    <div className="text-right font-mono text-[10px] text-gray-400">
+                      <div>base {createConfig.riskSettings.base_risk_pct}%</div>
+                      <div>strong {effectiveRiskPct(createConfig.riskSettings, 0.9).toFixed(2)}%</div>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wider text-gray-500">
+                      Base risk %
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        value={createConfig.riskSettings.base_risk_pct}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, base_risk_pct: Number(e.target.value) },
+                            }),
+                          )
+                        }
+                        className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wider text-gray-500">
+                      Daily loss %
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        value={createConfig.riskSettings.daily_loss_limit_pct}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, daily_loss_limit_pct: Number(e.target.value) },
+                            }),
+                          )
+                        }
+                        className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wider text-gray-500">
+                      Max drawdown %
+                      <input
+                        type="number"
+                        step="0.1"
+                        min="0.1"
+                        value={createConfig.riskSettings.max_drawdown_pct}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, max_drawdown_pct: Number(e.target.value) },
+                            }),
+                          )
+                        }
+                        className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                      />
+                    </label>
+                    <label className="flex flex-col gap-1 text-[10px] uppercase tracking-wider text-gray-500">
+                      Consecutive losses
+                      <input
+                        type="number"
+                        step="1"
+                        min="1"
+                        value={createConfig.riskSettings.consecutive_loss_limit}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: {
+                                ...c.riskSettings,
+                                consecutive_loss_limit: Number.parseInt(e.target.value, 10),
+                              },
+                            }),
+                          )
+                        }
+                        className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none"
+                      />
+                    </label>
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-[10px] uppercase tracking-wider text-gray-500">
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={createConfig.riskSettings.enable_daily_loss_limit}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, enable_daily_loss_limit: e.target.checked },
+                            }),
+                          )
+                        }
+                      />
+                      Daily loss
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={createConfig.riskSettings.enable_drawdown_protection}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, enable_drawdown_protection: e.target.checked },
+                            }),
+                          )
+                        }
+                      />
+                      Drawdown
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={createConfig.riskSettings.enable_consecutive_loss}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, enable_consecutive_loss: e.target.checked },
+                            }),
+                          )
+                        }
+                      />
+                      Loss streak
+                    </label>
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={createConfig.riskSettings.enable_dynamic_sizing}
+                        onChange={(e) =>
+                          setCreateConfig((c) =>
+                            c && ({
+                              ...c,
+                              riskSettings: { ...c.riskSettings, enable_dynamic_sizing: e.target.checked },
+                            }),
+                          )
+                        }
+                      />
+                      Dynamic sizing
+                    </label>
+                  </div>
+                </div>
 
                 <div className="flex gap-2 pt-1">
                   <button type="submit" disabled={createBusy}

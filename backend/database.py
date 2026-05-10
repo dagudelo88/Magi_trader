@@ -616,6 +616,28 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_bot_orders_bot_time ON bot_orders(bot_id, created_at DESC)"
     )
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_risk_settings (
+            bot_id TEXT PRIMARY KEY,
+            base_risk_pct REAL NOT NULL,
+            dynamic_tiers_json TEXT NOT NULL,
+            daily_loss_limit_pct REAL NOT NULL,
+            max_drawdown_pct REAL NOT NULL,
+            consecutive_loss_limit INTEGER NOT NULL,
+            enable_daily_loss_limit INTEGER NOT NULL DEFAULT 1,
+            enable_drawdown_protection INTEGER NOT NULL DEFAULT 1,
+            enable_consecutive_loss INTEGER NOT NULL DEFAULT 1,
+            enable_dynamic_sizing INTEGER NOT NULL DEFAULT 1,
+            enable_volatility_pause INTEGER NOT NULL DEFAULT 0,
+            volatility_threshold REAL,
+            drawdown_action TEXT NOT NULL DEFAULT 'reduce',
+            drawdown_reduce_factor REAL NOT NULL DEFAULT 0.5,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            FOREIGN KEY (bot_id) REFERENCES bots(bot_id)
+        )
+    """)
+
     # Migration: add created_at to bot_decisions so rows can be time-bounded for
     # archival and ML training queries.  Old rows will have NULL; new rows are
     # stamped by batch_record_bot_decisions().
@@ -1035,6 +1057,39 @@ def fork_bot(
                 now,
             ),
         )
+        cur.execute("SELECT * FROM bot_risk_settings WHERE bot_id = ?", (source_bot_id,))
+        risk_row = cur.fetchone()
+        if risk_row:
+            risk = _row_to_dict(risk_row)
+            cur.execute(
+                """
+                INSERT INTO bot_risk_settings (
+                    bot_id, base_risk_pct, dynamic_tiers_json, daily_loss_limit_pct,
+                    max_drawdown_pct, consecutive_loss_limit, enable_daily_loss_limit,
+                    enable_drawdown_protection, enable_consecutive_loss,
+                    enable_dynamic_sizing, enable_volatility_pause, volatility_threshold,
+                    drawdown_action, drawdown_reduce_factor, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_id,
+                    risk["base_risk_pct"],
+                    risk["dynamic_tiers_json"],
+                    risk["daily_loss_limit_pct"],
+                    risk["max_drawdown_pct"],
+                    risk["consecutive_loss_limit"],
+                    risk["enable_daily_loss_limit"],
+                    risk["enable_drawdown_protection"],
+                    risk["enable_consecutive_loss"],
+                    risk["enable_dynamic_sizing"],
+                    risk["enable_volatility_pause"],
+                    risk["volatility_threshold"],
+                    risk["drawdown_action"],
+                    risk["drawdown_reduce_factor"],
+                    now,
+                    now,
+                ),
+            )
         conn.commit()
         return {
             "new_bot_id": new_id,
@@ -1528,6 +1583,83 @@ def create_bot(
         conn.close()
 
 
+def get_bot_risk_settings(bot_id: str) -> dict[str, Any] | None:
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM bot_risk_settings WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_bot_risk_settings(bot_id: str, settings: dict[str, Any]) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    dynamic_tiers = settings.get("dynamic_tiers_json")
+    if dynamic_tiers is None:
+        dynamic_tiers = json.dumps(settings.get("dynamic_tiers", []), default=str)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM bots WHERE bot_id = ?", (bot_id,))
+        if cur.fetchone() is None:
+            raise ValueError(f"bot not found: {bot_id!r}")
+        cur.execute(
+            """
+            INSERT INTO bot_risk_settings (
+                bot_id, base_risk_pct, dynamic_tiers_json, daily_loss_limit_pct,
+                max_drawdown_pct, consecutive_loss_limit, enable_daily_loss_limit,
+                enable_drawdown_protection, enable_consecutive_loss,
+                enable_dynamic_sizing, enable_volatility_pause, volatility_threshold,
+                drawdown_action, drawdown_reduce_factor, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bot_id) DO UPDATE SET
+                base_risk_pct = excluded.base_risk_pct,
+                dynamic_tiers_json = excluded.dynamic_tiers_json,
+                daily_loss_limit_pct = excluded.daily_loss_limit_pct,
+                max_drawdown_pct = excluded.max_drawdown_pct,
+                consecutive_loss_limit = excluded.consecutive_loss_limit,
+                enable_daily_loss_limit = excluded.enable_daily_loss_limit,
+                enable_drawdown_protection = excluded.enable_drawdown_protection,
+                enable_consecutive_loss = excluded.enable_consecutive_loss,
+                enable_dynamic_sizing = excluded.enable_dynamic_sizing,
+                enable_volatility_pause = excluded.enable_volatility_pause,
+                volatility_threshold = excluded.volatility_threshold,
+                drawdown_action = excluded.drawdown_action,
+                drawdown_reduce_factor = excluded.drawdown_reduce_factor,
+                updated_at = excluded.updated_at
+            """,
+            (
+                bot_id,
+                float(settings["base_risk_pct"]),
+                str(dynamic_tiers),
+                float(settings["daily_loss_limit_pct"]),
+                float(settings["max_drawdown_pct"]),
+                int(settings["consecutive_loss_limit"]),
+                1 if settings.get("enable_daily_loss_limit") else 0,
+                1 if settings.get("enable_drawdown_protection") else 0,
+                1 if settings.get("enable_consecutive_loss") else 0,
+                1 if settings.get("enable_dynamic_sizing") else 0,
+                1 if settings.get("enable_volatility_pause") else 0,
+                (
+                    float(settings["volatility_threshold"])
+                    if settings.get("volatility_threshold") is not None
+                    else None
+                ),
+                str(settings.get("drawdown_action") or "reduce"),
+                float(settings.get("drawdown_reduce_factor") or 0.5),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM bot_risk_settings WHERE bot_id = ?", (bot_id,))
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
 def set_bot_execution_mode(bot_id: str, execution_mode: str) -> dict[str, Any]:
     """
     Switch a bot between 'testnet' and 'live'.
@@ -1596,6 +1728,7 @@ def delete_bot(bot_id: str) -> None:
             raise ValueError(f"bot not found: {bot_id!r}")
         if row["status"] == "running":
             raise ValueError("stop the bot before deleting it")
+        cur.execute("DELETE FROM bot_risk_settings WHERE bot_id = ?", (bot_id,))
         cur.execute("DELETE FROM bot_logs WHERE bot_id = ?", (bot_id,))
         cur.execute("DELETE FROM bot_orders WHERE bot_id = ?", (bot_id,))
         cur.execute("DELETE FROM bots WHERE bot_id = ?", (bot_id,))

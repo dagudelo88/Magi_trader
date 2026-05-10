@@ -15,9 +15,11 @@ class TestSyncOrdersFromLogs(unittest.TestCase):
         self._tmp.close()
         self._patch = patch.object(db, "DB_PATH", self._tmp.name)
         self._patch.start()
+        db._pool = None
         db.init_db()
 
     def tearDown(self) -> None:
+        db._pool = None
         self._patch.stop()
         try:
             os.unlink(self._tmp.name)
@@ -60,9 +62,22 @@ class TestDatabaseBotOrders(unittest.TestCase):
         self._tmp.close()
         self._patch = patch.object(db, "DB_PATH", self._tmp.name)
         self._patch.start()
+        db._pool = None
         db.init_db()
+        conn = db.get_db_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO bots (bot_id, name, symbol, strategy, status, execution_mode, created_at)
+                VALUES ('1', 'Test bot', 'BTC/USDT', 'sma_cross', 'stopped', 'testnet', 1)
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def tearDown(self) -> None:
+        db._pool = None
         self._patch.stop()
         try:
             os.unlink(self._tmp.name)
@@ -158,6 +173,33 @@ class TestDatabaseBotOrders(unittest.TestCase):
             self.assertEqual(cur.fetchone()["strategy_params_json"], custom)
         finally:
             conn.close()
+
+    def test_risk_settings_copy_on_fork_and_delete(self) -> None:
+        db.upsert_bot_risk_settings(
+            "1",
+            {
+                "base_risk_pct": 1.5,
+                "dynamic_tiers": [{"min_score": None, "max_score": None, "multiplier": 1.0}],
+                "daily_loss_limit_pct": 5,
+                "max_drawdown_pct": 12,
+                "consecutive_loss_limit": 10,
+                "enable_daily_loss_limit": True,
+                "enable_drawdown_protection": True,
+                "enable_consecutive_loss": True,
+                "enable_dynamic_sizing": True,
+                "enable_volatility_pause": False,
+                "volatility_threshold": None,
+                "drawdown_action": "reduce",
+                "drawdown_reduce_factor": 0.5,
+            },
+        )
+        r = db.fork_bot("1", name="Risk copy")
+        copied = db.get_bot_risk_settings(r["new_bot_id"])
+        self.assertIsNotNone(copied)
+        self.assertEqual(copied["base_risk_pct"], 1.5)
+
+        db.delete_bot(r["new_bot_id"])
+        self.assertIsNone(db.get_bot_risk_settings(r["new_bot_id"]))
 
 
 if __name__ == "__main__":

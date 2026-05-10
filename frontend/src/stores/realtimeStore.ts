@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { API_BASE } from '../config';
 import { TRACKED_STREAM_IDS_FALLBACK, TRACKED_TICKER_SYMBOLS_FALLBACK } from '../trackedMarketsFallback';
 import type { MagiWebSocketMessage, WebSocketStatus } from '../hooks/useMagiWebSocket';
+import type { RiskSettings } from '../riskSettings';
 
 export type NetworkView = 'testnet' | 'live';
 
@@ -33,6 +34,7 @@ export interface BotRow {
   realized_pnl_quote: number | null;
   win_rate_pct: number | null;
   closed_trades: number | null;
+  risk_settings?: RiskSettings;
 }
 
 export interface TradingSettings {
@@ -49,6 +51,7 @@ export interface BotRecord {
   status: string;
   execution_mode: string;
   strategy_params_json: string | null;
+  risk_settings?: RiskSettings;
 }
 
 export interface BotLogRow {
