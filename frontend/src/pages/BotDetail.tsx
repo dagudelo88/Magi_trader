@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import { Copy, ChevronDown, Info, Settings, X } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
@@ -49,15 +49,6 @@ function formatLogTimeExec(ms: number) {
     return localDateTimeStr(new Date(ms), true);
   } catch {
     return String(ms);
-  }
-}
-
-function formatParamsJson(raw: string | null) {
-  if (!raw) return '—';
-  try {
-    return JSON.stringify(JSON.parse(raw), null, 2);
-  } catch {
-    return raw;
   }
 }
 
@@ -302,6 +293,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
 
   const signalMap = Object.fromEntries(liveSignals.map((s) => [s.voter_name, s]));
   const hasLiveData = liveSignals.length > 0;
+  const consensusScore = liveSignals.find((s) => s.consensus_score != null)?.consensus_score ?? null;
 
   // Compute weighted buy/sell/hold totals from live signals
   const weightedTotals = { buy: 0, sell: 0, hold: 0 };
@@ -325,22 +317,35 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
     : `≥${(consensusThreshold * 100).toFixed(0)}%`;
 
   return (
-    <div className="border-b border-magi-grid/15 px-4 py-4">
+    <div className="border-b border-magi-grid/15 px-4 py-5">
       {/* Section header */}
-      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/50">
+          <span className="font-label text-[10px] uppercase tracking-widest text-magi-muted/55">
             Voter Council
           </span>
-          <span className="font-label text-[9px] font-bold text-magi-primary/70 border border-magi-primary/20 bg-magi-primary/8 px-1.5 py-0.5 rounded">
+          <span className="font-label rounded border border-magi-primary/20 bg-magi-primary/8 px-2 py-0.5 text-[10px] font-bold text-magi-primary/75">
             {voters.length} voters
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/40">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {consensusScore != null && (
+            <span
+              className={`font-label rounded border px-2 py-0.5 text-[10px] font-black uppercase tracking-widest ${
+                consensusSignal === 'buy'
+                  ? 'border-emerald-400/30 bg-emerald-500/10 text-emerald-300'
+                  : consensusSignal === 'sell'
+                    ? 'border-red-400/30 bg-red-500/10 text-red-300'
+                    : 'border-magi-grid/30 bg-magi-grid/10 text-magi-muted/70'
+              }`}
+            >
+              Score {(consensusScore * 100).toFixed(1)}%
+            </span>
+          )}
+          <span className="font-label text-[10px] uppercase tracking-widest text-magi-muted/45">
             {consensusMode}
           </span>
-          <span className="font-mono text-[9px] text-magi-muted/40">
+          <span className="font-mono text-[10px] text-magi-muted/45">
             {thresholdLabel}
           </span>
         </div>
@@ -348,12 +353,12 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
 
       {/* Consensus visualisation */}
       {hasLiveData && (
-        <div className="mb-3">
+        <div className="mb-4">
           {isDirectionalNet ? (
             // directional_net: centered bar showing (buy_w - sell_w) / total_w
             // Center = 0, left = sell pressure, right = buy pressure
             <div>
-              <div className="relative h-2 w-full rounded-full bg-magi-grid/20 overflow-hidden">
+              <div className="relative h-2.5 w-full overflow-hidden rounded-full bg-magi-grid/20">
                 {/* center baseline */}
                 <div className="absolute inset-y-0 left-1/2 w-px bg-magi-grid/60" />
                 {/* threshold markers */}
@@ -378,7 +383,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
                   />
                 ) : null}
               </div>
-              <div className="mt-1 flex items-center justify-between font-label text-[8px] text-magi-muted/50">
+              <div className="mt-1.5 flex items-center justify-between font-label text-[9px] text-magi-muted/55">
                 <span className="text-red-400/80">SELL</span>
                 <span className={`font-black ${
                   consensusSignal === 'buy' ? 'text-emerald-400' :
@@ -392,7 +397,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
           ) : (
             // Classic modes: show raw vote share bar
             <div>
-              <div className="flex h-1.5 w-full overflow-hidden rounded-full">
+              <div className="flex h-2.5 w-full overflow-hidden rounded-full">
                 {weightedTotals.buy > 0 && (
                   <div className="bg-emerald-400 transition-all"
                     style={{ width: `${(weightedTotals.buy / totalWeight) * 100}%` }} />
@@ -406,7 +411,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
                     style={{ width: `${(weightedTotals.sell / totalWeight) * 100}%` }} />
                 )}
               </div>
-              <div className="mt-1 flex justify-between font-label text-[8px] text-magi-muted/50">
+              <div className="mt-1.5 flex justify-between font-label text-[9px] text-magi-muted/55">
                 <span className="text-emerald-400/80">
                   B {totalWeight > 0 ? ((weightedTotals.buy / totalWeight) * 100).toFixed(0) : 0}%
                 </span>
@@ -426,7 +431,7 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
       )}
 
       {/* Voter grid */}
-      <div className="grid grid-cols-2 gap-1.5">
+      <div className="grid grid-cols-2 gap-2">
         {voters.map((voterId) => {
           const meta = VOTER_META[voterId] ?? { label: voterId, role: 'Other' };
           const roleColor = ROLE_COLORS[meta.role] ?? 'text-magi-muted border-magi-grid/30 bg-magi-grid/5';
@@ -439,20 +444,20 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
           return (
             <div
               key={voterId}
-              className={`relative flex flex-col gap-1.5 rounded border px-2.5 py-2 transition-colors ${
+              className={`relative flex flex-col gap-2 rounded border px-3 py-2.5 transition-colors ${
                 signalStyle ?? roleColor
               }`}
             >
               {sig && (
-                <span className={`absolute top-1.5 right-1.5 h-1.5 w-1.5 rounded-full ${SIGNAL_DOT[sig]}`} />
+                <span className={`absolute right-2 top-2 h-2 w-2 rounded-full ${SIGNAL_DOT[sig]}`} />
               )}
               <div className="flex items-start justify-between gap-1 min-w-0 pr-3">
-                <p className="font-label text-[10px] font-black truncate leading-tight">
+                <p className="truncate font-label text-[11px] font-black leading-tight">
                   {meta.label}
                 </p>
               </div>
               {sig ? (
-                <span className={`self-start font-label text-[9px] font-black uppercase tracking-wider px-1.5 py-0.5 rounded border ${signalStyle}`}>
+                <span className={`self-start rounded border px-2 py-0.5 font-label text-[10px] font-black uppercase tracking-wider ${signalStyle}`}>
                   {sig}
                   {live.confidence != null && (
                     <span className="ml-1 opacity-70 font-normal normal-case">
@@ -461,18 +466,18 @@ function VoterCouncil({ ensemble, liveSignals, lastUpdated }: VoterCouncilProps)
                   )}
                 </span>
               ) : (
-                <span className="font-label text-[8px] font-bold uppercase tracking-wide opacity-50">
+                <span className="font-label text-[9px] font-bold uppercase tracking-wide opacity-50">
                   {meta.role}
                 </span>
               )}
               <div className="flex items-center gap-1.5">
-                <div className="flex-1 h-0.5 rounded-full bg-current opacity-20 overflow-hidden">
+                <div className="h-1 flex-1 overflow-hidden rounded-full bg-current opacity-20">
                   <div
                     className="h-full rounded-full bg-current opacity-80 transition-all"
                     style={{ width: `${weightPct}%` }}
                   />
                 </div>
-                <span className="font-mono text-[8px] opacity-50 shrink-0">
+                <span className="shrink-0 font-mono text-[9px] opacity-50">
                   {weight.toFixed(1)}×
                 </span>
               </div>
@@ -599,7 +604,6 @@ function PortfolioDistribution({
 
 export default function BotDetail() {
   const { id } = useParams();
-  const navigate = useNavigate();
   const detail = useRealtimeStore((state) => (id ? state.botDetailsById[id] : undefined));
   const loadBotDetail = useRealtimeStore((state) => state.loadBotDetail);
   const loadTradeSummary = useRealtimeStore((state) => state.loadTradeSummary);
@@ -615,12 +619,7 @@ export default function BotDetail() {
   const [actionError, setActionError] = useState<string | null>(null);
   const error = actionError ?? detail?.error ?? null;
   const [busy, setBusy] = useState(false);
-  const [budgetDraft, setBudgetDraft] = useState('');
-  const [budgetBusy, setBudgetBusy] = useState(false);
   const [yoloBusy, setYoloBusy] = useState(false);
-  const [forkApplyBudget, setForkApplyBudget] = useState(false);
-  const [forkBusy, setForkBusy] = useState(false);
-  const [forkNameDraft, setForkNameDraft] = useState('');
   const [showPromoteModal, setShowPromoteModal] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
   const [activeConfigTab, setActiveConfigTab] = useState<ConfigTab>('risk');
@@ -684,12 +683,6 @@ export default function BotDetail() {
     const t = window.setInterval(() => void fetchTradeSummary(), 30_000);
     return () => window.clearInterval(t);
   }, [detailWs.isFallbackPolling, id, bot?.status, historyView, fetchTradeSummary]);
-
-  useEffect(() => {
-    const b = strategyHealth?.initial_budget_quote;
-    if (b != null && b > 0) setBudgetDraft(String(b));
-    else setBudgetDraft('');
-  }, [strategyHealth?.initial_budget_quote, id]);
 
   useEffect(() => {
     setFollowLogBottom(true);
@@ -893,85 +886,6 @@ export default function BotDetail() {
     const timer = setInterval(() => void loadVoterSignals(id), 30_000);
     return () => clearInterval(timer);
   }, [id, isEnsemble, detailWs.isFallbackPolling, loadVoterSignals]);
-
-  const forkNewBotInstance = async () => {
-    if (!id) return;
-    const msg =
-      'Create a new bot instance from this one? This bot\u2019s orders and logs stay here forever; the new bot gets a new id and starts with empty history. The exchange is unchanged.';
-    if (!window.confirm(msg)) return;
-    setForkBusy(true);
-    setActionError(null);
-    try {
-      const payload: Record<string, unknown> = {};
-      if (forkNameDraft.trim()) payload.name = forkNameDraft.trim();
-      if (forkApplyBudget) {
-        const trimmed = budgetDraft.trim();
-        if (trimmed === '') payload.initial_budget_quote = null;
-        else {
-          const n = Number.parseFloat(trimmed);
-          if (!Number.isFinite(n) || n < 0) {
-            setActionError('Initial capital must be empty (clear) or a non-negative number when applying on fork.');
-            setForkBusy(false);
-            return;
-          }
-          payload.initial_budget_quote = n === 0 ? null : n;
-        }
-      }
-      const res = await fetch(`${API_BASE}/api/bots/${id}/fork`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok)
-        throw new Error(typeof data.detail === 'string' ? data.detail : 'Fork failed');
-      const newId = data.new_bot_id as string | undefined;
-      if (!newId) throw new Error('No new_bot_id in response');
-      navigate(`/bots/${newId}`);
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Fork failed');
-    } finally {
-      setForkBusy(false);
-    }
-  };
-
-  const saveInitialBudget = async () => {
-    if (!id) return;
-    const trimmed = budgetDraft.trim();
-    const body =
-      trimmed === ''
-        ? { initial_budget_quote: null }
-        : { initial_budget_quote: Number.parseFloat(trimmed) };
-    if (trimmed !== '' && !Number.isFinite(body.initial_budget_quote as number)) {
-      setActionError('Initial capital must be a number');
-      return;
-    }
-    if (
-      trimmed !== '' &&
-      typeof body.initial_budget_quote === 'number' &&
-      body.initial_budget_quote < 0
-    ) {
-      setActionError('Initial capital cannot be negative');
-      return;
-    }
-    setBudgetBusy(true);
-    setActionError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/bots/${id}/strategy-params`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok)
-        throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to save initial capital');
-      await refresh();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Save failed');
-    } finally {
-      setBudgetBusy(false);
-    }
-  };
 
   const promoteBot = async (targetMode: 'testnet' | 'live') => {
     if (!id) return;
@@ -1295,74 +1209,6 @@ export default function BotDetail() {
             </div>
           )}
 
-          {/* Initial capital */}
-          <details className="border-b border-magi-grid/20 open:border-magi-primary/20" open>
-            <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/80 hover:text-magi-primary">
-              Initial Capital &amp; New Instance
-            </summary>
-            <div className="border-t border-magi-grid/20 px-4 py-4 flex flex-col gap-4">
-              <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
-                <label className="flex flex-col gap-1.5 uppercase tracking-wider">
-                  <span className="text-magi-muted/50">Initial capital ({qc})</span>
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    placeholder="e.g. 1000"
-                    value={budgetDraft}
-                    onChange={(e) => setBudgetDraft(e.target.value)}
-                    className="rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-base text-magi-on-bg focus:border-magi-primary/50 focus:outline-none"
-                  />
-                </label>
-                <button
-                  type="button"
-                  disabled={budgetBusy}
-                  onClick={() => void saveInitialBudget()}
-                  className="rounded border border-magi-primary/40 bg-magi-primary/15 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/25 disabled:opacity-40"
-                >
-                  {budgetBusy ? '…' : 'Save initial capital'}
-                </button>
-              </div>
-              <div className="flex flex-col gap-3 font-label text-[11px] text-magi-muted/85">
-                <label className="flex flex-col gap-1.5 uppercase tracking-wider">
-                  <span className="text-magi-muted/50">New instance name</span>
-                  <input
-                    type="text"
-                    placeholder={`${bot?.name ?? 'Bot'} (copy)`}
-                    value={forkNameDraft}
-                    onChange={(e) => setForkNameDraft(e.target.value)}
-                    className="rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-base text-magi-on-bg focus:border-magi-primary/50 focus:outline-none"
-                  />
-                </label>
-                <label className="flex cursor-pointer items-start gap-2 text-[10px] uppercase leading-snug tracking-wide text-magi-muted/70">
-                  <input
-                    type="checkbox"
-                    checked={forkApplyBudget}
-                    onChange={(e) => setForkApplyBudget(e.target.checked)}
-                    className="mt-0.5 border-magi-grid/40"
-                  />
-                  <span>Apply initial capital on fork</span>
-                </label>
-                <button
-                  type="button"
-                  disabled={forkBusy}
-                  onClick={() => void forkNewBotInstance()}
-                  className="rounded border border-magi-tertiary/50 bg-magi-tertiary/15 px-3 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-tertiary hover:bg-magi-tertiary/25 disabled:opacity-40"
-                >
-                  {forkBusy ? '…' : 'New instance →'}
-                </button>
-              </div>
-            </div>
-          </details>
-
-          {/* Strategy Params raw */}
-          <details className="border-b border-magi-grid/20 open:border-magi-primary/20">
-            <summary className="cursor-pointer px-4 py-3 font-label text-[11px] font-bold uppercase tracking-widest text-magi-primary/60 hover:text-magi-primary">
-              Strategy Params (raw)
-            </summary>
-            <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all border-t border-magi-grid/20 p-4 font-mono text-[10px] text-magi-on-bg/80">
-              {formatParamsJson(bot?.strategy_params_json ?? null)}
-            </pre>
-          </details>
         </div>
 
         {/* ── CENTER: Chart + Stats + Execution history ─────── */}
