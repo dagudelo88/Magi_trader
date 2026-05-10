@@ -4,7 +4,7 @@ export interface DynamicRiskTier {
   multiplier: number;
 }
 
-export type DrawdownAction = 'reduce' | 'pause';
+export type DrawdownAction = 'reduce' | 'pause' | 'stop';
 
 export interface RiskSettings {
   base_risk_pct: number;

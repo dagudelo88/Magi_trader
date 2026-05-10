@@ -137,8 +137,8 @@ def normalize_risk_settings(
         raise ValueError("max_drawdown_pct must be positive")
     if consecutive_loss_limit <= 0:
         raise ValueError("consecutive_loss_limit must be positive")
-    if drawdown_action not in {"reduce", "pause"}:
-        raise ValueError("drawdown_action must be 'reduce' or 'pause'")
+    if drawdown_action not in {"reduce", "pause", "stop"}:
+        raise ValueError("drawdown_action must be 'reduce', 'pause', or 'stop'")
     if drawdown_reduce_factor is None or not (0 < drawdown_reduce_factor <= 1):
         raise ValueError("drawdown_reduce_factor must be > 0 and <= 1")
     if volatility_threshold is not None and volatility_threshold <= 0:

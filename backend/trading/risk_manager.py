@@ -18,6 +18,7 @@ class RiskDecision:
     allowed: bool
     reason: str | None = None
     should_pause: bool = False
+    should_stop: bool = False
     size_multiplier: float = 1.0
     risk_pct: float | None = None
     current_capital: float | None = None
@@ -271,14 +272,15 @@ def evaluate_trade_risk(
         and drawdown >= float(cfg["max_drawdown_pct"])
         and drawdown > drawdown_baseline + 1e-9
     ):
-        if cfg["drawdown_action"] == "pause":
+        if cfg["drawdown_action"] in {"pause", "stop"}:
             return RiskDecision(
                 allowed=False,
                 reason=(
                     f"drawdown protection triggered ({drawdown:.2f}% >= "
                     f"{float(cfg['max_drawdown_pct']):.2f}%)"
                 ),
-                should_pause=True,
+                should_pause=cfg["drawdown_action"] == "pause",
+                should_stop=cfg["drawdown_action"] == "stop",
                 risk_pct=risk_pct,
                 current_capital=current_capital,
                 daily_pnl=daily_pnl,

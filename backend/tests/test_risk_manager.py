@@ -122,6 +122,32 @@ class TestRiskManager(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertAlmostEqual(decision.size_multiplier, 0.5)
 
+    def test_drawdown_stop_blocks_and_requests_stop(self) -> None:
+        settings = normalize_risk_settings(
+            {
+                **DEFAULT_RISK_SETTINGS,
+                "max_drawdown_pct": 1,
+                "drawdown_action": "stop",
+            }
+        )
+        orders = [
+            _o("buy", amount=1, cost=1000, average=1000, created_at=1),
+            _o("sell", amount=1, cost=900, average=900, created_at=2),
+        ]
+        decision = evaluate_trade_risk(
+            settings=settings,
+            orders_oldest_first=orders,
+            symbol="BTC/USDT",
+            initial_capital=1000,
+            mark_price=900,
+            consensus_score=0.50,
+            ohlcv=[],
+            side="buy",
+        )
+        self.assertFalse(decision.allowed)
+        self.assertFalse(decision.should_pause)
+        self.assertTrue(decision.should_stop)
+
     def test_yolo_bypasses_protections_but_keeps_dynamic_sizing(self) -> None:
         now_ms = 1_700_000_100_000
         settings = normalize_risk_settings(

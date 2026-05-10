@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { Copy, ChevronDown, Info } from 'lucide-react';
+import { Copy, ChevronDown, Info, Settings, X } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
 import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
+import {
+  GLOBAL_RISK_DEFAULTS,
+  cloneRiskSettings,
+  validateRiskSettings,
+  type DrawdownAction,
+  type RiskSettings,
+} from '../riskSettings';
 import { botLogIdentity, useRealtimeStore } from '../stores/realtimeStore';
 
 /** Pixels from bottom to consider the user "at" the latest log line. */
@@ -132,6 +139,108 @@ interface EnsembleParams {
   consensusThreshold: number;
 }
 
+type ConfigTab = 'risk' | 'strategy' | 'ensemble';
+type StrategyDraft = Record<string, unknown>;
+type RiskBooleanKey =
+  | 'enable_daily_loss_limit'
+  | 'enable_drawdown_protection'
+  | 'enable_consecutive_loss'
+  | 'enable_dynamic_sizing'
+  | 'enable_volatility_pause'
+  | 'yolo_mode';
+
+const CONSENSUS_MODES = ['directional_net', 'majority', 'weighted_majority', 'threshold', 'weighted'];
+const COMMON_STRATEGY_FIELDS = [
+  'fast_period',
+  'slow_period',
+  'signal_period',
+  'rsi_period',
+  'bb_period',
+  'ohlcv_timeframe',
+  'ohlcv_limit',
+  'quote_fraction',
+  'base_fraction',
+  'min_trade_interval_sec',
+  'target_asset',
+  'lag_lookback_sec',
+];
+const ENSEMBLE_STRATEGY_KEYS = new Set(['voters', 'voter_weights', 'consensus_mode', 'consensus_threshold']);
+const RISK_TOGGLES: Array<{ key: RiskBooleanKey; label: string }> = [
+  { key: 'enable_daily_loss_limit', label: 'Daily loss limit' },
+  { key: 'enable_drawdown_protection', label: 'Drawdown protection' },
+  { key: 'enable_consecutive_loss', label: 'Consecutive loss breaker' },
+  { key: 'enable_dynamic_sizing', label: 'Dynamic sizing' },
+  { key: 'enable_volatility_pause', label: 'Volatility pause' },
+  { key: 'yolo_mode', label: 'YOLO mode' },
+];
+
+function parseStrategyParams(raw: string | null | undefined): StrategyDraft {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as StrategyDraft)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function prettyStrategyParams(params: StrategyDraft) {
+  return JSON.stringify(params, null, 2);
+}
+
+function draftString(value: unknown): string {
+  if (value == null) return '';
+  return typeof value === 'string' ? value : String(value);
+}
+
+function parseStrategyInput(value: string, previous: unknown): unknown {
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  if (typeof previous === 'number') {
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? parsed : previous;
+  }
+  if (typeof previous === 'boolean') return trimmed === 'true';
+  const parsedNumber = Number(trimmed);
+  return Number.isFinite(parsedNumber) && trimmed !== '' && !Number.isNaN(parsedNumber)
+    ? parsedNumber
+    : value;
+}
+
+function consensusPreview(
+  voters: string[],
+  voterWeights: Record<string, number>,
+  liveSignals: LiveVoterSignal[],
+  consensusMode: string,
+  consensusThreshold: number,
+) {
+  const signalMap = Object.fromEntries(liveSignals.map((s) => [s.voter_name, s]));
+  const weightedTotals = { buy: 0, sell: 0, hold: 0 };
+  voters.forEach((voter) => {
+    const signal = signalMap[voter]?.voter_signal ?? 'hold';
+    weightedTotals[signal] += voterWeights[voter] ?? 1.0;
+  });
+  const totalWeight = weightedTotals.buy + weightedTotals.sell + weightedTotals.hold;
+  const net = totalWeight > 0 ? (weightedTotals.buy - weightedTotals.sell) / totalWeight : 0;
+  const buyShare = totalWeight > 0 ? weightedTotals.buy / totalWeight : 0;
+  const sellShare = totalWeight > 0 ? weightedTotals.sell / totalWeight : 0;
+  const signal: 'buy' | 'sell' | 'hold' =
+    consensusMode === 'directional_net'
+      ? net > consensusThreshold
+        ? 'buy'
+        : net < -consensusThreshold
+          ? 'sell'
+          : 'hold'
+      : buyShare >= sellShare && buyShare >= consensusThreshold
+        ? 'buy'
+        : sellShare >= consensusThreshold
+          ? 'sell'
+          : 'hold';
+  return { weightedTotals, totalWeight, net, buyShare, sellShare, signal };
+}
+
 function parseEnsembleParams(raw: string | null): EnsembleParams | null {
   if (!raw) return null;
   try {
@@ -158,6 +267,8 @@ interface LiveVoterSignal {
   consensus_score: number | null;
   timestamp: number;
 }
+
+const EMPTY_VOTER_SIGNALS: LiveVoterSignal[] = [];
 
 const SIGNAL_STYLES: Record<string, string> = {
   buy:  'bg-emerald-500/20 border-emerald-400/50 text-emerald-300',
@@ -504,6 +615,15 @@ export default function BotDetail() {
   const [forkBusy, setForkBusy] = useState(false);
   const [forkNameDraft, setForkNameDraft] = useState('');
   const [showPromoteModal, setShowPromoteModal] = useState(false);
+  const [showConfigModal, setShowConfigModal] = useState(false);
+  const [activeConfigTab, setActiveConfigTab] = useState<ConfigTab>('risk');
+  const [configRiskDraft, setConfigRiskDraft] = useState<RiskSettings | null>(null);
+  const [configStrategyDraft, setConfigStrategyDraft] = useState<StrategyDraft>({});
+  const [configStrategyJsonDraft, setConfigStrategyJsonDraft] = useState('');
+  const [configBudgetDraft, setConfigBudgetDraft] = useState('');
+  const [configBusy, setConfigBusy] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [configSuccess, setConfigSuccess] = useState<string | null>(null);
   const [promoteBusy, setPromoteBusy] = useState(false);
   const [followLogBottom, setFollowLogBottom] = useState(true);
   const [logsCopied, setLogsCopied] = useState(false);
@@ -514,7 +634,7 @@ export default function BotDetail() {
   const [historyView, setHistoryView] = useState<'fills' | 'summary'>('fills');
   const tradeSummary = detail?.tradeSummary ?? null;
   const tradeSummaryLoading = detail?.tradeSummaryLoading ?? false;
-  const liveVoterSignals = detail?.liveVoterSignals ?? [];
+  const liveVoterSignals = detail?.liveVoterSignals ?? EMPTY_VOTER_SIGNALS;
   const voterSignalsUpdatedAt = detail?.voterSignalsUpdatedAt ?? null;
 
   const refresh = useCallback(async () => {
@@ -662,6 +782,104 @@ export default function BotDetail() {
   );
 
   useEffect(() => {
+    if (!showConfigModal) return;
+    const parsed = parseStrategyParams(bot?.strategy_params_json);
+    const risk = bot?.risk_settings ?? GLOBAL_RISK_DEFAULTS;
+    const budget = parsed.initial_budget_quote ?? strategyHealth?.initial_budget_quote ?? null;
+    setConfigRiskDraft(cloneRiskSettings(risk));
+    setConfigStrategyDraft(parsed);
+    setConfigStrategyJsonDraft(prettyStrategyParams(parsed));
+    setConfigBudgetDraft(budget == null ? '' : String(budget));
+    setConfigError(null);
+    setConfigSuccess(null);
+    setActiveConfigTab((current) => (current === 'ensemble' && !isEnsemble ? 'risk' : current));
+  }, [
+    showConfigModal,
+    id,
+    bot?.risk_settings,
+    bot?.strategy_params_json,
+    strategyHealth?.initial_budget_quote,
+    isEnsemble,
+  ]);
+
+  useEffect(() => {
+    if (!showConfigModal) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !configBusy) {
+        setShowConfigModal(false);
+        setConfigError(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showConfigModal, configBusy]);
+
+  const closeConfigModal = useCallback(() => {
+    if (configBusy) return;
+    setShowConfigModal(false);
+    setConfigError(null);
+    setConfigSuccess(null);
+  }, [configBusy]);
+
+  const updateConfigRisk = useCallback(<K extends keyof RiskSettings>(key: K, value: RiskSettings[K]) => {
+    setConfigRiskDraft((current) => (current ? { ...current, [key]: value } : current));
+  }, []);
+
+  const updateStrategyDraft = useCallback((key: string, value: unknown) => {
+    setConfigStrategyDraft((current) => {
+      const next = { ...current, [key]: value };
+      setConfigStrategyJsonDraft(prettyStrategyParams(next));
+      return next;
+    });
+  }, []);
+
+  const editableStrategyKeys = useMemo(() => {
+    const primitiveKeys = Object.entries(configStrategyDraft)
+      .filter(([key, value]) => !ENSEMBLE_STRATEGY_KEYS.has(key) && value !== null && typeof value !== 'object')
+      .map(([key]) => key);
+    const ordered = COMMON_STRATEGY_FIELDS.filter((key) => primitiveKeys.includes(key));
+    const rest = primitiveKeys.filter((key) => key !== 'initial_budget_quote' && !ordered.includes(key)).sort();
+    return [...ordered, ...rest];
+  }, [configStrategyDraft]);
+
+  const configEnsembleParams = useMemo<EnsembleParams | null>(() => {
+    if (!isEnsemble) return null;
+    const voters =
+      Array.isArray(configStrategyDraft.voters) && configStrategyDraft.voters.every((v) => typeof v === 'string')
+        ? (configStrategyDraft.voters as string[])
+        : ensembleParams?.voters ?? [];
+    if (voters.length === 0) return null;
+    const rawWeights = configStrategyDraft.voter_weights;
+    const voterWeights =
+      rawWeights && typeof rawWeights === 'object' && !Array.isArray(rawWeights)
+        ? (rawWeights as Record<string, number>)
+        : ensembleParams?.voterWeights ?? {};
+    return {
+      voters,
+      voterWeights,
+      consensusMode:
+        typeof configStrategyDraft.consensus_mode === 'string'
+          ? configStrategyDraft.consensus_mode
+          : ensembleParams?.consensusMode ?? 'directional_net',
+      consensusThreshold:
+        typeof configStrategyDraft.consensus_threshold === 'number'
+          ? configStrategyDraft.consensus_threshold
+          : ensembleParams?.consensusThreshold ?? 0.15,
+    };
+  }, [configStrategyDraft, ensembleParams, isEnsemble]);
+
+  const configConsensusPreview = useMemo(() => {
+    if (!configEnsembleParams) return null;
+    return consensusPreview(
+      configEnsembleParams.voters,
+      configEnsembleParams.voterWeights,
+      liveVoterSignals,
+      configEnsembleParams.consensusMode,
+      configEnsembleParams.consensusThreshold,
+    );
+  }, [configEnsembleParams, liveVoterSignals]);
+
+  useEffect(() => {
     if (!id || !isEnsemble) return;
     void loadVoterSignals(id);
     if (!detailWs.isFallbackPolling) return;
@@ -798,6 +1016,105 @@ export default function BotDetail() {
     }
   };
 
+  const applyConfigJsonDraft = () => {
+    try {
+      const parsed = JSON.parse(configStrategyJsonDraft) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        setConfigError('Strategy params JSON must be an object.');
+        return;
+      }
+      const next = { ...configStrategyDraft, ...(parsed as StrategyDraft) };
+      setConfigStrategyDraft(next);
+      setConfigStrategyJsonDraft(prettyStrategyParams(next));
+      setConfigBudgetDraft(draftString(next.initial_budget_quote));
+      setConfigError(null);
+      setConfigSuccess('JSON applied to draft.');
+    } catch (e) {
+      setConfigError(e instanceof Error ? e.message : 'Invalid strategy params JSON.');
+    }
+  };
+
+  const resetConfigRiskToGlobal = async () => {
+    if (!id) return;
+    setConfigBusy(true);
+    setConfigError(null);
+    setConfigSuccess(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${id}/risk-settings/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: 'global' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok)
+        throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not reset bot risk');
+      setConfigRiskDraft(cloneRiskSettings(data.risk_settings as RiskSettings));
+      setConfigSuccess('Risk settings reset to global defaults.');
+      await refresh();
+    } catch (e) {
+      setConfigError(e instanceof Error ? e.message : 'Risk reset failed');
+    } finally {
+      setConfigBusy(false);
+    }
+  };
+
+  const saveBotConfiguration = async () => {
+    if (!id || !configRiskDraft) return;
+    const riskValidation = validateRiskSettings(configRiskDraft);
+    if (riskValidation) {
+      setConfigError(riskValidation);
+      return;
+    }
+    const budgetTrimmed = configBudgetDraft.trim();
+    let budget: number | null = null;
+    if (budgetTrimmed !== '') {
+      const parsedBudget = Number.parseFloat(budgetTrimmed);
+      if (!Number.isFinite(parsedBudget) || parsedBudget < 0) {
+        setConfigError('Initial budget must be empty or a non-negative number.');
+        return;
+      }
+      budget = parsedBudget;
+    }
+
+    setConfigBusy(true);
+    setConfigError(null);
+    setConfigSuccess(null);
+    try {
+      const riskRes = await fetch(`${API_BASE}/api/bots/${id}/risk-settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(configRiskDraft),
+      });
+      const riskData = await riskRes.json().catch(() => ({}));
+      if (!riskRes.ok)
+        throw new Error(typeof riskData.detail === 'string' ? riskData.detail : 'Could not save risk settings');
+
+      const strategyPayload: StrategyDraft = {
+        ...configStrategyDraft,
+        initial_budget_quote: budget,
+      };
+      const strategyRes = await fetch(`${API_BASE}/api/bots/${id}/strategy-params`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(strategyPayload),
+      });
+      const strategyData = await strategyRes.json().catch(() => ({}));
+      if (!strategyRes.ok)
+        throw new Error(
+          typeof strategyData.detail === 'string' ? strategyData.detail : 'Could not save strategy params',
+        );
+
+      await refresh();
+      setConfigSuccess('Configuration saved.');
+      setShowConfigModal(false);
+      setConfigError(null);
+    } catch (e) {
+      setConfigError(e instanceof Error ? e.message : 'Configuration save failed');
+    } finally {
+      setConfigBusy(false);
+    }
+  };
+
   const confirmRiskOverride = () =>
     window.confirm(
       'Resume bot trading?\n\nThis manually overrides active risk protections and resets the daily loss, drawdown, and consecutive-loss baselines from the current account state. Continue?',
@@ -859,6 +1176,15 @@ export default function BotDetail() {
   const netPnl = strategyHealth?.total_pnl_quote ?? null;
   const recordedOrderCount = orderStats?.total_orders ?? 0;
   const yoloMode = bot?.risk_settings?.yolo_mode ?? false;
+  const configInputClass =
+    'rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-sm text-magi-on-bg focus:border-magi-primary/50 focus:outline-none disabled:opacity-50';
+  const configLabelClass = 'flex flex-col gap-1.5 font-label text-[10px] uppercase tracking-wider text-magi-muted/55';
+  const configTabClass = (tab: ConfigTab) =>
+    `rounded-t border px-3 py-2 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+      activeConfigTab === tab
+        ? 'border-magi-primary/40 bg-magi-primary/15 text-magi-primary'
+        : 'border-magi-grid/20 bg-magi-grid/5 text-magi-muted/50 hover:text-magi-muted'
+    }`;
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-magi-bg text-magi-on-bg">
@@ -878,6 +1204,15 @@ export default function BotDetail() {
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowConfigModal(true)}
+                className="flex items-center gap-1.5 rounded border border-magi-primary/40 bg-magi-primary/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/20 active:bg-magi-primary/30 transition-colors"
+                title="Configure risk, strategy, weights & consensus for this bot only"
+              >
+                <Settings size={13} />
+                CONFIG
+              </button>
               <span
                 className={`font-label inline-flex items-center border px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest ${
                   botExecMode === 'live'
@@ -1545,6 +1880,442 @@ export default function BotDetail() {
           </div>
         </div>
       </footer>
+
+      {/* ── BOT CONFIGURATION MODAL ──────────────────────────────────────── */}
+      {showConfigModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4">
+          <div className="mx-4 flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-magi-grid/30 bg-magi-container shadow-2xl">
+            <div className="flex items-start justify-between gap-4 border-b border-magi-grid/30 px-5 py-4">
+              <div>
+                <p className="font-label text-[9px] uppercase tracking-[0.25em] text-magi-muted/45">
+                  Per-bot override
+                </p>
+                <h2 className="font-headline text-lg font-black uppercase italic tracking-tight text-magi-primary phosphor-amber">
+                  Bot Configuration — {symbolHeadline(bot?.symbol)}
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={closeConfigModal}
+                disabled={configBusy}
+                className="rounded border border-magi-grid/30 bg-black/20 p-2 text-magi-muted transition-colors hover:border-magi-primary/40 hover:text-magi-primary disabled:opacity-40"
+                aria-label="Close bot configuration"
+              >
+                <X className="h-4 w-4" strokeWidth={2.5} />
+              </button>
+            </div>
+
+            <div className="flex flex-wrap gap-1 border-b border-magi-grid/20 bg-magi-container-low/50 px-4 pt-3">
+              <button type="button" className={configTabClass('risk')} onClick={() => setActiveConfigTab('risk')}>
+                Risk Management
+              </button>
+              <button type="button" className={configTabClass('strategy')} onClick={() => setActiveConfigTab('strategy')}>
+                Strategy Settings
+              </button>
+              {isEnsemble && (
+                <button type="button" className={configTabClass('ensemble')} onClick={() => setActiveConfigTab('ensemble')}>
+                  Decision Weights &amp; Consensus
+                </button>
+              )}
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+              {configError && (
+                <div className="mb-4 rounded border border-red-500/40 bg-red-950/20 px-3 py-2 text-xs text-red-300">
+                  {configError}
+                </div>
+              )}
+              {configSuccess && (
+                <div className="mb-4 rounded border border-magi-tertiary/30 bg-magi-tertiary/10 px-3 py-2 text-xs text-magi-tertiary">
+                  {configSuccess}
+                </div>
+              )}
+
+              {activeConfigTab === 'risk' && (
+                <section className="flex flex-col gap-5">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                    <div>
+                      <h3 className="font-label text-[12px] font-black uppercase tracking-widest text-magi-on-bg">
+                        Risk Management
+                      </h3>
+                      <p className="mt-1 text-xs text-magi-muted/55">
+                        Current per-bot sizing and protection rules. These values apply only to this bot.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={configBusy}
+                      onClick={() => void resetConfigRiskToGlobal()}
+                      className="rounded border border-magi-grid/40 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-magi-muted hover:border-magi-primary/40 hover:text-magi-primary disabled:opacity-40"
+                    >
+                      Reset to Global Defaults
+                    </button>
+                  </div>
+
+                  {configRiskDraft ? (
+                    <>
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                        <label className={configLabelClass}>
+                          Base risk %
+                          <input
+                            type="number"
+                            min="0.05"
+                            max="10"
+                            step="0.05"
+                            value={configRiskDraft.base_risk_pct}
+                            onChange={(e) => updateConfigRisk('base_risk_pct', Number(e.currentTarget.value))}
+                            className={configInputClass}
+                          />
+                        </label>
+                        <label className={configLabelClass}>
+                          Daily loss %
+                          <input
+                            type="number"
+                            min="0.05"
+                            max="100"
+                            step="0.05"
+                            value={configRiskDraft.daily_loss_limit_pct}
+                            onChange={(e) => updateConfigRisk('daily_loss_limit_pct', Number(e.currentTarget.value))}
+                            className={configInputClass}
+                          />
+                        </label>
+                        <label className={configLabelClass}>
+                          Max drawdown %
+                          <input
+                            type="number"
+                            min="0.05"
+                            max="100"
+                            step="0.05"
+                            value={configRiskDraft.max_drawdown_pct}
+                            onChange={(e) => updateConfigRisk('max_drawdown_pct', Number(e.currentTarget.value))}
+                            className={configInputClass}
+                          />
+                        </label>
+                        <label className={configLabelClass}>
+                          Loss streak limit
+                          <input
+                            type="number"
+                            min="1"
+                            step="1"
+                            value={configRiskDraft.consecutive_loss_limit}
+                            onChange={(e) =>
+                              updateConfigRisk('consecutive_loss_limit', Number.parseInt(e.currentTarget.value, 10))
+                            }
+                            className={configInputClass}
+                          />
+                        </label>
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                        {RISK_TOGGLES.map(({ key, label }) => (
+                          <label
+                            key={key}
+                            className={`flex cursor-pointer items-center justify-between gap-3 rounded border px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-colors ${
+                              configRiskDraft[key]
+                                ? 'border-magi-primary/35 bg-magi-primary/10 text-magi-primary'
+                                : 'border-magi-grid/25 bg-magi-grid/5 text-magi-muted/60'
+                            }`}
+                          >
+                            <span>{label}</span>
+                            <input
+                              type="checkbox"
+                              checked={configRiskDraft[key]}
+                              onChange={(e) => updateConfigRisk(key, e.currentTarget.checked)}
+                              className="h-4 w-4 accent-magi-primary"
+                            />
+                          </label>
+                        ))}
+                      </div>
+
+                      {configRiskDraft.yolo_mode && (
+                        <div className="rounded border border-red-400/40 bg-red-500/10 px-3 py-2 text-xs font-bold text-red-300">
+                          YOLO mode bypasses risk protection blockers for this bot. Trade sizing still uses the
+                          configured risk percent.
+                        </div>
+                      )}
+
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                        <label className={configLabelClass}>
+                          Drawdown action
+                          <select
+                            value={configRiskDraft.drawdown_action}
+                            onChange={(e) => updateConfigRisk('drawdown_action', e.currentTarget.value as DrawdownAction)}
+                            className={configInputClass}
+                          >
+                            <option value="reduce">Reduce position size</option>
+                            <option value="pause">Pause bot</option>
+                            <option value="stop">Stop bot</option>
+                          </select>
+                        </label>
+                        <label className={configLabelClass}>
+                          Reduce factor
+                          <input
+                            type="number"
+                            min="0.05"
+                            max="1"
+                            step="0.05"
+                            value={configRiskDraft.drawdown_reduce_factor}
+                            onChange={(e) => updateConfigRisk('drawdown_reduce_factor', Number(e.currentTarget.value))}
+                            className={configInputClass}
+                          />
+                        </label>
+                        {configRiskDraft.enable_volatility_pause && (
+                          <label className={configLabelClass}>
+                            Volatility threshold %
+                            <input
+                              type="number"
+                              min="0.1"
+                              step="0.1"
+                              value={configRiskDraft.volatility_threshold ?? ''}
+                              onChange={(e) =>
+                                updateConfigRisk(
+                                  'volatility_threshold',
+                                  e.currentTarget.value === '' ? null : Number(e.currentTarget.value),
+                                )
+                              }
+                              className={configInputClass}
+                              placeholder="required"
+                            />
+                          </label>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <p className="text-sm text-magi-muted/60">Loading risk settings…</p>
+                  )}
+                </section>
+              )}
+
+              {activeConfigTab === 'strategy' && (
+                <section className="flex flex-col gap-5">
+                  <div>
+                    <h3 className="font-label text-[12px] font-black uppercase tracking-widest text-magi-on-bg">
+                      Strategy Settings
+                    </h3>
+                    <p className="mt-1 text-xs text-magi-muted/55">
+                      Edits are merged into this bot&apos;s strategy params JSON.
+                    </p>
+                  </div>
+
+                  <label className={`${configLabelClass} max-w-xs`}>
+                    Initial budget ({qc})
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="e.g. 1000"
+                      value={configBudgetDraft}
+                      onChange={(e) => setConfigBudgetDraft(e.currentTarget.value)}
+                      className={configInputClass}
+                    />
+                  </label>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {editableStrategyKeys.length === 0 ? (
+                      <p className="text-xs italic text-magi-muted/50">No primitive strategy fields found.</p>
+                    ) : (
+                      editableStrategyKeys.map((key) => {
+                        const current = configStrategyDraft[key];
+                        return (
+                          <label key={key} className={configLabelClass}>
+                            {key}
+                            <input
+                              type={typeof current === 'number' ? 'number' : 'text'}
+                              step={typeof current === 'number' ? 'any' : undefined}
+                              value={draftString(current)}
+                              onChange={(e) => updateStrategyDraft(key, parseStrategyInput(e.currentTarget.value, current))}
+                              className={configInputClass}
+                            />
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+
+                  <div className="rounded-lg border border-magi-grid/20 bg-black/20">
+                    <div className="flex flex-col gap-2 border-b border-magi-grid/20 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="font-label text-[10px] font-bold uppercase tracking-widest text-magi-muted/60">
+                          Advanced strategy_params_json
+                        </p>
+                        <p className="text-[10px] text-magi-muted/40">Pretty-print, edit, then apply to merge into the draft.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={applyConfigJsonDraft}
+                        className="rounded border border-magi-primary/40 bg-magi-primary/10 px-3 py-1.5 text-[10px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/20"
+                      >
+                        Apply JSON
+                      </button>
+                    </div>
+                    <textarea
+                      value={configStrategyJsonDraft}
+                      onChange={(e) => setConfigStrategyJsonDraft(e.currentTarget.value)}
+                      className="min-h-56 w-full resize-y bg-transparent p-3 font-mono text-[11px] text-magi-on-bg/85 outline-none"
+                      spellCheck={false}
+                    />
+                  </div>
+                </section>
+              )}
+
+              {activeConfigTab === 'ensemble' && isEnsemble && (
+                <section className="flex flex-col gap-5">
+                  <div>
+                    <h3 className="font-label text-[12px] font-black uppercase tracking-widest text-magi-on-bg">
+                      Decision Weights &amp; Consensus
+                    </h3>
+                    <p className="mt-1 text-xs text-magi-muted/55">
+                      Tune this bot&apos;s voter weights and preview how the latest live signals would resolve.
+                    </p>
+                  </div>
+
+                  {configEnsembleParams ? (
+                    <>
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                        {configEnsembleParams.voters.map((voter) => {
+                          const meta = VOTER_META[voter] ?? { label: voter, role: 'Other' };
+                          const live = liveVoterSignals.find((signal) => signal.voter_name === voter);
+                          return (
+                            <div key={voter} className="rounded border border-magi-grid/25 bg-magi-grid/5 px-3 py-2">
+                              <div className="mb-2 flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <p className="truncate font-label text-[11px] font-black text-magi-on-bg">
+                                    {meta.label}
+                                  </p>
+                                  <p className="font-label text-[9px] uppercase tracking-widest text-magi-muted/45">
+                                    {meta.role}
+                                  </p>
+                                </div>
+                                <span
+                                  className={`rounded border px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wider ${
+                                    live ? SIGNAL_STYLES[live.voter_signal] : 'border-magi-grid/20 text-magi-muted/40'
+                                  }`}
+                                >
+                                  {live?.voter_signal ?? 'no signal'}
+                                  {live?.confidence != null ? ` ${(live.confidence * 100).toFixed(0)}%` : ''}
+                                </span>
+                              </div>
+                              <label className={configLabelClass}>
+                                Weight
+                                <input
+                                  type="number"
+                                  min="0"
+                                  max="5"
+                                  step="0.1"
+                                  value={configEnsembleParams.voterWeights[voter] ?? 1}
+                                  onChange={(e) => {
+                                    const nextWeight = Number(e.currentTarget.value);
+                                    updateStrategyDraft('voter_weights', {
+                                      ...configEnsembleParams.voterWeights,
+                                      [voter]: Number.isFinite(nextWeight) ? nextWeight : 1,
+                                    });
+                                  }}
+                                  className={configInputClass}
+                                />
+                              </label>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <label className={configLabelClass}>
+                          Consensus mode
+                          <select
+                            value={configEnsembleParams.consensusMode}
+                            onChange={(e) => updateStrategyDraft('consensus_mode', e.currentTarget.value)}
+                            className={configInputClass}
+                          >
+                            {CONSENSUS_MODES.map((mode) => (
+                              <option key={mode} value={mode}>
+                                {mode}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className={configLabelClass}>
+                          Consensus threshold
+                          <div className="grid grid-cols-[1fr_5rem] gap-2">
+                            <input
+                              type="range"
+                              min="0"
+                              max="0.5"
+                              step="0.01"
+                              value={configEnsembleParams.consensusThreshold}
+                              onChange={(e) => updateStrategyDraft('consensus_threshold', Number(e.currentTarget.value))}
+                              className="accent-magi-primary"
+                            />
+                            <input
+                              type="number"
+                              min="0"
+                              max="0.5"
+                              step="0.01"
+                              value={configEnsembleParams.consensusThreshold}
+                              onChange={(e) => updateStrategyDraft('consensus_threshold', Number(e.currentTarget.value))}
+                              className={configInputClass}
+                            />
+                          </div>
+                        </label>
+                      </div>
+
+                      {configConsensusPreview && (
+                        <div className="rounded-lg border border-magi-primary/20 bg-magi-primary/5 px-4 py-3">
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <p className="font-label text-[10px] font-bold uppercase tracking-widest text-magi-muted/60">
+                              Live consensus preview
+                            </p>
+                            <span
+                              className={`rounded border px-2 py-0.5 text-[10px] font-black uppercase tracking-widest ${
+                                configConsensusPreview.signal === 'buy'
+                                  ? 'border-emerald-400/40 text-emerald-300'
+                                  : configConsensusPreview.signal === 'sell'
+                                    ? 'border-red-400/40 text-red-300'
+                                    : 'border-magi-grid/40 text-magi-muted/60'
+                              }`}
+                            >
+                              {configConsensusPreview.signal}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-3 gap-2 font-mono text-[11px] text-magi-muted/70">
+                            <span>buy {configConsensusPreview.weightedTotals.buy.toFixed(1)}</span>
+                            <span>hold {configConsensusPreview.weightedTotals.hold.toFixed(1)}</span>
+                            <span>sell {configConsensusPreview.weightedTotals.sell.toFixed(1)}</span>
+                          </div>
+                          <p className="mt-2 font-label text-[10px] text-magi-muted/50">
+                            Net {(configConsensusPreview.net * 100).toFixed(1)}% · Buy share{' '}
+                            {(configConsensusPreview.buyShare * 100).toFixed(1)}% · Sell share{' '}
+                            {(configConsensusPreview.sellShare * 100).toFixed(1)}%
+                          </p>
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-magi-muted/60">No ensemble voter params found for this bot.</p>
+                  )}
+                </section>
+              )}
+            </div>
+
+            <div className="flex flex-col-reverse gap-2 border-t border-magi-grid/30 bg-magi-container-low/50 px-5 py-4 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                disabled={configBusy}
+                onClick={closeConfigModal}
+                className="rounded border border-magi-grid/40 px-4 py-2 text-[11px] font-bold uppercase tracking-widest text-magi-muted hover:border-magi-muted/60 hover:text-magi-on-bg disabled:opacity-40"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={configBusy || !configRiskDraft}
+                onClick={() => void saveBotConfiguration()}
+                className="rounded bg-magi-primary px-5 py-2 text-[11px] font-black uppercase tracking-widest text-black shadow-lg shadow-orange-900/20 transition-colors hover:brightness-110 disabled:opacity-40"
+              >
+                {configBusy ? 'Saving…' : 'Save All Changes'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── PROMOTE TO LIVE MODAL ──────────────────────────────────────── */}
       {showPromoteModal && (

@@ -647,6 +647,23 @@ def _pause_bot_for_risk(bot_id: str, execution_mode: str, reason: str) -> None:
     )
 
 
+def _stop_bot_for_risk(bot_id: str, execution_mode: str, reason: str) -> None:
+    conn = get_db_connection()
+    try:
+        conn.execute("UPDATE bots SET status = 'stopped' WHERE bot_id = ?", (bot_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    update_bot_risk_state(bot_id, {"last_risk_stop_reason": reason})
+    _log(bot_id, "warn", execution_mode, f"Risk protection stopped bot — {reason}")
+    _emit_bot_event(
+        bot_id,
+        "bot_status",
+        {"status": "stopped", "reason": reason, "source": "risk_manager"},
+        priority=True,
+    )
+
+
 def _merge_params(strategy_name: str, raw: str | None) -> dict[str, Any]:
     base = default_params_for(strategy_name)
     if not raw:
@@ -1042,7 +1059,9 @@ def _process_bot(
 
     if not risk_decision.allowed:
         reason = risk_decision.reason or "risk protection triggered"
-        if risk_decision.should_pause:
+        if risk_decision.should_stop:
+            _stop_bot_for_risk(bot_id, execution_mode, reason)
+        elif risk_decision.should_pause:
             _pause_bot_for_risk(bot_id, execution_mode, reason)
         else:
             _log(bot_id, "warn", execution_mode, f"Trade skipped — {reason}")

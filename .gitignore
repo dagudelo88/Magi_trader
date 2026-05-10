@@ -9,6 +9,9 @@ data/
 *.sqlite
 *.sqlite3
 
+# Generated bot strategy reports (PDF / JSON / TXT)
+reports/
+
 # Python
 __pycache__/
 *.py[cod]
