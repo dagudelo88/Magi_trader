@@ -227,6 +227,8 @@ def build_signal_result(
     meta: dict[str, Any] = {
         "consensus_score": consensus["consensus_score"],
         "voter_signals": consensus["voter_signals"],
+        # bot_runner._log_voter_feedback reads this for voter_feedback.confidence.
+        "voter_confidences": consensus["voter_confidences"],
         "meta_weights": consensus["meta_weights"],
         "voter_count": len(consensus["voter_signals"]),
         "consensus_mode": params.get("consensus_mode", "directional_net"),
