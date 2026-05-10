@@ -6,12 +6,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from trading.risk_manager import (  # noqa: E402
+from trading.risk_manager import (  # type: ignore[import-not-found] # noqa: E402
     dynamic_risk_pct,
     evaluate_trade_risk,
+    risk_resume_state,
     recent_volatility_pct,
 )
-from trading.risk_settings import (  # noqa: E402
+from trading.risk_settings import (  # type: ignore[import-not-found] # noqa: E402
     DEFAULT_RISK_SETTINGS,
     normalize_risk_settings,
     template_risk_defaults,
@@ -68,6 +69,37 @@ class TestRiskManager(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertTrue(decision.should_pause)
         self.assertEqual(decision.consecutive_losses, 2)
+
+    def test_manual_resume_baseline_allows_existing_loss_streak(self) -> None:
+        settings = normalize_risk_settings(
+            {**DEFAULT_RISK_SETTINGS, "consecutive_loss_limit": 2}
+        )
+        orders = [
+            _o("buy", amount=1, cost=100, average=100, created_at=1),
+            _o("sell", amount=1, cost=90, average=90, created_at=2),
+            _o("buy", amount=1, cost=100, average=100, created_at=3),
+            _o("sell", amount=1, cost=95, average=95, created_at=4),
+        ]
+        state = risk_resume_state(
+            orders_oldest_first=orders,
+            symbol="BTC/USDT",
+            initial_capital=1000,
+            now_ms=1_700_000_000_000,
+        )
+        decision = evaluate_trade_risk(
+            settings=settings,
+            orders_oldest_first=orders,
+            symbol="BTC/USDT",
+            initial_capital=1000,
+            mark_price=100,
+            consensus_score=0.50,
+            ohlcv=[],
+            side="buy",
+            now_ms=1_700_000_000_000,
+            risk_state=state,
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.consecutive_losses, 0)
 
     def test_drawdown_reduce(self) -> None:
         settings = normalize_risk_settings(

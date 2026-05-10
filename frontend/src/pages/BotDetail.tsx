@@ -768,7 +768,15 @@ export default function BotDetail() {
     }
   };
 
-  const setStatus = async (status: 'running' | 'stopped' | 'paused') => {
+  const confirmRiskOverride = () =>
+    window.confirm(
+      'Resume bot trading?\n\nThis manually overrides active risk protections and resets the daily loss, drawdown, and consecutive-loss baselines from the current account state. Continue?',
+    );
+
+  const setStatus = async (
+    status: 'running' | 'stopped' | 'paused',
+    options: { resetRiskProtections?: boolean } = {},
+  ) => {
     if (!id) return;
     setBusy(true);
     setActionError(null);
@@ -776,7 +784,10 @@ export default function BotDetail() {
       const res = await fetch(`${API_BASE}/api/bots/${id}/status`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({
+          status,
+          reset_risk_protections: options.resetRiskProtections ?? false,
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
@@ -1418,21 +1429,27 @@ export default function BotDetail() {
             </div>
           </div>
           <div className="flex min-h-10 w-full flex-wrap gap-px sm:h-full sm:min-h-0 sm:w-auto sm:flex-nowrap">
-            {bot?.status !== 'running' ? (
+            {bot?.status === 'stopped' ? (
               <button type="button" disabled={busy} onClick={() => setStatus('running')}
                 className="font-headline min-h-10 min-w-0 flex-1 bg-magi-tertiary px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
                 START
+              </button>
+            ) : bot?.status === 'paused' ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  if (!confirmRiskOverride()) return;
+                  void setStatus('running', { resetRiskProtections: true });
+                }}
+                className="font-headline min-h-10 min-w-0 flex-1 bg-magi-tertiary px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]"
+              >
+                RESUME + RESET RISK
               </button>
             ) : (
               <button type="button" disabled={busy} onClick={() => setStatus('paused')}
                 className="font-headline min-h-10 min-w-0 flex-1 bg-yellow-500 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
                 PAUSE
-              </button>
-            )}
-            {bot?.status === 'paused' && (
-              <button type="button" disabled={busy} onClick={() => setStatus('running')}
-                className="font-headline min-h-10 min-w-0 flex-1 border-l border-black/20 bg-magi-tertiary/80 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
-                RESUME
               </button>
             )}
             <button type="button" disabled={busy}

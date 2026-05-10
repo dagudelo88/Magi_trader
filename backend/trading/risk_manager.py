@@ -27,6 +27,12 @@ class RiskDecision:
     volatility_pct: float | None = None
 
 
+def _utc_day_key(now_ms: int | None = None) -> str:
+    fallback_ms = int(datetime.now(tz=UTC).timestamp() * 1000)
+    now = datetime.fromtimestamp((now_ms or fallback_ms) / 1000, tz=UTC)
+    return now.date().isoformat()
+
+
 def dynamic_risk_pct(
     settings: dict[str, Any],
     consensus_score: float | None,
@@ -98,9 +104,14 @@ def _daily_pnl(
     return total
 
 
-def _consecutive_losses(trades: list[dict[str, Any]]) -> int:
+def _consecutive_losses(
+    trades: list[dict[str, Any]],
+    *,
+    baseline_count: int = 0,
+) -> int:
     losses = 0
-    for trade in reversed(trades):
+    scoped_trades = trades[max(0, baseline_count):]
+    for trade in reversed(scoped_trades):
         outcome = str(trade.get("outcome") or "")
         if outcome == "loss":
             losses += 1
@@ -132,6 +143,41 @@ def _drawdown_pct(
     return max_dd
 
 
+def risk_resume_state(
+    *,
+    orders_oldest_first: list[dict[str, Any]],
+    symbol: str,
+    initial_capital: float,
+    mark_price: float | None = None,
+    now_ms: int | None = None,
+) -> dict[str, Any]:
+    trades = compute_closed_trades(orders_oldest_first, symbol)
+    perf = compute_strategy_performance(
+        orders_oldest_first,
+        symbol,
+        mark_price=mark_price,
+    )
+    current_capital = (
+        initial_capital
+        + float(perf["realized_pnl_quote"] or 0.0)
+        + float(perf["unrealized_pnl_quote"] or 0.0)
+    )
+    drawdown = _drawdown_pct(
+        trades,
+        initial_capital,
+        current_capital=current_capital,
+    )
+    return {
+        "consecutive_loss_baseline": len(trades),
+        "daily_loss_baseline_date": _utc_day_key(now_ms),
+        "daily_loss_baseline_pnl": _daily_pnl(trades, now_ms),
+        "drawdown_baseline_pct": drawdown,
+        "last_manual_resume_at": now_ms
+        or int(datetime.now(tz=UTC).timestamp() * 1000),
+        "last_risk_pause_reason": None,
+    }
+
+
 def evaluate_trade_risk(
     *,
     settings: dict[str, Any],
@@ -143,6 +189,7 @@ def evaluate_trade_risk(
     ohlcv: list[Any],
     side: str,
     now_ms: int | None = None,
+    risk_state: dict[str, Any] | None = None,
 ) -> RiskDecision:
     cfg = normalize_risk_settings(settings)
     perf = compute_strategy_performance(
@@ -155,13 +202,18 @@ def evaluate_trade_risk(
         initial_capital + float(perf["realized_pnl_quote"] or 0.0) + unrealized
     )
     trades = compute_closed_trades(orders_oldest_first, symbol)
+    state = risk_state or {}
     daily_pnl = _daily_pnl(trades, now_ms)
-    streak = _consecutive_losses(trades)
+    if state.get("daily_loss_baseline_date") == _utc_day_key(now_ms):
+        daily_pnl -= float(state.get("daily_loss_baseline_pnl") or 0.0)
+    baseline_count = int(state.get("consecutive_loss_baseline") or 0)
+    streak = _consecutive_losses(trades, baseline_count=baseline_count)
     drawdown = _drawdown_pct(
         trades,
         initial_capital,
         current_capital=current_capital,
     )
+    drawdown_baseline = float(state.get("drawdown_baseline_pct") or 0.0)
     risk_pct = dynamic_risk_pct(cfg, consensus_score)
 
     if cfg["enable_daily_loss_limit"] and daily_pnl < 0:
@@ -204,6 +256,7 @@ def evaluate_trade_risk(
     if (
         cfg["enable_drawdown_protection"]
         and drawdown >= float(cfg["max_drawdown_pct"])
+        and drawdown > drawdown_baseline + 1e-9
     ):
         if cfg["drawdown_action"] == "pause":
             return RiskDecision(
@@ -254,4 +307,3 @@ def evaluate_trade_risk(
         consecutive_losses=streak,
         volatility_pct=volatility,
     )
-

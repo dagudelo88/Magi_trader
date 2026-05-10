@@ -211,14 +211,26 @@ export default function BotsList() {
     }
   };
 
-  const setStatus = async (botId: string, status: 'running' | 'stopped' | 'paused') => {
+  const confirmRiskOverride = (label: string) =>
+    window.confirm(
+      `${label}\n\nThis manually overrides active risk protections for this bot and resets the daily loss, drawdown, and consecutive-loss baselines from the current account state. Continue?`,
+    );
+
+  const setStatus = async (
+    botId: string,
+    status: 'running' | 'stopped' | 'paused',
+    options: { resetRiskProtections?: boolean } = {},
+  ) => {
     setBusyBotId(botId);
     setError(null);
     try {
       const res = await fetch(`${API_BASE}/api/bots/${botId}/status`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({
+          status,
+          reset_risk_protections: options.resetRiskProtections ?? false,
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
@@ -233,6 +245,7 @@ export default function BotsList() {
   const resumeAll = async () => {
     const targets = bots.filter((b) => b.status === 'paused');
     if (targets.length === 0) return;
+    if (!confirmRiskOverride(`Resume ${targets.length} paused bot(s)?`)) return;
     setBulkBusy('resume');
     setError(null);
     try {
@@ -241,7 +254,10 @@ export default function BotsList() {
           fetch(`${API_BASE}/api/bots/${b.bot_id}/status`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ status: 'running' }),
+            body: JSON.stringify({
+              status: 'running',
+              reset_risk_protections: true,
+            }),
           }),
         ),
       );
@@ -435,7 +451,7 @@ export default function BotsList() {
               </Link>
 
               <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
-                {!isRunning && (
+                {!isRunning && !isPaused && (
                   <button type="button" disabled={isBusy}
                     onClick={() => void setStatus(bot.bot_id, 'running')}
                     className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-green-600/80 hover:bg-green-500 text-white rounded disabled:opacity-40 transition-colors">
@@ -451,7 +467,10 @@ export default function BotsList() {
                 )}
                 {isPaused && (
                   <button type="button" disabled={isBusy}
-                    onClick={() => void setStatus(bot.bot_id, 'running')}
+                    onClick={() => {
+                      if (!confirmRiskOverride(`Resume "${bot.name}"?`)) return;
+                      void setStatus(bot.bot_id, 'running', { resetRiskProtections: true });
+                    }}
                     className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-green-600/80 hover:bg-green-500 text-white rounded disabled:opacity-40 transition-colors">
                     RESUME
                   </button>

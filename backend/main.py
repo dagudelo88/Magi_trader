@@ -37,6 +37,7 @@ from database import (
     refresh_stale_bot_orders_from_exchange,
     fork_bot,
     set_bot_execution_mode,
+    update_bot_risk_state,
     update_bot,
 )
 from tracked_markets import (
@@ -64,12 +65,14 @@ from trading.strategy_budget import (
 )
 from trading.risk_settings import (
     db_row_to_risk_settings,
+    ensure_bot_risk_settings,
     get_effective_bot_risk_settings,
     get_global_risk_defaults,
     save_bot_risk_settings,
     set_global_risk_defaults,
     template_risk_defaults,
 )
+from trading.risk_manager import risk_resume_state
 from trading.strategies.registry import (
     get_strategy,
     strategy_names,
@@ -1381,6 +1384,7 @@ def post_fork_bot(bot_id: str, body: dict[str, Any] = Body(default_factory=dict)
 
 class BotStatusBody(BaseModel):
     status: str
+    reset_risk_protections: bool = False
 
 
 @app.put("/api/bots/{bot_id}/status")
@@ -1396,8 +1400,12 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT bot_id FROM bots WHERE bot_id = ?", (bot_id,))
-        if cur.fetchone() is None:
+        cur.execute(
+            "SELECT bot_id, symbol, strategy_params_json FROM bots WHERE bot_id = ?",
+            (bot_id,),
+        )
+        bot_row = cur.fetchone()
+        if bot_row is None:
             raise HTTPException(status_code=404, detail="Bot not found")
         if body.status == "running":
             cur.execute(
@@ -1419,9 +1427,26 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
     finally:
         conn.close()
 
+    risk_protections_reset = False
+    if body.status == "running" and body.reset_risk_protections:
+        ensure_bot_risk_settings(bot_id)
+        raw_params = bot_row["strategy_params_json"]
+        budget = initial_budget_from_strategy_params_json(
+            raw_params if isinstance(raw_params, str) else None
+        )
+        orders = fetch_bot_orders_chronological(bot_id)
+        state = risk_resume_state(
+            orders_oldest_first=orders,
+            symbol=str(bot_row["symbol"] or ""),
+            initial_capital=float(budget or 1.0),
+        )
+        update_bot_risk_state(bot_id, state)
+        risk_protections_reset = True
+
     payload = {
         "bot_id": bot_id,
         "status": body.status,
+        "risk_protections_reset": risk_protections_reset,
     }
     publish_bot_event(bot_id, "bot_status", payload)
     return payload

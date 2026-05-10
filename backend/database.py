@@ -632,11 +632,32 @@ def init_db():
             volatility_threshold REAL,
             drawdown_action TEXT NOT NULL DEFAULT 'reduce',
             drawdown_reduce_factor REAL NOT NULL DEFAULT 0.5,
+            consecutive_loss_baseline INTEGER NOT NULL DEFAULT 0,
+            daily_loss_baseline_date TEXT,
+            daily_loss_baseline_pnl REAL NOT NULL DEFAULT 0,
+            drawdown_baseline_pct REAL NOT NULL DEFAULT 0,
+            last_risk_pause_reason TEXT,
+            last_manual_resume_at INTEGER,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
             FOREIGN KEY (bot_id) REFERENCES bots(bot_id)
         )
     """)
+    risk_state_migrations = [
+        ("consecutive_loss_baseline", "INTEGER NOT NULL DEFAULT 0"),
+        ("daily_loss_baseline_date", "TEXT"),
+        ("daily_loss_baseline_pnl", "REAL NOT NULL DEFAULT 0"),
+        ("drawdown_baseline_pct", "REAL NOT NULL DEFAULT 0"),
+        ("last_risk_pause_reason", "TEXT"),
+        ("last_manual_resume_at", "INTEGER"),
+    ]
+    for col, col_def in risk_state_migrations:
+        try:
+            cursor.execute(
+                f"ALTER TABLE bot_risk_settings ADD COLUMN {col} {col_def}"
+            )
+        except sqlite3.OperationalError:
+            pass
 
     # Migration: add created_at to bot_decisions so rows can be time-bounded for
     # archival and ML training queries.  Old rows will have NULL; new rows are
@@ -1590,6 +1611,50 @@ def get_bot_risk_settings(bot_id: str) -> dict[str, Any] | None:
         cur.execute("SELECT * FROM bot_risk_settings WHERE bot_id = ?", (bot_id,))
         row = cur.fetchone()
         return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_bot_risk_state(bot_id: str) -> dict[str, Any]:
+    row = get_bot_risk_settings(bot_id) or {}
+    return {
+        "consecutive_loss_baseline": int(
+            row.get("consecutive_loss_baseline") or 0
+        ),
+        "daily_loss_baseline_date": row.get("daily_loss_baseline_date"),
+        "daily_loss_baseline_pnl": float(
+            row.get("daily_loss_baseline_pnl") or 0.0
+        ),
+        "drawdown_baseline_pct": float(row.get("drawdown_baseline_pct") or 0.0),
+        "last_risk_pause_reason": row.get("last_risk_pause_reason"),
+        "last_manual_resume_at": row.get("last_manual_resume_at"),
+    }
+
+
+def update_bot_risk_state(bot_id: str, state: dict[str, Any]) -> None:
+    allowed = {
+        "consecutive_loss_baseline",
+        "daily_loss_baseline_date",
+        "daily_loss_baseline_pnl",
+        "drawdown_baseline_pct",
+        "last_risk_pause_reason",
+        "last_manual_resume_at",
+    }
+    updates = [key for key in state if key in allowed]
+    if not updates:
+        return
+    set_clause = ", ".join(f"{key} = ?" for key in updates)
+    values = [state[key] for key in updates]
+    values.append(int(time.time() * 1000))
+    values.append(bot_id)
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            f"UPDATE bot_risk_settings SET {set_clause}, updated_at = ? "
+            "WHERE bot_id = ?",
+            values,
+        )
+        conn.commit()
     finally:
         conn.close()
 

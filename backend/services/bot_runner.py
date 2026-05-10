@@ -50,6 +50,8 @@ from database import (
     batch_insert_voter_feedback,
     batch_record_bot_decisions,
     fetch_bot_orders_chronological,
+    get_bot_risk_state,
+    update_bot_risk_state,
     upsert_ohlcv_candles,
 )
 from trading.app_settings import get_execution_mode, is_global_halt
@@ -635,6 +637,7 @@ def _pause_bot_for_risk(bot_id: str, execution_mode: str, reason: str) -> None:
         conn.commit()
     finally:
         conn.close()
+    update_bot_risk_state(bot_id, {"last_risk_pause_reason": reason})
     _log(bot_id, "warn", execution_mode, f"Risk protection paused bot — {reason}")
     _emit_bot_event(
         bot_id,
@@ -1020,6 +1023,7 @@ def _process_bot(
     try:
         risk_settings = get_effective_bot_risk_settings(bot_id)
         orders_for_risk = fetch_bot_orders_chronological(bot_id)
+        risk_state = get_bot_risk_state(bot_id)
         risk_decision = evaluate_trade_risk(
             settings=risk_settings,
             orders_oldest_first=orders_for_risk,
@@ -1029,6 +1033,7 @@ def _process_bot(
             consensus_score=consensus_score,
             ohlcv=ohlcv,
             side=str(result.signal),
+            risk_state=risk_state,
         )
     except Exception as e:
         _log(bot_id, "error", execution_mode, f"Risk check failed: {e}")

@@ -82,7 +82,11 @@ def _parse_tiers(value: Any) -> list[dict[str, float | None]]:
             continue
         if max_score is not None and (max_score < 0 or max_score > 1):
             continue
-        if min_score is not None and max_score is not None and min_score >= max_score:
+        if (
+            min_score is not None
+            and max_score is not None
+            and min_score >= max_score
+        ):
             continue
         tiers.append(
             {
@@ -170,7 +174,9 @@ def normalize_risk_settings(
     }
 
 
-def db_row_to_risk_settings(row: dict[str, Any] | None) -> dict[str, Any] | None:
+def db_row_to_risk_settings(
+    row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if not row:
         return None
     raw = dict(row)
@@ -186,7 +192,8 @@ def get_global_risk_defaults() -> dict[str, Any]:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
         return normalize_risk_settings()
-    return normalize_risk_settings(parsed if isinstance(parsed, dict) else None)
+    parsed_dict = parsed if isinstance(parsed, dict) else None
+    return normalize_risk_settings(parsed_dict)
 
 
 def set_global_risk_defaults(settings: dict[str, Any]) -> dict[str, Any]:
@@ -240,6 +247,13 @@ def get_effective_bot_risk_settings(bot_id: str) -> dict[str, Any]:
     return db_row_to_risk_settings(row) or get_global_risk_defaults()
 
 
+def ensure_bot_risk_settings(bot_id: str) -> dict[str, Any]:
+    row = get_bot_risk_settings(bot_id)
+    if row:
+        return db_row_to_risk_settings(row) or get_global_risk_defaults()
+    return save_bot_risk_settings(bot_id, get_global_risk_defaults())
+
+
 def save_bot_risk_settings(
     bot_id: str,
     settings: dict[str, Any],
@@ -247,4 +261,3 @@ def save_bot_risk_settings(
     normalized = normalize_risk_settings(settings)
     row = upsert_bot_risk_settings(bot_id, normalized)
     return db_row_to_risk_settings(row) or normalized
-
