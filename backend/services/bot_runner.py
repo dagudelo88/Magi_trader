@@ -852,6 +852,23 @@ def _expand_sell_amount_to_avoid_dust(
     return sell_amt, False
 
 
+def _full_position_is_unsellable_dust(
+    available: float,
+    min_amount: float,
+    min_notional: float,
+    last_close: float,
+) -> tuple[bool, float]:
+    """Return true when the entire position cannot clear sell filters."""
+    if available <= 0:
+        return False, 0.0
+    full_notional = available * last_close if last_close > 0 else 0.0
+    if min_amount > 0 and available < min_amount:
+        return True, full_notional
+    if min_notional > 0 and last_close > 0 and full_notional < min_notional:
+        return True, full_notional
+    return False, full_notional
+
+
 def _process_bot(
     ex,
     bot: dict[str, Any],
@@ -1277,6 +1294,29 @@ def _process_bot(
             # No budget configured — use exchange wallet as fallback
             available_base = free_base
             sell_amt = available_base * base_fraction
+
+        is_unsellable_dust, full_notional = _full_position_is_unsellable_dust(
+            available_base,
+            min_amt,
+            min_cost,
+            last_close,
+        )
+        if is_unsellable_dust:
+            # The whole balance is below exchange filters, so no fractional sell
+            # can succeed. Throttle because live bots may SELL every poll.
+            _log_info_throttled(
+                bot_id,
+                execution_mode,
+                f"sell_dust_below_min:{symbol}",
+                f"SELL dust ignored — full position "
+                f"{available_base:.8f} {base_cur} "
+                f"(notional ~{full_notional:.4f} {quote_cur}) "
+                f"below exchange minimums "
+                f"amount={min_amt} {base_cur}, "
+                f"notional={min_cost} {quote_cur}",
+            )
+            _close_decision()
+            return
 
         dust_remaining_notional = max(0.0, available_base - sell_amt) * last_close
         sell_amt, expanded_to_full_position = _expand_sell_amount_to_avoid_dust(
