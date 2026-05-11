@@ -115,6 +115,53 @@ def _coerce_positive_float(v: Any) -> float | None:
     return x
 
 
+_STABLE_USD_ASSETS = frozenset(("USDT", "USDC", "FDUSD", "BUSD"))
+
+
+def _attach_wallet_usd_values(exchange: Any, balances: list[dict[str, Any]]) -> None:
+    """Mutate wallet balance rows with best-effort USDT marks from Binance."""
+    prices: dict[str, float] = {asset: 1.0 for asset in _STABLE_USD_ASSETS}
+    assets_to_price = {
+        str(row.get("asset") or "").upper()
+        for row in balances
+        if str(row.get("asset") or "").upper() not in _STABLE_USD_ASSETS
+    }
+    if assets_to_price:
+        try:
+            if not exchange.markets:
+                exchange.load_markets()
+            symbols_by_asset = {
+                asset: f"{asset}/USDT"
+                for asset in assets_to_price
+                if f"{asset}/USDT" in exchange.markets
+            }
+            symbols = list(symbols_by_asset.values())
+            tickers: dict[str, Any] = {}
+            if symbols:
+                if exchange.has.get("fetchTickers"):
+                    tickers = exchange.fetch_tickers(symbols)
+                else:
+                    tickers = {symbol: exchange.fetch_ticker(symbol) for symbol in symbols}
+            for asset, symbol in symbols_by_asset.items():
+                ticker = tickers.get(symbol) or {}
+                price = _coerce_positive_float(ticker.get("last") or ticker.get("close"))
+                if price is not None:
+                    prices[asset] = price
+        except Exception as exc:
+            logging.getLogger("wallet").warning("Could not value wallet balances: %s", exc)
+
+    for row in balances:
+        asset = str(row.get("asset") or "").upper()
+        price = prices.get(asset)
+        if price is None:
+            row["usd_price"] = None
+            row["usd_value"] = None
+            continue
+        total = _coerce_positive_float(row.get("total")) or 0.0
+        row["usd_price"] = price
+        row["usd_value"] = total * price
+
+
 def _compute_blended_voter_weights(edge: dict[str, Any], acc: dict[str, Any]) -> dict[str, float]:
     """65% suggested_edge_weights + 35% suggested_accuracy_weights, mean-renormalized + clamped."""
     voters = sorted(set(edge) | set(acc))
@@ -982,6 +1029,8 @@ def get_wallet_balances(
         if effective == "testnet":
             allowed = wallet_assets_allowed()
             non_zero_balances = [b for b in non_zero_balances if b["asset"] in allowed]
+
+        _attach_wallet_usd_values(exchange, non_zero_balances)
 
         stable_order = ["USDT", "USDC", "FDUSD", "BUSD"]
         base_pos = {a: i for i, a in enumerate(TRACKED_BASE_ORDER)}

@@ -18,6 +18,8 @@ export interface WalletItem {
   free: number;
   used: number;
   total: number;
+  usd_price?: number | null;
+  usd_value?: number | null;
   value?: number;
 }
 

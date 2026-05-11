@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { API_BASE } from '../config';
-import { useRealtimeStore, type NetworkView, type WalletItem } from '../stores/realtimeStore';
+import { useRealtimeStore, type WalletItem } from '../stores/realtimeStore';
 
 function formatUptime(startedAtSec: number | null, status: string): string {
   if (status !== 'running' || startedAtSec == null) return '—';
@@ -52,26 +52,29 @@ function parseStrategyLabel(strategy: string, paramsJson: string | null): string
   return strategy.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+type ValuedWalletItem = WalletItem & { value: number };
+
+function hasUsdValue(item: WalletItem & { value?: number }): item is ValuedWalletItem {
+  return typeof item.value === 'number' && Number.isFinite(item.value) && item.value > 0;
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
   const tickers = useRealtimeStore((state) => state.marketTickers);
   const trackedTickers = useRealtimeStore((state) => state.trackedTickers);
   const bots = useRealtimeStore((state) => state.bots);
-  const botExecutionMode = useRealtimeStore((state) => state.tradingSettings?.execution_mode ?? null);
   const [wallet, setWallet] = useState<WalletItem[]>([]);
-  const [selectedWalletView, setSelectedWalletView] = useState<NetworkView | null>(null);
-  const walletView: NetworkView = selectedWalletView ?? (botExecutionMode === 'live' ? 'live' : 'testnet');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
   useEffect(() => {
     // Only show the full-page spinner on the very first load.
-    // Subsequent re-fetches (walletView switch etc.) update silently so the
+    // Subsequent re-fetches update silently so the
     // UI never goes blank while waiting for the Binance balance call.
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
 
-    fetch(`${API_BASE}/api/wallet/balances?view=${walletView}`, {
+    fetch(`${API_BASE}/api/wallet/balances?view=live`, {
       signal: controller.signal,
     })
       .then(async (res) => {
@@ -107,24 +110,30 @@ export default function Dashboard() {
       });
 
     return () => { clearTimeout(timeout); controller.abort(); };
-  }, [walletView]);
+  }, []);
 
-  const walletWithValues = wallet.map((item) => {
-    let usdPrice = 0;
-    if (['USDT', 'USDC', 'FDUSD', 'BUSD'].includes(item.asset)) {
-      usdPrice = 1;
-    } else {
-      const ticker = tickers[`${item.asset}USDT`];
-      if (ticker) {
-        usdPrice = parseFloat(ticker.price);
+  const walletWithValues = wallet
+    .map((item) => {
+      if (typeof item.usd_value === 'number' && Number.isFinite(item.usd_value)) {
+        return { ...item, value: item.usd_value };
       }
-    }
-    return { ...item, value: item.total * usdPrice };
-  });
+
+      let usdPrice = 0;
+      if (['USDT', 'USDC', 'FDUSD', 'BUSD'].includes(item.asset)) {
+        usdPrice = 1;
+      } else {
+        const ticker = tickers[`${item.asset}USDT`];
+        if (ticker) {
+          usdPrice = parseFloat(ticker.price);
+        }
+      }
+      return { ...item, value: usdPrice > 0 ? item.total * usdPrice : undefined };
+    })
+    .filter(hasUsdValue);
 
   const totalWalletValue = walletWithValues.reduce((acc, curr) => acc + (curr.value || 0), 0);
 
-  const viewLabel = walletView === 'live' ? 'Mainnet' : 'Testnet';
+  const viewLabel = 'Mainnet';
 
   // Bot aggregates
   const runningBots   = bots.filter((b) => b.status === 'running');
@@ -154,9 +163,7 @@ export default function Dashboard() {
                 ? '---'
                 : `$${totalWalletValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
             </div>
-            {walletView && (
-              <p className="text-xs text-gray-500 mt-1">Based on {viewLabel} wallet & matching spot prices</p>
-            )}
+            <p className="text-xs text-gray-500 mt-1">Based on {viewLabel} wallet & matching spot prices</p>
           </div>
 
           {/* Active bots (live) */}
@@ -288,54 +295,11 @@ export default function Dashboard() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
                 </svg>
                 Spot wallet
-                {walletView && (
-                  <span
-                    className={`text-xs font-bold uppercase px-2 py-0.5 rounded ${
-                      walletView === 'live' ? 'bg-red-500/20 text-red-400' : 'bg-blue-500/20 text-blue-400'
-                    }`}
-                  >
-                    {viewLabel}
-                  </span>
-                )}
+                <span className="text-xs font-bold uppercase px-2 py-0.5 rounded bg-red-500/20 text-red-400">
+                  {viewLabel}
+                </span>
               </h2>
-              <div
-                className="flex rounded-lg border border-border bg-surface p-0.5 shrink-0"
-                role="group"
-                aria-label="Wallet network"
-              >
-                <button
-                  type="button"
-                  aria-pressed={walletView === 'testnet'}
-                  onClick={() => setSelectedWalletView('testnet')}
-                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${
-                    walletView === 'testnet'
-                      ? 'bg-primary text-white'
-                      : 'text-gray-400 hover:text-white'
-                  }`}
-                >
-                  Testnet
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={walletView === 'live'}
-                  onClick={() => setSelectedWalletView('live')}
-                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-colors ${
-                    walletView === 'live'
-                      ? 'bg-red-600 text-white'
-                      : 'text-gray-400 hover:text-white'
-                  }`}
-                >
-                  Mainnet
-                </button>
-              </div>
             </div>
-            {botExecutionMode && walletView && botExecutionMode !== walletView && (
-              <p className="text-[11px] text-amber-400/90 mb-3">
-                Trading bots use Settings mode:{' '}
-                <span className="font-semibold">{botExecutionMode === 'live' ? 'Mainnet' : 'Testnet'}</span>. This
-                toggle is display-only for the dashboard.
-              </p>
-            )}
             <div className="flex-1 overflow-auto pr-2">
               {loading ? (
                 <div className="text-gray-400 py-4 flex items-center gap-2">
@@ -351,9 +315,9 @@ export default function Dashboard() {
                   <div className="mt-4 text-sm text-gray-300 space-y-1">
                     <p className="font-semibold text-gray-400">Checklist</p>
                     <p>
-                      1. In <code className="bg-black/50 px-1 rounded">.env</code>, use{' '}
-                      <code className="bg-black/50 px-1 rounded">BINANCE_TESTNET_API_KEY</code> for Testnet and{' '}
-                      <code className="bg-black/50 px-1 rounded">BINANCE_API_KEY</code> for Mainnet.
+                      1. In <code className="bg-black/50 px-1 rounded">.env</code>, set{' '}
+                      <code className="bg-black/50 px-1 rounded">BINANCE_API_KEY</code> and{' '}
+                      <code className="bg-black/50 px-1 rounded">BINANCE_API_SECRET</code>.
                     </p>
                     <p>
                       2. API key needs <strong className="text-gray-200">Enable Reading</strong>. Check IP whitelist.
@@ -378,7 +342,7 @@ export default function Dashboard() {
                     {walletWithValues.length === 0 ? (
                       <tr>
                         <td colSpan={3} className="py-8 text-center text-gray-500 italic">
-                          No assets found or balances are 0
+                          No assets with USDT value found
                         </td>
                       </tr>
                     ) : (
@@ -394,11 +358,7 @@ export default function Dashboard() {
                             {item.total.toLocaleString(undefined, { maximumFractionDigits: 6 })}
                           </td>
                           <td className="py-4 text-right font-mono">
-                            {item.value !== undefined && item.value > 0 ? (
-                              `$${item.value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                            ) : (
-                              <span className="text-gray-600">Syncing...</span>
-                            )}
+                            ${item.value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                           </td>
                         </tr>
                       ))
@@ -416,13 +376,11 @@ export default function Dashboard() {
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
               </svg>
               Spot markets
-              {walletView && (
-                <span className={`text-xs font-bold uppercase px-2 py-0.5 rounded ml-1 ${walletView === 'live' ? 'bg-red-500/15 text-red-400' : 'bg-blue-500/15 text-blue-400'}`}>
-                  {viewLabel}
-                </span>
-              )}
+              <span className="text-xs font-bold uppercase px-2 py-0.5 rounded ml-1 bg-red-500/15 text-red-400">
+                {viewLabel}
+              </span>
             </h2>
-            <p className="text-xs text-gray-500 mb-4">Eight tracked pairs — prices from the same network as the wallet toggle.</p>
+            <p className="text-xs text-gray-500 mb-4">Eight tracked pairs — prices from the mainnet market stream.</p>
             <div className="flex-1 overflow-auto pr-2">
               <table className="w-full text-left border-collapse">
                 <thead>
