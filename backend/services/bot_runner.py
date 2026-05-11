@@ -51,6 +51,7 @@ from database import (
     batch_record_bot_decisions,
     fetch_bot_orders_chronological,
     get_bot_risk_state,
+    get_bot_net_capital_flow,
     update_bot_risk_state,
     upsert_ohlcv_candles,
 )
@@ -272,7 +273,7 @@ _balance_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 _balance_cache_lock = threading.Lock()
 
 _POSITION_CACHE_TTL_SEC = float(os.environ.get("BOT_POSITION_CACHE_TTL_SEC", "60"))
-_position_cache: dict[tuple[str, str], tuple[float, tuple[float, float]]] = {}
+_position_cache: dict[tuple[str, str, str], tuple[float, tuple[float, float]]] = {}
 _position_cache_lock = threading.Lock()
 
 _FEATURES_SNAPSHOT_MISSING = object()
@@ -395,6 +396,7 @@ def _get_features_snapshot(symbol: str) -> str | None:
 
 def _log_voter_feedback(
     bot_id: str,
+    execution_mode: str,
     symbol: str,
     result: Any,
     features_snapshot: str | None | object = _FEATURES_SNAPSHOT_MISSING,
@@ -426,6 +428,7 @@ def _log_voter_feedback(
     records = [
         {
             "bot_id": bot_id,
+            "execution_mode": execution_mode,
             "timestamp": ts,
             "target_asset": symbol,
             "ensemble_signal": result.signal,
@@ -450,6 +453,7 @@ def _log_voter_feedback(
                         "voter_signal": r["voter_signal"],
                         "confidence": r["confidence"],
                         "consensus_score": r["consensus_score"],
+                        "execution_mode": r["execution_mode"],
                         "timestamp": r["timestamp"],
                     }
                     for r in records
@@ -722,14 +726,14 @@ def _log_post_trade_balance(
         )
 
 
-def _get_bot_position(bot_id: str, symbol: str) -> tuple[float, float]:
+def _get_bot_position(bot_id: str, symbol: str, execution_mode: str) -> tuple[float, float]:
     """
     Returns (open_base_position, open_cost_basis_quote) for this bot
     by replaying its order history using FIFO accounting.
     Used to constrain trades to the bot's configured budget.
     """
     try:
-        orders = fetch_bot_orders_chronological(bot_id)
+        orders = fetch_bot_orders_chronological(bot_id, mode=execution_mode)
         perf = compute_strategy_performance(orders, symbol)
         return float(perf["open_base_position"]), float(perf["open_cost_basis_quote"])
     except Exception as e:
@@ -741,20 +745,24 @@ def _get_bot_position(bot_id: str, symbol: str) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def _invalidate_position_cache(bot_id: str, symbol: str) -> None:
+def _invalidate_position_cache(bot_id: str, symbol: str, execution_mode: str | None = None) -> None:
     with _position_cache_lock:
-        _position_cache.pop((bot_id, symbol), None)
+        if execution_mode is None:
+            for key in [k for k in _position_cache if k[0] == bot_id and k[1] == symbol]:
+                _position_cache.pop(key, None)
+        else:
+            _position_cache.pop((bot_id, symbol, execution_mode), None)
 
 
-def _get_cached_bot_position(bot_id: str, symbol: str) -> tuple[float, float]:
+def _get_cached_bot_position(bot_id: str, symbol: str, execution_mode: str) -> tuple[float, float]:
     """Short-lived position cache; invalidated whenever this runner records an order."""
-    key = (bot_id, symbol)
+    key = (bot_id, symbol, execution_mode)
     now = time.monotonic()
     with _position_cache_lock:
         cached = _position_cache.get(key)
         if cached and now - cached[0] <= _POSITION_CACHE_TTL_SEC:
             return cached[1]
-    pos = _get_bot_position(bot_id, symbol)
+    pos = _get_bot_position(bot_id, symbol, execution_mode)
     with _position_cache_lock:
         _position_cache[key] = (now, pos)
     return pos
@@ -853,7 +861,7 @@ def _process_bot(
     phase_ms: dict[str, float] | None = None,
     market_cache: dict[str, dict[str, Any]] | None = None,
     balance_cache: dict[str, dict[str, Any]] | None = None,
-    position_cache: dict[tuple[str, str], tuple[float, float]] | None = None,
+    position_cache: dict[tuple[str, str, str], tuple[float, float]] | None = None,
     features_cache: dict[str, str | None] | None = None,
 ) -> None:
     """
@@ -869,6 +877,11 @@ def _process_bot(
     symbol = bot["symbol"]
     strategy_name = bot.get("strategy") or "sma_cross"
     params = _merge_params(strategy_name, bot.get("strategy_params_json"))
+    params["execution_mode"] = execution_mode
+    mode_budget = _f_order(bot.get(f"{execution_mode}_initial_capital_quote"))
+    if mode_budget > 0:
+        net_flow = get_bot_net_capital_flow(bot_id, execution_mode)
+        params["initial_budget_quote"] = max(0.0, mode_budget + net_flow)
     data_ex = public_ex if public_ex is not None else ex  # real prices for signals
 
     def _queue_decision(action: str, confidence: float | None, executed: bool) -> None:
@@ -985,7 +998,7 @@ def _process_bot(
         if features_cache is not None and symbol in features_cache
         else _FEATURES_SNAPSHOT_MISSING
     )
-    _log_voter_feedback(bot_id, symbol, result, features_snapshot)
+    _log_voter_feedback(bot_id, execution_mode, symbol, result, features_snapshot)
 
     if result.signal == "hold":
         if result.warmup:
@@ -1059,7 +1072,7 @@ def _process_bot(
         initial_budget_for_risk = max(0.0, free_quote)
     try:
         risk_settings = get_effective_bot_risk_settings(bot_id)
-        orders_for_risk = fetch_bot_orders_chronological(bot_id)
+        orders_for_risk = fetch_bot_orders_chronological(bot_id, mode=execution_mode)
         risk_state = get_bot_risk_state(bot_id)
         risk_decision = evaluate_trade_risk(
             settings=risk_settings,
@@ -1110,9 +1123,9 @@ def _process_bot(
         if initial_budget > 0:
             # Budget-constrained: only trade within the configured budget
             _, open_cost = (
-                position_cache.get((bot_id, symbol))
-                if position_cache is not None and (bot_id, symbol) in position_cache
-                else _get_cached_bot_position(bot_id, symbol)
+                position_cache.get((bot_id, symbol, execution_mode))
+                if position_cache is not None and (bot_id, symbol, execution_mode) in position_cache
+                else _get_cached_bot_position(bot_id, symbol, execution_mode)
             )
             remaining_budget = max(0.0, initial_budget - open_cost)
             if remaining_budget < min_cost:
@@ -1125,9 +1138,18 @@ def _process_bot(
             # Use 2% buffer on the minimum so price slippage between snapshot and fill
             # can't push the executed notional below the exchange minimum.
             min_spend = min_cost * 1.02 if min_cost > 0 else 0.0
-            spend = min(target_spend, remaining_budget, free_quote)
-            if spend < min_spend:
-                spend = min_spend
+            spend_cap = min(remaining_budget, free_quote)
+            if spend_cap < min_spend:
+                _log(
+                    bot_id,
+                    "warn",
+                    execution_mode,
+                    f"BUY skipped — capped spend {spend_cap:.4f} {quote_cur} "
+                    f"below exchange minimum {min_cost} {quote_cur}",
+                )
+                _close_decision()
+                return
+            spend = max(min_spend, min(target_spend, spend_cap))
             _log(bot_id, "info", execution_mode,
                  f"Budget: {remaining_budget:.4f} {quote_cur} remaining of {initial_budget:.2f} {quote_cur} budget")
         else:
@@ -1180,7 +1202,7 @@ def _process_bot(
             _last_trade_monotonic[bot_id] = time.monotonic()
             t_sub = time.perf_counter()
             record_bot_order(bot_id, execution_mode, order)
-            _invalidate_position_cache(bot_id, symbol)
+            _invalidate_position_cache(bot_id, symbol, execution_mode)
             trade_phase_ms["record_order_ms"] = (time.perf_counter() - t_sub) * 1000.0
             filled_base = _f_order(order.get("filled"))
             cost_quote = _f_order(order.get("cost")) or actual_spend
@@ -1239,9 +1261,9 @@ def _process_bot(
         if initial_budget > 0:
             # Sell only the base position this bot acquired with its own budget
             open_base, _ = (
-                position_cache.get((bot_id, symbol))
-                if position_cache is not None and (bot_id, symbol) in position_cache
-                else _get_cached_bot_position(bot_id, symbol)
+                position_cache.get((bot_id, symbol, execution_mode))
+                if position_cache is not None and (bot_id, symbol, execution_mode) in position_cache
+                else _get_cached_bot_position(bot_id, symbol, execution_mode)
             )
             if open_base <= 1e-12:
                 _log(bot_id, "info", execution_mode,
@@ -1396,7 +1418,7 @@ def _process_bot(
             _last_trade_monotonic[bot_id] = time.monotonic()
             t_sub = time.perf_counter()
             record_bot_order(bot_id, execution_mode, order)
-            _invalidate_position_cache(bot_id, symbol)
+            _invalidate_position_cache(bot_id, symbol, execution_mode)
             trade_phase_ms["record_order_ms"] = (time.perf_counter() - t_sub) * 1000.0
             filled_base = _f_order(order.get("filled"))
             cost_quote = _f_order(order.get("cost"))
@@ -1683,7 +1705,7 @@ def _run_one_cycle():
 
     _cycle_debug(cycle_id, "position_prefetch skipped")
     t_phase = time.perf_counter()
-    position_cache: dict[tuple[str, str], tuple[float, float]] = {}
+    position_cache: dict[tuple[str, str, str], tuple[float, float]] = {}
     # Position replay is only needed for budget-constrained BUY/SELL decisions.
     # Keep it lazy so HOLD cycles avoid DB order-history reads entirely.
     full_phase_ms["position_prefetch_ms"] = (time.perf_counter() - t_phase) * 1000.0

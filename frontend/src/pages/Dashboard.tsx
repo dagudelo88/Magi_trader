@@ -64,6 +64,7 @@ export default function Dashboard() {
   const trackedTickers = useRealtimeStore((state) => state.trackedTickers);
   const bots = useRealtimeStore((state) => state.bots);
   const [wallet, setWallet] = useState<WalletItem[]>([]);
+  const [walletView, setWalletView] = useState<'testnet' | 'live'>('live');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
 
@@ -95,6 +96,9 @@ export default function Dashboard() {
       .then((data: { balances?: WalletItem[]; execution_mode?: string; wallet_view?: string }) => {
         if (data.balances) {
           setWallet(data.balances);
+        }
+        if (data.wallet_view === 'testnet' || data.wallet_view === 'live') {
+          setWalletView(data.wallet_view);
         }
         setLoading(false);
       })
@@ -133,7 +137,7 @@ export default function Dashboard() {
 
   const totalWalletValue = walletWithValues.reduce((acc, curr) => acc + (curr.value || 0), 0);
 
-  const viewLabel = 'Mainnet';
+  const viewLabel = walletView === 'live' ? 'Mainnet' : 'Testnet';
 
   // Bot aggregates
   const runningBots   = bots.filter((b) => b.status === 'running');

@@ -23,6 +23,12 @@ The project name and ensemble concept are inspired by the **Magi supercomputer**
 
 ## Voters, ensembles, and how trades run
 
+## Live/Testnet Bot Separation
+
+Each bot keeps separate `testnet` and `live` metrics, fills, trade PnL, and voter feedback. The bot detail page defaults to the bot's active `execution_mode`: live bots open on Live Performance and Live Execution History, while testnet bots open on Testnet Performance and Testnet Execution History. Users can still switch tabs to inspect the other mode's historical data.
+
+Promoting a bot with `POST /api/bots/{bot_id}/promote-to-live` requires an explicit live initial capital allocation and starts a separate live execution history. Orders are still capped by the real mainnet wallet balance, while later cash-outs/deposits can be recorded as capital flows so they adjust deployable capital without counting as trading losses. MetaMagi feedback is labeled by mode for auditability; live execution can reuse testnet-learned weights as priors, then refine them with live feedback as it accumulates.
+
 ### Voters vs bot
 
 - **Voters** are individual strategies registered in [`backend/trading/strategies/registry.py`](backend/trading/strategies/registry.py) (e.g. SMA cross, MACD+RSI). Each returns `buy`, `sell`, or `hold` from OHLCV (and sometimes extra features). They **do not** call the exchange.

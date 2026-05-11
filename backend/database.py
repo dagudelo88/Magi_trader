@@ -569,6 +569,9 @@ def init_db():
             strategy_params_json TEXT,
             status TEXT NOT NULL DEFAULT 'stopped',
             execution_mode TEXT NOT NULL DEFAULT 'testnet',
+            capital_source TEXT NOT NULL DEFAULT 'budget',
+            live_initial_capital_quote REAL,
+            testnet_initial_capital_quote REAL,
             created_at INTEGER NOT NULL
         )
     """)
@@ -582,6 +585,54 @@ def init_db():
         cursor.execute("ALTER TABLE bots ADD COLUMN started_at INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
+    for col, col_def in [
+        ("capital_source", "TEXT NOT NULL DEFAULT 'budget'"),
+        ("live_initial_capital_quote", "REAL"),
+        ("testnet_initial_capital_quote", "REAL"),
+    ]:
+        try:
+            cursor.execute(f"ALTER TABLE bots ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+    # Backfill the new per-mode testnet initial capital from legacy strategy params.
+    try:
+        cursor.execute(
+            """
+            SELECT bot_id, strategy_params_json
+            FROM bots
+            WHERE testnet_initial_capital_quote IS NULL
+            """
+        )
+        backfills: list[tuple[float, str]] = []
+        for row in cursor.fetchall():
+            raw = row["strategy_params_json"]
+            budget: float | None = None
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    params = json.loads(raw)
+                except json.JSONDecodeError:
+                    params = {}
+                if isinstance(params, dict):
+                    for key in ("initial_budget_quote", "trading_budget_quote", "budget_usdt"):
+                        if key not in params:
+                            continue
+                        try:
+                            value = float(params[key])
+                        except (TypeError, ValueError):
+                            continue
+                        if value > 0:
+                            budget = value
+                            break
+            if budget is not None:
+                backfills.append((budget, row["bot_id"]))
+        if backfills:
+            cursor.executemany(
+                "UPDATE bots SET testnet_initial_capital_quote = ? WHERE bot_id = ?",
+                backfills,
+            )
+    except Exception:
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_logs (
@@ -617,6 +668,27 @@ def init_db():
     """)
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_bot_orders_bot_time ON bot_orders(bot_id, created_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bot_orders_bot_mode_time "
+        "ON bot_orders(bot_id, execution_mode, created_at DESC)"
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_capital_flows (
+            flow_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            execution_mode TEXT NOT NULL,
+            amount_quote REAL NOT NULL,
+            flow_type TEXT NOT NULL,
+            reason TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (bot_id) REFERENCES bots(bot_id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bot_capital_flows_bot_mode_time "
+        "ON bot_capital_flows(bot_id, execution_mode, created_at DESC)"
     )
 
     cursor.execute("""
@@ -706,6 +778,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS voter_feedback (
             feedback_id        INTEGER PRIMARY KEY AUTOINCREMENT,
             bot_id             TEXT,
+            execution_mode     TEXT,
             timestamp          INTEGER NOT NULL,
             target_asset       TEXT    NOT NULL,
             ensemble_signal    TEXT    NOT NULL,
@@ -720,13 +793,19 @@ def init_db():
         )
     """)
     # Migrate existing databases that predate the bot_id / confidence columns.
-    for col, col_def in [("bot_id", "TEXT"), ("confidence", "REAL")]:
+    for col, col_def in [("bot_id", "TEXT"), ("execution_mode", "TEXT"), ("confidence", "REAL")]:
         try:
             cursor.execute(
                 f"ALTER TABLE voter_feedback ADD COLUMN {col} {col_def}"
             )
         except Exception:
             pass  # column already exists — safe to ignore
+    try:
+        cursor.execute(
+            "UPDATE voter_feedback SET execution_mode = 'testnet' WHERE execution_mode IS NULL"
+        )
+    except Exception:
+        pass
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_voter_feedback_asset_ts "
         "ON voter_feedback(target_asset, timestamp)"
@@ -734,6 +813,10 @@ def init_db():
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_voter_feedback_bot_ts "
         "ON voter_feedback(bot_id, timestamp)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_voter_feedback_bot_mode_ts "
+        "ON voter_feedback(bot_id, execution_mode, timestamp)"
     )
     # Per-voter-name lookups for MetaMagi training and feature extraction.
     cursor.execute(
@@ -895,9 +978,9 @@ def sync_bot_orders_from_logs(bot_id: str, symbol: str) -> int:
                 cur.execute(
                     """
                     SELECT 1 FROM bot_orders
-                    WHERE bot_id = ? AND exchange_order_id = ?
+                    WHERE bot_id = ? AND exchange_order_id = ? AND execution_mode = ?
                     """,
-                    (bot_id, ex_id),
+                    (bot_id, ex_id, ex_mode),
                 )
                 if cur.fetchone():
                     continue
@@ -941,9 +1024,9 @@ def sync_bot_orders_from_logs(bot_id: str, symbol: str) -> int:
                 cur.execute(
                     """
                     SELECT 1 FROM bot_orders
-                    WHERE bot_id = ? AND exchange_order_id = ?
+                    WHERE bot_id = ? AND exchange_order_id = ? AND execution_mode = ?
                     """,
-                    (bot_id, ex_id),
+                    (bot_id, ex_id, ex_mode),
                 )
                 if cur.fetchone():
                     continue
@@ -987,8 +1070,21 @@ def sync_bot_orders_from_logs(bot_id: str, symbol: str) -> int:
         conn.close()
 
 
-def fetch_bot_orders_panel(bot_id: str, order_limit: int = 50) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def _mode_filter(mode: str | None) -> str | None:
+    if mode is None or mode == "both":
+        return None
+    if mode not in ("testnet", "live"):
+        raise ValueError("mode must be 'testnet', 'live', or 'both'")
+    return mode
+
+
+def fetch_bot_orders_panel(
+    bot_id: str,
+    order_limit: int = 50,
+    mode: str | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Aggregate stats and recent rows for the bot detail API."""
+    mode_filter = _mode_filter(mode)
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -1001,8 +1097,9 @@ def fetch_bot_orders_panel(bot_id: str, order_limit: int = 50) -> tuple[dict[str
                 MAX(created_at) AS last_order_at_ms
             FROM bot_orders
             WHERE bot_id = ?
+              AND (? IS NULL OR execution_mode = ?)
             """,
-            (bot_id,),
+            (bot_id, mode_filter, mode_filter),
         )
         row = cur.fetchone()
         stats = {
@@ -1018,10 +1115,11 @@ def fetch_bot_orders_panel(bot_id: str, order_limit: int = 50) -> tuple[dict[str
                    raw_response_json
             FROM bot_orders
             WHERE bot_id = ?
+              AND (? IS NULL OR execution_mode = ?)
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (bot_id, order_limit),
+            (bot_id, mode_filter, mode_filter, order_limit),
         )
         orders = []
         for r in cur.fetchall():
@@ -1132,19 +1230,24 @@ def fork_bot(
         conn.close()
 
 
-def fetch_bot_orders_chronological(bot_id: str) -> list[dict[str, Any]]:
+def fetch_bot_orders_chronological(
+    bot_id: str,
+    mode: str | None = None,
+) -> list[dict[str, Any]]:
     """All orders for FIFO PnL (oldest first)."""
+    mode_filter = _mode_filter(mode)
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT side, amount, cost, average, filled, created_at, symbol
+            SELECT side, amount, cost, average, filled, created_at, symbol, execution_mode
             FROM bot_orders
             WHERE bot_id = ?
+              AND (? IS NULL OR execution_mode = ?)
             ORDER BY created_at ASC, order_row_id ASC
             """,
-            (bot_id,),
+            (bot_id, mode_filter, mode_filter),
         )
         return [_row_to_dict(r) for r in cur.fetchall()]
     finally:
@@ -1198,7 +1301,7 @@ def insert_voter_feedback(record: dict[str, Any]) -> None:
     Persist one voter's vote for a single ensemble decision.
 
     Required keys: timestamp, target_asset, ensemble_signal, voter_name, voter_signal
-    Optional keys: bot_id, confidence, consensus_score, features_snapshot (JSON string)
+    Optional keys: bot_id, execution_mode, confidence, consensus_score, features_snapshot (JSON string)
     Deferred keys: forward_roc_30s, forward_roc_5m, realized_pnl  (filled by training loop)
     """
     conn = get_db_connection()
@@ -1206,14 +1309,15 @@ def insert_voter_feedback(record: dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT INTO voter_feedback (
-                bot_id, timestamp, target_asset, ensemble_signal,
+                bot_id, execution_mode, timestamp, target_asset, ensemble_signal,
                 voter_name, voter_signal, confidence,
                 forward_roc_30s, forward_roc_5m, realized_pnl,
                 consensus_score, features_snapshot
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.get("bot_id"),
+                record.get("execution_mode") or "testnet",
                 record["timestamp"],
                 record["target_asset"],
                 record["ensemble_signal"],
@@ -1272,6 +1376,7 @@ def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
     rows = [
         (
             r.get("bot_id"),
+            r.get("execution_mode") or "testnet",
             r["timestamp"],
             r["target_asset"],
             r["ensemble_signal"],
@@ -1292,11 +1397,11 @@ def batch_insert_voter_feedback(records: list[dict[str, Any]]) -> None:
         conn.executemany(
             """
             INSERT INTO voter_feedback (
-                bot_id, timestamp, target_asset, ensemble_signal,
+                bot_id, execution_mode, timestamp, target_asset, ensemble_signal,
                 voter_name, voter_signal, confidence,
                 forward_roc_30s, forward_roc_5m, realized_pnl,
                 consensus_score, features_snapshot
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -1367,13 +1472,17 @@ def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
     )
 
 
-def get_latest_voter_signals(bot_id: str) -> list[dict[str, Any]]:
+def get_latest_voter_signals(
+    bot_id: str,
+    mode: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Return the most-recent signal for each voter for a given bot.
 
     Used by the Bot Detail page to render live voter cards.
     Each row: voter_name, voter_signal, confidence, consensus_score, timestamp.
     """
+    mode_filter = _mode_filter(mode)
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -1383,43 +1492,51 @@ def get_latest_voter_signals(bot_id: str) -> list[dict[str, Any]]:
                    vf.voter_signal,
                    vf.confidence,
                    vf.consensus_score,
+                   vf.execution_mode,
                    vf.timestamp
             FROM voter_feedback vf
             INNER JOIN (
                 SELECT voter_name, MAX(timestamp) AS max_ts
                 FROM voter_feedback
                 WHERE bot_id = ?
+                  AND (? IS NULL OR execution_mode = ?)
                 GROUP BY voter_name
             ) latest
               ON vf.voter_name = latest.voter_name
              AND vf.timestamp  = latest.max_ts
              AND vf.bot_id     = ?
+             AND (? IS NULL OR vf.execution_mode = ?)
             ORDER BY vf.voter_name ASC
             """,
-            (bot_id, bot_id),
+            (bot_id, mode_filter, mode_filter, bot_id, mode_filter, mode_filter),
         )
         return [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
 
 
-def get_voter_feedback_batch(hours: int = 24) -> list[dict[str, Any]]:
+def get_voter_feedback_batch(
+    hours: int = 24,
+    mode: str | None = None,
+) -> list[dict[str, Any]]:
     """Return labeled + unlabeled voter_feedback rows from the last `hours` hours."""
     cutoff_ms = int((time.time() - hours * 3600) * 1000)
+    mode_filter = _mode_filter(mode)
     conn = get_db_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT feedback_id, timestamp, target_asset, ensemble_signal,
+            SELECT feedback_id, execution_mode, timestamp, target_asset, ensemble_signal,
                    voter_name, voter_signal,
                    forward_roc_30s, forward_roc_5m, realized_pnl,
                    consensus_score, features_snapshot
             FROM voter_feedback
             WHERE timestamp >= ?
+              AND (? IS NULL OR execution_mode = ?)
             ORDER BY timestamp ASC
             """,
-            (cutoff_ms,),
+            (cutoff_ms, mode_filter, mode_filter),
         )
         return [dict(row) for row in cur.fetchall()]
     finally:
@@ -2005,6 +2122,9 @@ def create_bot(
     strategy: str = "sma_cross",
     strategy_params_json: str | None = None,
     execution_mode: str = "testnet",
+    capital_source: str = "budget",
+    testnet_initial_capital_quote: float | None = None,
+    live_initial_capital_quote: float | None = None,
 ) -> dict[str, Any]:
     """Create a new bot in testnet mode by default and return its full record."""
     conn = get_db_connection()
@@ -2020,11 +2140,14 @@ def create_bot(
         cur.execute(
             """
             INSERT INTO bots
-              (bot_id, name, symbol, strategy, strategy_params_json, status, execution_mode, created_at)
-            VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?)
+              (bot_id, name, symbol, strategy, strategy_params_json, status,
+               execution_mode, capital_source, testnet_initial_capital_quote,
+               live_initial_capital_quote, created_at)
+            VALUES (?, ?, ?, ?, ?, 'stopped', ?, ?, ?, ?, ?)
             """,
             (new_id, name.strip(), symbol.upper().strip(), strategy, strategy_params_json,
-             execution_mode, now),
+             execution_mode, capital_source, testnet_initial_capital_quote,
+             live_initial_capital_quote, now),
         )
         conn.commit()
         cur.execute("SELECT * FROM bots WHERE bot_id = ?", (new_id,))
@@ -2183,6 +2306,119 @@ def set_bot_execution_mode(bot_id: str, execution_mode: str) -> dict[str, Any]:
         conn.commit()
         cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
         return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def promote_bot_to_live(
+    bot_id: str,
+    *,
+    initial_capital_quote: float,
+) -> dict[str, Any]:
+    """Switch a stopped bot to live mode and persist live capital settings."""
+    if initial_capital_quote <= 0:
+        raise ValueError("initial_capital_quote must be positive")
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"bot not found: {bot_id!r}")
+        if row["status"] == "running":
+            raise ValueError("stop the bot before changing execution mode")
+        cur.execute(
+            """
+            UPDATE bots
+            SET execution_mode = 'live',
+                capital_source = 'budget',
+                live_initial_capital_quote = ?
+            WHERE bot_id = ?
+            """,
+            (initial_capital_quote, bot_id),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def record_bot_capital_flow(
+    bot_id: str,
+    execution_mode: str,
+    amount_quote: float,
+    flow_type: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Record an external capital flow, e.g. deposit or cash-out withdrawal."""
+    if execution_mode not in ("testnet", "live"):
+        raise ValueError("execution_mode must be 'testnet' or 'live'")
+    if flow_type not in ("deposit", "withdrawal", "adjustment"):
+        raise ValueError("flow_type must be deposit, withdrawal, or adjustment")
+    if amount_quote <= 0:
+        raise ValueError("amount_quote must be positive")
+    signed = -amount_quote if flow_type == "withdrawal" else amount_quote
+    now = int(time.time() * 1000)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM bots WHERE bot_id = ?", (bot_id,))
+        if not cur.fetchone():
+            raise ValueError(f"bot not found: {bot_id!r}")
+        cur.execute(
+            """
+            INSERT INTO bot_capital_flows
+              (bot_id, execution_mode, amount_quote, flow_type, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (bot_id, execution_mode, signed, flow_type, reason, now),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM bot_capital_flows WHERE flow_id = ?", (cur.lastrowid,))
+        return _row_to_dict(cur.fetchone())
+    finally:
+        conn.close()
+
+
+def get_bot_capital_flows(
+    bot_id: str,
+    execution_mode: str | None = None,
+) -> list[dict[str, Any]]:
+    mode_filter = _mode_filter(execution_mode)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT * FROM bot_capital_flows
+            WHERE bot_id = ?
+              AND (? IS NULL OR execution_mode = ?)
+            ORDER BY created_at DESC, flow_id DESC
+            """,
+            (bot_id, mode_filter, mode_filter),
+        )
+        return [_row_to_dict(row) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_bot_net_capital_flow(bot_id: str, execution_mode: str | None = None) -> float:
+    mode_filter = _mode_filter(execution_mode)
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COALESCE(SUM(amount_quote), 0) AS net_flow
+            FROM bot_capital_flows
+            WHERE bot_id = ?
+              AND (? IS NULL OR execution_mode = ?)
+            """,
+            (bot_id, mode_filter, mode_filter),
+        )
+        row = cur.fetchone()
+        return float(row["net_flow"] or 0.0) if row else 0.0
     finally:
         conn.close()
 

@@ -5,6 +5,8 @@ import type { MagiWebSocketMessage, WebSocketStatus } from '../hooks/useMagiWebS
 import type { RiskSettings } from '../riskSettings';
 
 export type NetworkView = 'testnet' | 'live';
+export type ExecutionMode = NetworkView;
+export type CapitalSource = 'budget' | 'wallet';
 
 export interface Ticker {
   symbol: string;
@@ -31,12 +33,17 @@ export interface BotRow {
   strategy_params_json?: string | null;
   status: string;
   execution_mode: string;
+  capital_source?: CapitalSource;
+  live_initial_capital_quote?: number | null;
+  testnet_initial_capital_quote?: number | null;
   started_at?: number | null;
   initial_budget_quote: number | null;
   realized_pnl_quote: number | null;
   win_rate_pct: number | null;
   closed_trades: number | null;
   risk_settings?: RiskSettings;
+  current_capital_quote?: number | null;
+  metrics?: Partial<Record<ExecutionMode, StrategyHealth>>;
 }
 
 export interface TradingSettings {
@@ -52,6 +59,9 @@ export interface BotRecord {
   strategy: string;
   status: string;
   execution_mode: string;
+  capital_source?: CapitalSource;
+  live_initial_capital_quote?: number | null;
+  testnet_initial_capital_quote?: number | null;
   strategy_params_json: string | null;
   risk_settings?: RiskSettings;
 }
@@ -88,6 +98,17 @@ export interface StrategyHealth {
   mark_price: number | null;
   total_pnl_quote: number;
   initial_budget_quote: number | null;
+  adjusted_initial_capital_quote?: number | null;
+  net_capital_flow_quote?: number;
+  capital_flows?: Array<{
+    flow_id: number;
+    bot_id: string;
+    execution_mode: string;
+    amount_quote: number;
+    flow_type: string;
+    reason: string | null;
+    created_at: number;
+  }>;
   current_capital_quote: number | null;
   pnl_return_on_budget_pct: number | null;
   max_drawdown_vs_budget_pct: number | null;
@@ -133,6 +154,20 @@ export interface LiveVoterSignal {
   confidence: number | null;
   consensus_score: number | null;
   timestamp: number;
+  execution_mode?: ExecutionMode;
+}
+
+export interface ExecutionHistory {
+  mode: ExecutionMode;
+  active_execution_mode: ExecutionMode;
+  order_stats: BotOrderStats;
+  fills: BotOrderRow[];
+  trades: ClosedTrade[];
+  metrics: StrategyHealth;
+  realized_pnl_quote: number;
+  win_rate_pct: number | null;
+  best_trade_pnl: number | null;
+  worst_trade_pnl: number | null;
 }
 
 export interface BotDetailState {
@@ -141,9 +176,12 @@ export interface BotDetailState {
   orderStats: BotOrderStats | null;
   orders: BotOrderRow[];
   strategyHealth: StrategyHealth | null;
+  metrics: Partial<Record<ExecutionMode, StrategyHealth>> | null;
   executionMode: string | null;
   tradeSummary: ClosedTrade[] | null;
   tradeSummaryLoading: boolean;
+  executionHistories: Partial<Record<ExecutionMode, ExecutionHistory>>;
+  executionHistoryLoading: boolean;
   liveVoterSignals: LiveVoterSignal[];
   voterSignalsUpdatedAt: number | null;
   loaded: boolean;
@@ -183,8 +221,9 @@ interface RealtimeState {
   handleMarketMessage: (message: MagiWebSocketMessage<Record<string, unknown>>) => void;
   handleBotDetailMessage: (botId: string, message: MagiWebSocketMessage<Record<string, unknown>>) => void;
   loadBotDetail: (botId: string, signal?: AbortSignal) => Promise<void>;
-  loadTradeSummary: (botId: string, signal?: AbortSignal) => Promise<void>;
-  loadVoterSignals: (botId: string, signal?: AbortSignal) => Promise<void>;
+  loadTradeSummary: (botId: string, mode?: ExecutionMode, signal?: AbortSignal) => Promise<void>;
+  loadExecutionHistory: (botId: string, mode: ExecutionMode, signal?: AbortSignal) => Promise<void>;
+  loadVoterSignals: (botId: string, mode?: ExecutionMode, signal?: AbortSignal) => Promise<void>;
   patchBotStatus: (botId: string, status: string) => void;
   removeBot: (botId: string) => void;
   scheduleBotsRefresh: () => void;
@@ -197,9 +236,12 @@ const emptyBotDetail = (): BotDetailState => ({
   orderStats: null,
   orders: [],
   strategyHealth: null,
+  metrics: null,
   executionMode: null,
   tradeSummary: null,
   tradeSummaryLoading: false,
+  executionHistories: {},
+  executionHistoryLoading: false,
   liveVoterSignals: [],
   voterSignalsUpdatedAt: null,
   loaded: false,
@@ -527,6 +569,7 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
             orderStats: data.order_stats ?? null,
             orders: data.orders || [],
             strategyHealth: data.strategy_health ?? null,
+            metrics: data.metrics ?? null,
             executionMode: data.execution_mode ?? null,
             loaded: true,
             loading: false,
@@ -554,7 +597,7 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
     }
   },
 
-  loadTradeSummary: async (botId, signal) => {
+  loadTradeSummary: async (botId, mode, signal) => {
     set((state) => {
       const detail = state.botDetailsById[botId] ?? emptyBotDetail();
       return {
@@ -565,7 +608,8 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
       };
     });
     try {
-      const res = await fetch(`${API_BASE}/api/bots/${botId}/trade-summary`, { signal });
+      const qs = mode ? `?mode=${mode}` : '';
+      const res = await fetch(`${API_BASE}/api/bots/${botId}/trade-summary${qs}`, { signal });
       if (!res.ok) return;
       const data = (await res.json()) as { trades: ClosedTrade[] };
       set((state) => {
@@ -592,9 +636,52 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
     }
   },
 
-  loadVoterSignals: async (botId, signal) => {
+  loadExecutionHistory: async (botId, mode, signal) => {
+    set((state) => {
+      const detail = state.botDetailsById[botId] ?? emptyBotDetail();
+      return {
+        botDetailsById: {
+          ...state.botDetailsById,
+          [botId]: { ...detail, executionHistoryLoading: true },
+        },
+      };
+    });
     try {
-      const res = await fetch(`${API_BASE}/api/bots/${botId}/voter-signals`, { signal });
+      const res = await fetch(`${API_BASE}/api/bots/${botId}/execution-history?mode=${mode}`, { signal });
+      if (!res.ok) return;
+      const data = (await res.json()) as ExecutionHistory;
+      set((state) => {
+        const detail = state.botDetailsById[botId] ?? emptyBotDetail();
+        return {
+          botDetailsById: {
+            ...state.botDetailsById,
+            [botId]: {
+              ...detail,
+              executionHistories: { ...detail.executionHistories, [mode]: data },
+              executionHistoryLoading: false,
+            },
+          },
+        };
+      });
+    } catch (e) {
+      if (e instanceof Error && e.name === 'AbortError') return;
+    } finally {
+      set((state) => {
+        const detail = state.botDetailsById[botId] ?? emptyBotDetail();
+        return {
+          botDetailsById: {
+            ...state.botDetailsById,
+            [botId]: { ...detail, executionHistoryLoading: false },
+          },
+        };
+      });
+    }
+  },
+
+  loadVoterSignals: async (botId, mode, signal) => {
+    try {
+      const qs = mode ? `?mode=${mode}` : '';
+      const res = await fetch(`${API_BASE}/api/bots/${botId}/voter-signals${qs}`, { signal });
       if (!res.ok) return;
       const data = (await res.json()) as { voter_signals: LiveVoterSignal[] };
       set((state) => {

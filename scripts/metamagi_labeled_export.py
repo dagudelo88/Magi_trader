@@ -75,6 +75,11 @@ def labeled_table_schema() -> dict[str, Any]:
                 "role": "Bot that produced the vote (nullable in legacy rows).",
             },
             {
+                "name": "execution_mode",
+                "type": "text",
+                "role": "Mode that produced the feedback: testnet | live.",
+            },
+            {
                 "name": "timestamp",
                 "type": "integer (ms since Unix epoch)",
                 "role": "Cycle time; same for all voters in one ensemble decision.",
@@ -917,7 +922,7 @@ def _fetch_sample_rows(
     cur = conn.cursor()
     cur.execute(
         f"""
-        SELECT feedback_id, bot_id, timestamp, target_asset, ensemble_signal,
+        SELECT feedback_id, bot_id, execution_mode, timestamp, target_asset, ensemble_signal,
                voter_name, voter_signal, confidence, consensus_score,
                forward_roc_30s, forward_roc_5m,
                features_snapshot
@@ -987,6 +992,7 @@ def build_export_payload(
     sample_rows: int,
     include_feature_keys: bool,
     bot_row: sqlite3.Row | None,
+    execution_mode_filter: str | None = None,
     weight_method: Literal["edge", "accuracy", "both"] = "edge",
     blend_alpha: float = 0.65,
 ) -> dict[str, Any]:
@@ -995,6 +1001,9 @@ def build_export_payload(
     if bot_id_filter:
         clauses.append("bot_id = ?")
         params.append(bot_id_filter)
+    if execution_mode_filter:
+        clauses.append("execution_mode = ?")
+        params.append(execution_mode_filter)
     if since_ms is not None:
         clauses.append("timestamp >= ?")
         params.append(since_ms)
@@ -1055,6 +1064,7 @@ def build_export_payload(
             "all_time": since_ms is None,
             "roc_threshold_used": roc_threshold,
             "weight_method": weight_method,
+            "execution_mode": execution_mode_filter or "both",
             "blend_alpha_used": float(blend_alpha),
         },
         "labeled_data_schema": labeled_table_schema(),
@@ -1265,6 +1275,12 @@ def main() -> None:
     )
     p.add_argument("--bot", type=str, default=None, help="Restrict to one bot (id, name, or prefix)")
     p.add_argument(
+        "--mode",
+        choices=("testnet", "live", "both"),
+        default="both",
+        help="Restrict voter_feedback to one execution mode, or use both (default both)",
+    )
+    p.add_argument(
         "--hours",
         type=float,
         default=168.0,
@@ -1370,6 +1386,7 @@ def main() -> None:
                     sample_rows=int(cfg_o.sample_rows),
                     include_feature_keys=bool(cfg_o.include_feature_keys),
                     bot_row=bot_row,
+                    execution_mode_filter=None if args.mode == "both" else args.mode,
                     weight_method=args.weight_method,
                     blend_alpha=float(args.blend_alpha),
                 )
@@ -1410,6 +1427,7 @@ def main() -> None:
             sample_rows=int(args.sample_rows),
             include_feature_keys=bool(args.include_feature_keys),
             bot_row=bot_row,
+            execution_mode_filter=None if args.mode == "both" else args.mode,
             weight_method=args.weight_method,
             blend_alpha=float(args.blend_alpha),
         )

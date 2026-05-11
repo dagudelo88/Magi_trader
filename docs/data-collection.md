@@ -137,7 +137,7 @@ This paginates the Binance public REST API (no API key required) and inserts int
 
 ### `voter_feedback` — written by `bot_runner`
 
-One row per voter per ensemble decision cycle. Powers MetaMagi dynamic weight learning.
+One row per voter per ensemble decision cycle. Powers MetaMagi dynamic weight learning. Rows include `execution_mode` so labels, exports, and weight updates can be audited separately for testnet and live.
 
 | Column | Meaning |
 |---|---|
@@ -181,6 +181,8 @@ Because `market_ticks` stores one snapshot per second per asset continuously, fo
 ---
 
 ## MetaMagi weight learning
+
+MetaMagi keeps feedback mode-aware, but live bots are not forced to start cold: live dynamic weights use testnet-learned accuracy as the prior and then overlay live feedback once real mainnet rows exist. Manual optimization can also target a mode with `POST /api/bots/{bot_id}/optimize-weights?mode=testnet|live|current`.
 
 After labeling, the background loop calls `metatrader.train_step(batch)` in `backend/trading/metatrader.py`. This updates each voter's **exponential moving accuracy** — the fraction of past decisions where the voter's signal matched the actual forward price direction. On the next bot cycle, `ensemble_core.run_consensus()` calls `metatrader.get_dynamic_weights()` to shift voter weights toward historically accurate voters.
 

@@ -50,25 +50,41 @@ class MetaTrader:
                            move. Smaller moves are labelled "hold" outcomes.
         """
         self._roc_threshold = roc_threshold
-        self._accuracies: dict[str, float] = {}
+        self._accuracies_by_mode: dict[str, dict[str, float]] = {
+            "testnet": {},
+            "live": {},
+        }
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Hot-path method — must be fast, no I/O
     # ------------------------------------------------------------------
 
-    def get_dynamic_weights(self, voter_names: list[str]) -> dict[str, float]:
+    def get_dynamic_weights(
+        self,
+        voter_names: list[str],
+        mode: str = "testnet",
+    ) -> dict[str, float]:
         """
         Return normalised dynamic weights for the given voters.
 
         Voters with no recorded accuracy yet receive weight 1.0 (neutral).
+        Live mode uses testnet learned accuracy as its prior, then overlays any
+        live-specific feedback once it exists. That preserves the point of
+        incubating bots in testnet before promoting them to mainnet.
         Weights are scaled so their average equals 1.0 and each is clamped
         to [_MIN_WEIGHT, average * _MAX_WEIGHT_MULTIPLIER].
         """
+        mode_key = mode if mode in ("testnet", "live") else "testnet"
         with self._lock:
-            raw: dict[str, float] = {
-                v: self._accuracies.get(v, 0.5) for v in voter_names
-            }
+            testnet_acc = self._accuracies_by_mode.get("testnet", {})
+            mode_acc = self._accuracies_by_mode.get(mode_key, {})
+            raw: dict[str, float] = {}
+            for voter in voter_names:
+                if mode_key == "live":
+                    raw[voter] = mode_acc.get(voter, testnet_acc.get(voter, 0.5))
+                else:
+                    raw[voter] = mode_acc.get(voter, 0.5)
 
         if not raw:
             return {}
@@ -91,8 +107,10 @@ class MetaTrader:
     # ------------------------------------------------------------------
 
     def train_step(
-        self, feedback_batch: list[dict[str, Any]]
-    ) -> dict[str, float]:
+        self,
+        feedback_batch: list[dict[str, Any]],
+        mode: str | None = None,
+    ) -> dict[str, dict[str, float]] | dict[str, float]:
         """
         Update voter accuracy EMAs from a batch of labeled voter_feedback rows.
 
@@ -108,31 +126,38 @@ class MetaTrader:
             if r.get("forward_roc_30s") is not None
         ]
         if not labeled:
-            return dict(self._accuracies)
+            with self._lock:
+                snapshot = {m: dict(v) for m, v in self._accuracies_by_mode.items()}
+            return snapshot if mode is None else snapshot.get(mode, {})
 
-        # Accumulate per-voter correctness within this batch, then EMA.
-        batch_correct: dict[str, list[float]] = {}
+        # Accumulate per-mode, per-voter correctness within this batch, then EMA.
+        batch_correct: dict[str, dict[str, list[float]]] = {}
         for row in labeled:
+            row_mode = mode or str(row.get("execution_mode") or "testnet")
+            if row_mode not in ("testnet", "live"):
+                row_mode = "testnet"
             voter = row["voter_name"]
             signal = row["voter_signal"]
             roc = float(row["forward_roc_30s"])
-            batch_correct.setdefault(voter, []).append(
+            batch_correct.setdefault(row_mode, {}).setdefault(voter, []).append(
                 float(self._is_correct(signal, roc))
             )
 
         with self._lock:
-            for voter, scores in batch_correct.items():
-                batch_mean = sum(scores) / len(scores)
-                self._accuracies[voter] = _ema_update(
-                    self._accuracies.get(voter, 0.5), batch_mean
-                )
+            for row_mode, voters in batch_correct.items():
+                mode_acc = self._accuracies_by_mode.setdefault(row_mode, {})
+                for voter, scores in voters.items():
+                    batch_mean = sum(scores) / len(scores)
+                    mode_acc[voter] = _ema_update(mode_acc.get(voter, 0.5), batch_mean)
 
         logger.info(
-            "MetaTrader: updated %d voter(s) from %d labeled rows.",
-            len(batch_correct),
+            "MetaTrader: updated weights by mode from %d labeled rows: %s",
             len(labeled),
+            ", ".join(f"{m}={len(v)} voter(s)" for m, v in sorted(batch_correct.items())),
         )
-        return dict(self._accuracies)
+        with self._lock:
+            snapshot = {m: dict(v) for m, v in self._accuracies_by_mode.items()}
+        return snapshot if mode is None else snapshot.get(mode, {})
 
     def _is_correct(self, signal: str, forward_roc: float) -> bool:
         """Return True if the voter signal matched the actual direction."""

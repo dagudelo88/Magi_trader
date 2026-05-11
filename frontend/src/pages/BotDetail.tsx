@@ -11,7 +11,7 @@ import {
   type DrawdownAction,
   type RiskSettings,
 } from '../riskSettings';
-import { botLogIdentity, useRealtimeStore } from '../stores/realtimeStore';
+import { botLogIdentity, useRealtimeStore, type ExecutionMode } from '../stores/realtimeStore';
 
 /** Pixels from bottom to consider the user "at" the latest log line. */
 const LOG_BOTTOM_THRESHOLD_PX = 72;
@@ -618,6 +618,7 @@ export default function BotDetail() {
   const detail = useRealtimeStore((state) => (id ? state.botDetailsById[id] : undefined));
   const loadBotDetail = useRealtimeStore((state) => state.loadBotDetail);
   const loadTradeSummary = useRealtimeStore((state) => state.loadTradeSummary);
+  const loadExecutionHistory = useRealtimeStore((state) => state.loadExecutionHistory);
   const loadVoterSignals = useRealtimeStore((state) => state.loadVoterSignals);
   const handleBotDetailMessage = useRealtimeStore((state) => state.handleBotDetailMessage);
   const setChannelStatus = useRealtimeStore((state) => state.setChannelStatus);
@@ -627,6 +628,8 @@ export default function BotDetail() {
   const orders = detail?.orders ?? [];
   const strategyHealth = detail?.strategyHealth ?? null;
   const executionMode = detail?.executionMode ?? null;
+  const activeBotMode: ExecutionMode = (bot?.execution_mode ?? executionMode) === 'live' ? 'live' : 'testnet';
+  const [activeModeView, setActiveModeView] = useState<ExecutionMode>('testnet');
   const [actionError, setActionError] = useState<string | null>(null);
   const error = actionError ?? detail?.error ?? null;
   const [busy, setBusy] = useState(false);
@@ -646,6 +649,8 @@ export default function BotDetail() {
   const [weightsOptimizeLines, setWeightsOptimizeLines] = useState<Array<{ level: string; text: string }>>([]);
   const weightsOptimizeLogRef = useRef<HTMLDivElement>(null);
   const [promoteBusy, setPromoteBusy] = useState(false);
+  const [promoteInitialCapital, setPromoteInitialCapital] = useState('');
+  const [promoteConfirmRealMoney, setPromoteConfirmRealMoney] = useState(false);
   const [followLogBottom, setFollowLogBottom] = useState(true);
   const [logsCopied, setLogsCopied] = useState(false);
   const logScrollRef = useRef<HTMLDivElement>(null);
@@ -655,6 +660,11 @@ export default function BotDetail() {
   const [historyView, setHistoryView] = useState<'fills' | 'summary'>('fills');
   const tradeSummary = detail?.tradeSummary ?? null;
   const tradeSummaryLoading = detail?.tradeSummaryLoading ?? false;
+  const selectedHistory = detail?.executionHistories?.[activeModeView] ?? null;
+  const effectiveStrategyHealth = selectedHistory?.metrics ?? detail?.metrics?.[activeModeView] ?? strategyHealth;
+  const effectiveOrders = selectedHistory?.fills ?? (activeModeView === activeBotMode ? orders : []);
+  const effectiveOrderStats = selectedHistory?.order_stats ?? (activeModeView === activeBotMode ? orderStats : null);
+  const effectiveTradeSummary = selectedHistory?.trades ?? (activeModeView === activeBotMode ? tradeSummary : null);
   const liveVoterSignals = detail?.liveVoterSignals ?? EMPTY_VOTER_SIGNALS;
   const voterSignalsUpdatedAt = detail?.voterSignalsUpdatedAt ?? null;
 
@@ -668,10 +678,19 @@ export default function BotDetail() {
     refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    setActiveModeView(activeBotMode);
+  }, [activeBotMode, bot?.bot_id]);
+
   const fetchTradeSummary = useCallback(async () => {
     if (!id) return;
-    await loadTradeSummary(id);
-  }, [id, loadTradeSummary]);
+    await loadTradeSummary(id, activeModeView);
+  }, [activeModeView, id, loadTradeSummary]);
+
+  useEffect(() => {
+    if (!id || !bot) return;
+    void loadExecutionHistory(id, activeModeView);
+  }, [activeModeView, bot, id, loadExecutionHistory]);
 
   const detailWs = useMagiWebSocket({
     path: `/ws/bot/${id}`,
@@ -800,7 +819,7 @@ export default function BotDetail() {
     if (!showConfigModal) return;
     const parsed = parseStrategyParams(bot?.strategy_params_json);
     const risk = bot?.risk_settings ?? GLOBAL_RISK_DEFAULTS;
-    const budget = parsed.initial_budget_quote ?? strategyHealth?.initial_budget_quote ?? null;
+    const budget = parsed.initial_budget_quote ?? effectiveStrategyHealth?.initial_budget_quote ?? null;
     setConfigRiskDraft(cloneRiskSettings(risk));
     setConfigStrategyDraft(parsed);
     setConfigStrategyJsonDraft(prettyStrategyParams(parsed));
@@ -813,7 +832,7 @@ export default function BotDetail() {
     id,
     bot?.risk_settings,
     bot?.strategy_params_json,
-    strategyHealth?.initial_budget_quote,
+    effectiveStrategyHealth?.initial_budget_quote,
     isEnsemble,
   ]);
 
@@ -902,25 +921,42 @@ export default function BotDetail() {
 
   useEffect(() => {
     if (!id || !isEnsemble) return;
-    void loadVoterSignals(id);
+    void loadVoterSignals(id, activeModeView);
     if (!detailWs.isFallbackPolling) return;
-    const timer = setInterval(() => void loadVoterSignals(id), 30_000);
+    const timer = setInterval(() => void loadVoterSignals(id, activeModeView), 30_000);
     return () => clearInterval(timer);
-  }, [id, isEnsemble, detailWs.isFallbackPolling, loadVoterSignals]);
+  }, [activeModeView, id, isEnsemble, detailWs.isFallbackPolling, loadVoterSignals]);
 
   const promoteBot = async (targetMode: 'testnet' | 'live') => {
     if (!id) return;
     setPromoteBusy(true);
     setActionError(null);
     try {
-      const res = await fetch(`${API_BASE}/api/bots/${id}/execution-mode`, {
-        method: 'PUT',
+      const initialCapital = Number.parseFloat(promoteInitialCapital.trim());
+      const isLivePromotion = targetMode === 'live';
+      const res = await fetch(
+        isLivePromotion
+          ? `${API_BASE}/api/bots/${id}/promote-to-live`
+          : `${API_BASE}/api/bots/${id}/execution-mode`,
+        {
+        method: isLivePromotion ? 'POST' : 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ execution_mode: targetMode }),
+        body: JSON.stringify(
+          isLivePromotion
+            ? {
+                initial_capital_quote:
+                  Number.isFinite(initialCapital)
+                    ? initialCapital
+                    : null,
+                confirm_real_money: promoteConfirmRealMoney,
+              }
+            : { execution_mode: targetMode },
+        ),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
       setShowPromoteModal(false);
+      setPromoteConfirmRealMoney(false);
       await refresh();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Update failed');
@@ -1204,7 +1240,7 @@ export default function BotDetail() {
   if (!id) return null;
 
   // Bot's own execution_mode drives the badge (not the global setting)
-  const botExecMode = bot?.execution_mode ?? executionMode ?? 'testnet';
+  const botExecMode = activeBotMode;
   const liveLabel =
     botExecMode === 'live' ? 'LIVE TRADING' : botExecMode === 'testnet' ? 'TESTNET' : 'OFFLINE';
   const strategyTag = (() => {
@@ -1219,28 +1255,28 @@ export default function BotDetail() {
     }
     return s.toUpperCase().replace(/-/g, '_') || '—';
   })();
-  const qc = strategyHealth?.quote_currency ?? 'USDT';
+  const qc = effectiveStrategyHealth?.quote_currency ?? 'USDT';
   const winRateLabel =
-    strategyHealth?.win_rate_pct != null ? `${strategyHealth.win_rate_pct}%` : '—';
+    effectiveStrategyHealth?.win_rate_pct != null ? `${effectiveStrategyHealth.win_rate_pct}%` : '—';
   const drawdownLabel =
-    strategyHealth != null
-      ? strategyHealth.max_drawdown_pct != null
-        ? `${formatQuoteAmount(strategyHealth.max_drawdown_pct, 4)}%`
-        : `${formatQuoteAmount(strategyHealth.max_drawdown_quote)} ${qc}`
+    effectiveStrategyHealth != null
+      ? effectiveStrategyHealth.max_drawdown_pct != null
+        ? `${formatQuoteAmount(effectiveStrategyHealth.max_drawdown_pct, 4)}%`
+        : `${formatQuoteAmount(effectiveStrategyHealth.max_drawdown_quote)} ${qc}`
       : '—';
-  const netPnl = strategyHealth?.total_pnl_quote ?? null;
-  const pnlBreakdownLabel = strategyHealth != null
-    ? `R ${formatQuoteAmount(strategyHealth.realized_pnl_quote)} · U ${
-        strategyHealth.unrealized_pnl_quote != null
-          ? formatQuoteAmount(strategyHealth.unrealized_pnl_quote)
+  const netPnl = effectiveStrategyHealth?.total_pnl_quote ?? null;
+  const pnlBreakdownLabel = effectiveStrategyHealth != null
+    ? `R ${formatQuoteAmount(effectiveStrategyHealth.realized_pnl_quote)} · U ${
+        effectiveStrategyHealth.unrealized_pnl_quote != null
+          ? formatQuoteAmount(effectiveStrategyHealth.unrealized_pnl_quote)
           : '—'
       }${
-        strategyHealth.pnl_return_on_budget_pct != null
-          ? ` · ROI ${formatQuoteAmount(strategyHealth.pnl_return_on_budget_pct, 2)}%`
+        effectiveStrategyHealth.pnl_return_on_budget_pct != null
+          ? ` · ROI ${formatQuoteAmount(effectiveStrategyHealth.pnl_return_on_budget_pct, 2)}%`
           : ''
       }`
     : '—';
-  const recordedOrderCount = orderStats?.total_orders ?? 0;
+  const recordedOrderCount = effectiveOrderStats?.total_orders ?? 0;
   const yoloMode = bot?.risk_settings?.yolo_mode ?? false;
   const configInputClass =
     'rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-sm text-magi-on-bg focus:border-magi-primary/50 focus:outline-none disabled:opacity-50';
@@ -1351,10 +1387,10 @@ export default function BotDetail() {
                 {recordedOrderCount}
               </p>
               <p className="font-label text-[10px] uppercase tracking-wide text-magi-muted/55">
-                B {orderStats?.buy_count ?? 0} · S {orderStats?.sell_count ?? 0}
-                {orderStats?.last_order_at_ms != null && (
+                B {effectiveOrderStats?.buy_count ?? 0} · S {effectiveOrderStats?.sell_count ?? 0}
+                {effectiveOrderStats?.last_order_at_ms != null && (
                   <span className="mt-0.5 block normal-case text-magi-muted/40">
-                    {formatLogTime(orderStats.last_order_at_ms)}
+                    {formatLogTime(effectiveOrderStats.last_order_at_ms)}
                   </span>
                 )}
               </p>
@@ -1364,8 +1400,8 @@ export default function BotDetail() {
               <p className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">Win Rate</p>
               <p className="font-headline text-2xl font-black text-magi-on-bg">{winRateLabel}</p>
               <p className="font-label text-[10px] uppercase tracking-wide text-magi-muted/55">
-                {strategyHealth != null
-                  ? `${strategyHealth.winning_trades}W · ${strategyHealth.losing_trades}L / ${strategyHealth.closed_trades} exits`
+                {effectiveStrategyHealth != null
+                  ? `${effectiveStrategyHealth.winning_trades}W · ${effectiveStrategyHealth.losing_trades}L / ${effectiveStrategyHealth.closed_trades} exits`
                   : '—'}
               </p>
             </div>
@@ -1388,8 +1424,8 @@ export default function BotDetail() {
               <p className="font-label text-[10px] uppercase tracking-widest text-magi-muted/50">Max Drawdown</p>
               <p className="font-headline text-2xl font-black text-red-400">{drawdownLabel}</p>
               <p className="font-label text-[10px] tracking-wide text-magi-muted/55">
-                {strategyHealth?.max_drawdown_vs_budget_pct != null
-                  ? `${formatQuoteAmount(strategyHealth.max_drawdown_vs_budget_pct, 2)}% of initial capital`
+                {effectiveStrategyHealth?.max_drawdown_vs_budget_pct != null
+                  ? `${formatQuoteAmount(effectiveStrategyHealth.max_drawdown_vs_budget_pct, 2)}% of initial capital`
                   : 'vs peak realized PnL'}
               </p>
             </div>
@@ -1399,6 +1435,36 @@ export default function BotDetail() {
 
         {/* ── CENTER: Chart + Stats + Execution history ─────── */}
         <div className="col-span-1 flex min-h-0 min-w-0 flex-col overflow-y-auto overflow-x-hidden border-r border-magi-grid/15 lg:col-span-6">
+
+          <div className={`border-b px-4 py-3 ${
+            activeModeView === 'live'
+              ? 'border-red-500/30 bg-red-950/25 text-red-200'
+              : 'border-blue-400/25 bg-blue-950/20 text-blue-200'
+          }`}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="font-label text-[11px] font-black uppercase tracking-widest">
+                Currently viewing: {activeModeView.toUpperCase()} (
+                {activeModeView === activeBotMode ? 'Active Mode' : `Historical ${activeModeView.toUpperCase()} Data`}
+                {' – '}
+                {activeModeView === 'live'
+                  ? 'Live Allocation'
+                  : 'Paper Trading'}
+                )
+              </p>
+              <button
+                type="button"
+                onClick={() => setActiveModeView(activeModeView === 'live' ? 'testnet' : 'live')}
+                className="rounded border border-current/30 px-3 py-1 font-label text-[10px] font-bold uppercase tracking-widest opacity-80 hover:opacity-100"
+              >
+                Switch to {activeModeView === 'live' ? 'Testnet' : 'Live'} View
+              </button>
+            </div>
+            {activeModeView !== activeBotMode && (
+              <p className="mt-1 text-xs opacity-75">
+                You are viewing historical {activeModeView} data while this bot is currently running on {activeBotMode}.
+              </p>
+            )}
+          </div>
 
           {/* Chart — flush, full width of center column */}
           {bot?.symbol ? (
@@ -1412,17 +1478,40 @@ export default function BotDetail() {
             />
           ) : null}
 
-          {/* Metrics strip — shows Current Capital when initial capital is set */}
-          {strategyHealth?.initial_budget_quote != null && (
+          {/* Metrics strip — shows explicit allocation and capital-flow adjustments. */}
+          {(effectiveStrategyHealth?.initial_budget_quote != null ||
+            effectiveStrategyHealth?.current_capital_quote != null) && (
             <div className="border-b border-magi-grid/15 bg-magi-primary/5 px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-1">
               <div className="flex items-baseline gap-2">
                 <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/60">
                   Initial Capital
                 </span>
                 <span className="font-headline text-sm font-bold text-magi-muted/80">
-                  {formatQuoteAmount(strategyHealth.initial_budget_quote, 2)} {qc}
+                  {formatQuoteAmount(
+                    effectiveStrategyHealth.initial_budget_quote ?? 0,
+                    2,
+                  )} {qc}
+                </span>
+                <span className="rounded border border-magi-grid/30 px-2 py-0.5 font-label text-[9px] uppercase tracking-widest text-magi-muted/60">
+                  Live Allocation
                 </span>
               </div>
+              {effectiveStrategyHealth.adjusted_initial_capital_quote != null && (
+                <div className="flex items-baseline gap-2">
+                  <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/60">
+                    Adjusted Available
+                  </span>
+                  <span className="font-headline text-sm font-bold text-magi-on-bg">
+                    {formatQuoteAmount(effectiveStrategyHealth.adjusted_initial_capital_quote, 2)} {qc}
+                  </span>
+                  {effectiveStrategyHealth.net_capital_flow_quote ? (
+                    <span className="font-mono text-[10px] text-magi-muted/55">
+                      flows {effectiveStrategyHealth.net_capital_flow_quote >= 0 ? '+' : ''}
+                      {formatQuoteAmount(effectiveStrategyHealth.net_capital_flow_quote, 2)}
+                    </span>
+                  ) : null}
+                </div>
+              )}
               <span className="text-magi-grid/40 hidden sm:block">→</span>
               <div className="flex items-baseline gap-2">
                 <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/60">
@@ -1430,42 +1519,46 @@ export default function BotDetail() {
                 </span>
                 <span
                   className={`font-headline text-lg font-black ${
-                    strategyHealth.current_capital_quote != null
-                      ? pnlToneClass(strategyHealth.current_capital_quote - strategyHealth.initial_budget_quote)
+                    effectiveStrategyHealth.current_capital_quote != null
+                      ? pnlToneClass(
+                          effectiveStrategyHealth.current_capital_quote -
+                            (effectiveStrategyHealth.initial_budget_quote ??
+                              effectiveStrategyHealth.current_capital_quote),
+                        )
                       : 'text-magi-on-bg'
                   }`}
                 >
-                  {strategyHealth.current_capital_quote != null
-                    ? `${formatQuoteAmountFixed(strategyHealth.current_capital_quote)} ${qc}`
+                  {effectiveStrategyHealth.current_capital_quote != null
+                    ? `${formatQuoteAmountFixed(effectiveStrategyHealth.current_capital_quote)} ${qc}`
                     : '—'}
                 </span>
               </div>
-              {strategyHealth.pnl_return_on_budget_pct != null && (
+              {effectiveStrategyHealth.pnl_return_on_budget_pct != null && (
                 <span
                   className={`font-label text-[11px] font-bold px-2 py-0.5 rounded ${
-                    strategyHealth.pnl_return_on_budget_pct >= 0
+                    effectiveStrategyHealth.pnl_return_on_budget_pct >= 0
                       ? 'bg-green-500/15 text-green-400'
                       : 'bg-red-500/15 text-red-400'
                   }`}
                 >
-                  {strategyHealth.pnl_return_on_budget_pct >= 0 ? '+' : ''}
-                  {formatQuoteAmount(strategyHealth.pnl_return_on_budget_pct, 2)}% ROI
+                  {effectiveStrategyHealth.pnl_return_on_budget_pct >= 0 ? '+' : ''}
+                  {formatQuoteAmount(effectiveStrategyHealth.pnl_return_on_budget_pct, 2)}% ROI
                 </span>
               )}
             </div>
           )}
 
           {/* Portfolio distribution bar */}
-          {strategyHealth != null && (strategyHealth.base_alloc_pct != null || strategyHealth.open_base_position > 1e-12) && (
+          {effectiveStrategyHealth != null && (effectiveStrategyHealth.base_alloc_pct != null || effectiveStrategyHealth.open_base_position > 1e-12) && (
             <PortfolioDistribution
               baseSym={bot?.symbol?.split('/')[0] ?? 'BASE'}
               quoteSym={qc}
-              baseValueQuote={strategyHealth.base_value_quote}
-              quoteRemaining={strategyHealth.quote_remaining}
-              baseAllocPct={strategyHealth.base_alloc_pct}
-              quoteAllocPct={strategyHealth.quote_alloc_pct}
-              openBasePosition={strategyHealth.open_base_position}
-              markPrice={strategyHealth.mark_price}
+              baseValueQuote={effectiveStrategyHealth.base_value_quote}
+              quoteRemaining={effectiveStrategyHealth.quote_remaining}
+              baseAllocPct={effectiveStrategyHealth.base_alloc_pct}
+              quoteAllocPct={effectiveStrategyHealth.quote_alloc_pct}
+              openBasePosition={effectiveStrategyHealth.open_base_position}
+              markPrice={effectiveStrategyHealth.mark_price}
             />
           )}
 
@@ -1474,11 +1567,11 @@ export default function BotDetail() {
             {/* Header row: title + view toggle */}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
               <h3 className="font-label text-[11px] font-bold uppercase tracking-widest text-magi-muted">
-                Execution History
+                {activeModeView === 'live' ? 'Live Execution History' : 'Testnet Execution History'}
               </h3>
               <div className="flex items-center gap-2">
                 <span className="font-label text-[9px] tracking-tight text-magi-muted/40">
-                  {orderStats?.total_orders ?? 0} fills
+                  {effectiveOrderStats?.total_orders ?? 0} fills
                 </span>
                 {/* View toggle */}
                 <div className="flex items-center rounded border border-magi-grid/30 overflow-hidden">
@@ -1523,14 +1616,14 @@ export default function BotDetail() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-magi-grid/5">
-                    {orders.length === 0 && (
+                    {effectiveOrders.length === 0 && (
                       <tr>
                         <td colSpan={6} className="py-4 italic text-magi-muted/60">
                           No fills yet — appears here after the first accepted buy/sell.
                         </td>
                       </tr>
                     )}
-                    {orders.map((o) => {
+                    {effectiveOrders.map((o) => {
                       const isBuy = o.side === 'buy';
                       const avgPx =
                         o.display_price != null ? o.display_price
@@ -1584,7 +1677,7 @@ export default function BotDetail() {
                   </p>
                 </div>
                 <div className="max-h-[420px] overflow-auto">
-                  {tradeSummaryLoading && tradeSummary === null ? (
+                  {tradeSummaryLoading && effectiveTradeSummary === null ? (
                     <p className="py-4 font-label text-[10px] italic text-magi-muted/50">Loading…</p>
                   ) : (
                     <table className="w-full min-w-[42rem] text-left font-label text-[10px] sm:text-[11px]">
@@ -1600,14 +1693,14 @@ export default function BotDetail() {
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-magi-grid/5">
-                        {(tradeSummary ?? []).length === 0 && (
+                        {(effectiveTradeSummary ?? []).length === 0 && (
                           <tr>
                             <td colSpan={7} className="py-4 italic text-magi-muted/60">
                               No closed trades yet — PnL appears here after the first matched buy→sell pair.
                             </td>
                           </tr>
                         )}
-                        {[...(tradeSummary ?? [])].reverse().map((t, i) => {
+                        {[...(effectiveTradeSummary ?? [])].reverse().map((t, i) => {
                           const qc = t.quote_currency;
                           const outcomeLabel =
                             t.outcome === 'win' ? '▲ W' : t.outcome === 'loss' ? '▼ L' : '= B';
@@ -1657,19 +1750,19 @@ export default function BotDetail() {
                           );
                         })}
                       </tbody>
-                      {(tradeSummary ?? []).length > 0 && (
+                      {(effectiveTradeSummary ?? []).length > 0 && (
                         <tfoot className="border-t border-magi-grid/20">
                           <tr>
                             <td colSpan={6} className="py-2 pr-3 font-label text-[9px] uppercase tracking-wider text-magi-muted/40">
-                              {(tradeSummary ?? []).length} closed trades ·{' '}
-                              {(tradeSummary ?? []).filter((t) => t.outcome === 'win').length}W ·{' '}
-                              {(tradeSummary ?? []).filter((t) => t.outcome === 'loss').length}L ·{' '}
-                              {(tradeSummary ?? []).filter((t) => t.outcome === 'flat').length}B
+                              {(effectiveTradeSummary ?? []).length} closed trades ·{' '}
+                              {(effectiveTradeSummary ?? []).filter((t) => t.outcome === 'win').length}W ·{' '}
+                              {(effectiveTradeSummary ?? []).filter((t) => t.outcome === 'loss').length}L ·{' '}
+                              {(effectiveTradeSummary ?? []).filter((t) => t.outcome === 'flat').length}B
                             </td>
                             <td className="py-2 text-right">
                               {(() => {
-                                const total = (tradeSummary ?? []).reduce((s, t) => s + t.realized_pnl, 0);
-                                const qc = tradeSummary?.[0]?.quote_currency ?? 'USDT';
+                                const total = (effectiveTradeSummary ?? []).reduce((s, t) => s + t.realized_pnl, 0);
+                                const qc = effectiveTradeSummary?.[0]?.quote_currency ?? 'USDT';
                                 return (
                                   <span className={`font-mono text-[11px] font-black ${total >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                                     {total >= 0 ? '+' : ''}{formatQuoteAmount(total, 4)} {qc}
@@ -2347,7 +2440,7 @@ export default function BotDetail() {
           <div className="bg-[#161616] border border-red-900/60 rounded-xl w-full max-w-lg shadow-2xl shadow-red-950/40">
             <div className="px-6 py-5 border-b border-red-900/40">
               <h2 className="text-sm font-black uppercase tracking-widest text-red-400">
-                ⚠ Promote to Live Spot Trading
+                Promote to Live Spot Trading
               </h2>
             </div>
             <div className="px-6 py-5 flex flex-col gap-4">
@@ -2355,6 +2448,8 @@ export default function BotDetail() {
                 <p className="font-bold mb-2">This will switch the bot to real Binance Spot orders.</p>
                 <ul className="list-disc list-inside space-y-1 text-[12px] text-red-300/80">
                   <li>The exact same strategy runs — only the exchange endpoint changes</li>
+                  <li>Live gets its own separate fills, trade PnL, and history</li>
+                  <li>Testnet-learned voter weights carry forward as live priors</li>
                   <li>Orders will use your <strong>real API keys</strong> on <code className="text-red-200">api.binance.com</code></li>
                   <li>Real USDT/BTC from your live Spot wallet will be at risk</li>
                   <li>You can demote back to Testnet at any time (bot must be stopped)</li>
@@ -2363,16 +2458,43 @@ export default function BotDetail() {
               <div className="rounded-lg border border-border bg-black/20 px-4 py-3 text-[11px] text-gray-400">
                 <span className="font-bold text-white">Bot:</span> {bot?.name} · {bot?.symbol}<br />
                 <span className="font-bold text-white">Strategy:</span> {bot?.strategy?.toUpperCase()}<br />
-                <span className="font-bold text-white">Initial capital:</span>{' '}
-                {strategyHealth?.initial_budget_quote != null
-                  ? `${strategyHealth.initial_budget_quote.toLocaleString()} USDT`
-                  : 'not set — set initial capital before going live'}
+                <span className="font-bold text-white">Testnet capital:</span>{' '}
+                {detail?.metrics?.testnet?.initial_budget_quote != null
+                  ? `${detail.metrics.testnet.initial_budget_quote.toLocaleString()} USDT`
+                  : 'not set'}
+              </div>
+              <div className="grid gap-2 text-xs">
+                <p className="rounded border border-red-900/30 bg-black/20 px-3 py-2 text-red-200/80">
+                  Set the live allocation this bot is allowed to trade. Orders are still capped by
+                  the real mainnet wallet free balance.
+                </p>
+                <input
+                  value={promoteInitialCapital}
+                  onChange={(event) => setPromoteInitialCapital(event.target.value)}
+                  placeholder="Live initial capital, e.g. 100"
+                  className="rounded border border-red-900/40 bg-black/30 px-3 py-2 text-sm text-white outline-none focus:border-red-400/60"
+                />
+                <label className="flex items-start gap-2 text-[11px] text-red-200/80">
+                  <input
+                    type="checkbox"
+                    checked={promoteConfirmRealMoney}
+                    onChange={(event) => setPromoteConfirmRealMoney(event.target.checked)}
+                    className="mt-0.5"
+                  />
+                  I understand this uses real Binance mainnet spot funds.
+                </label>
               </div>
               {error && (
                 <p className="text-red-400 text-xs border border-red-500/40 bg-red-950/20 rounded p-2">{error}</p>
               )}
               <div className="flex gap-2 pt-1">
-                <button type="button" disabled={promoteBusy}
+                <button
+                  type="button"
+                  disabled={
+                    promoteBusy ||
+                    !promoteConfirmRealMoney ||
+                    !(Number.parseFloat(promoteInitialCapital.trim()) > 0)
+                  }
                   onClick={() => void promoteBot('live')}
                   className="flex-1 py-3 bg-red-600 hover:bg-red-500 text-white text-[11px] font-black uppercase tracking-widest rounded disabled:opacity-40 transition-all">
                   {promoteBusy ? 'Promoting…' : 'Yes, Go Live with Real Funds'}

@@ -343,6 +343,10 @@ export default function BotsList() {
   };
 
   // ── Render ───────────────────────────────────────────────────────────────
+  const botSections = [
+    { id: 'live', title: 'Live Bots', bots: bots.filter((bot) => bot.execution_mode === 'live') },
+    { id: 'testnet', title: 'Testnet Bots', bots: bots.filter((bot) => bot.execution_mode !== 'live') },
+  ];
 
   return (
     <main className="flex-1 flex flex-col overflow-hidden p-6">
@@ -397,7 +401,20 @@ export default function BotsList() {
         {bots.length === 0 && !error && (
           <p className="text-gray-500 text-sm">No bots yet — create one with the button above.</p>
         )}
-        {bots.map((bot) => {
+        {botSections.map((section) => (
+          <div key={section.id} className="grid grid-cols-1 gap-3">
+            <div className="mt-2 flex items-center justify-between border-b border-border/70 pb-2">
+              <h2 className={`text-xs font-black uppercase tracking-widest ${
+                section.id === 'live' ? 'text-red-400' : 'text-blue-300'
+              }`}>
+                {section.title}
+              </h2>
+              <span className="text-[10px] font-mono text-gray-500">{section.bots.length} bot(s)</span>
+            </div>
+            {section.bots.length === 0 && (
+              <p className="text-xs text-gray-600">No {section.id} bots.</p>
+            )}
+            {section.bots.map((bot) => {
           const isBusy = busyBotId === bot.bot_id;
           const isRunning = bot.status === 'running';
           const isPaused = bot.status === 'paused';
@@ -500,7 +517,9 @@ export default function BotsList() {
               </div>
             </div>
           );
-        })}
+            })}
+          </div>
+        ))}
       </div>
 
       {/* ── CREATE BOT MODAL ─────────────────────────────────────────────── */}

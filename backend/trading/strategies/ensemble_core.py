@@ -80,7 +80,11 @@ def run_consensus(ohlcv: list[list], params: dict[str, Any]) -> dict[str, Any]:
     base_weights: dict[str, float] = dict(
         params.get("voter_weights", {v: 1.0 for v in voters})
     )
-    dynamic_weights = get_metatrader().get_dynamic_weights(voters)
+    execution_mode = str(params.get("execution_mode") or "testnet")
+    dynamic_weights = get_metatrader().get_dynamic_weights(
+        voters,
+        execution_mode,
+    )
     # Dynamic weights override base weights only for keys MetaTrader learned.
     weights: dict[str, float] = {**base_weights, **dynamic_weights}
 

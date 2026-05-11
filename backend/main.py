@@ -29,8 +29,10 @@ logging.basicConfig(
 from database import (
     create_bot,
     delete_bot,
+    get_bot_capital_flows,
     get_db_connection,
     get_bot_risk_settings,
+    get_bot_net_capital_flow,
     get_latest_voter_signals,
     get_pool_stats,
     init_db,
@@ -41,6 +43,8 @@ from database import (
     fork_bot,
     metamagi_label_voter_feedback_catchup,
     peer_voter_weights_for_new_ensemble_bot,
+    promote_bot_to_live,
+    record_bot_capital_flow,
     set_bot_execution_mode,
     update_bot_risk_state,
     update_bot,
@@ -219,27 +223,28 @@ def _merge_blended_voter_weights_into_params(
     return merged
 
 
-def _optimize_weights_sse(bot_id: str):
+def _optimize_weights_sse(bot_id: str, mode: str = "current"):
     log = logging.getLogger("optimize_weights")
 
     yield _sse_event(
         {
             "type": "log",
             "level": "info",
-            "message": f"Starting MetaMagi weight optimization for bot {bot_id}…",
+            "message": f"Starting MetaMagi weight optimization for bot {bot_id} mode={mode}…",
         }
     )
 
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT strategy_params_json FROM bots WHERE bot_id = ?", (bot_id,))
+        cur.execute("SELECT strategy_params_json, execution_mode FROM bots WHERE bot_id = ?", (bot_id,))
         row = cur.fetchone()
         if not row:
             yield _sse_event({"type": "log", "level": "error", "message": "Bot not found."})
             yield _sse_event({"type": "done", "ok": False})
             return
         existing_snapshot = row["strategy_params_json"]
+        resolved_mode = str(row["execution_mode"] or "testnet") if mode == "current" else mode
     finally:
         conn.close()
 
@@ -251,6 +256,8 @@ def _optimize_weights_sse(bot_id: str):
         _METAMAGI_LABELED_EXPORT_SCRIPT,
         "--bot",
         bot_id,
+        "--mode",
+        resolved_mode,
         "--weight-method",
         "both",
         "--hours",
@@ -265,7 +272,7 @@ def _optimize_weights_sse(bot_id: str):
             "level": "info",
             "message": (
                 "Running: python scripts/metamagi_labeled_export.py "
-                f"--bot {bot_id} --weight-method both --hours 720 --sample-rows 0 --json"
+                f"--bot {bot_id} --mode {resolved_mode} --weight-method both --hours 720 --sample-rows 0 --json"
             ),
         }
     )
@@ -386,7 +393,7 @@ def _optimize_weights_sse(bot_id: str):
     nt = int(counts.get("total_rows") or 0)
     nl = int(counts.get("labeled_forward_roc_30s") or 0)
     yield _sse_event(
-        {"type": "log", "level": "info", "message": f"Analyzing {nt:,} labeled rows (last 720 hours)…"}
+        {"type": "log", "level": "info", "message": f"Analyzing {nt:,} {resolved_mode} rows (last 720 hours)…"}
     )
     yield _sse_event(
         {
@@ -429,12 +436,19 @@ def _optimize_weights_sse(bot_id: str):
         finally:
             conn_u.close()
 
-        yield _sse_event({"type": "log", "level": "info", "message": "Done. New weights applied."})
+        log.info(
+            "MetaMagi optimize: updated voter weights bot_id=%s mode=%s applied=%d",
+            bot_id,
+            resolved_mode,
+            n_applied,
+        )
+        yield _sse_event({"type": "log", "level": "info", "message": f"Done. New weights applied from mode={resolved_mode}."})
         yield _sse_event(
             {
                 "type": "done",
                 "ok": True,
                 "voter_weights": vw if isinstance(vw, dict) else {},
+                "mode": resolved_mode,
                 "strategy_params": merged,
                 "strategy_params_json": out_json,
             }
@@ -624,14 +638,18 @@ async def _meta_training_loop() -> None:
             updated_weights = metatrader.train_step(batch)
             train_ms = (time.perf_counter() - t0) * 1000.0
             if updated_weights:
-                weight_str = "  ".join(
-                    f"{v}={w:.3f}" for v, w in sorted(updated_weights.items())
-                )
-                logger.info(
-                    "MetaMagi: updated weights in %.0fms — %s",
-                    train_ms,
-                    weight_str,
-                )
+                for mode_name, weights in sorted(updated_weights.items()):
+                    if not isinstance(weights, dict):
+                        continue
+                    weight_str = "  ".join(
+                        f"{v}={w:.3f}" for v, w in sorted(weights.items())
+                    )
+                    logger.info(
+                        "MetaMagi: updated weights in %.0fms mode=%s — %s",
+                        train_ms,
+                        mode_name,
+                        weight_str,
+                    )
 
         except asyncio.CancelledError:
             raise
@@ -1461,6 +1479,165 @@ def reset_bot_risk_settings_endpoint(bot_id: str, body: RiskResetBody):
 # --- Bots ---
 
 
+EXECUTION_MODES = ("testnet", "live")
+
+
+def _normalize_mode_query(mode: str | None, *, allow_both: bool = True) -> str:
+    value = (mode or "current").strip().lower()
+    allowed = {"testnet", "live", "current"} | ({"both"} if allow_both else set())
+    if value not in allowed:
+        suffix = "|both" if allow_both else ""
+        raise HTTPException(status_code=400, detail=f"mode must be testnet|live|current{suffix}")
+    return value
+
+
+def _resolve_mode_for_bot(mode: str | None, bot_mode: str, *, allow_both: bool = True) -> str:
+    value = _normalize_mode_query(mode, allow_both=allow_both)
+    return bot_mode if value == "current" else value
+
+
+def _initial_capital_for_mode(bot_row: dict[str, Any], mode: str) -> float | None:
+    key = f"{mode}_initial_capital_quote"
+    raw = bot_row.get(key)
+    try:
+        value = float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        value = None
+    if value is not None and value > 0:
+        return value
+    if mode == "testnet":
+        raw_params = bot_row.get("strategy_params_json")
+        return initial_budget_from_strategy_params_json(
+            raw_params if isinstance(raw_params, str) else None
+        )
+    return None
+
+
+def _build_strategy_health_for_mode(
+    *,
+    bot_id: str,
+    bot_row: dict[str, Any],
+    mode: str,
+    mark_price: float | None = None,
+) -> dict[str, Any]:
+    sym = str(bot_row.get("symbol") or "")
+    orders_asc = fetch_bot_orders_chronological(bot_id, mode=mode)
+    perf = compute_strategy_performance(orders_asc, sym, mark_price=mark_price)
+    total_pnl = perf["realized_pnl_quote"] + (perf["unrealized_pnl_quote"] or 0.0)
+    budget = _initial_capital_for_mode(bot_row, mode)
+    net_capital_flow = get_bot_net_capital_flow(bot_id, mode)
+    adjusted_capital = (
+        max(0.0, budget + net_capital_flow)
+        if budget is not None and budget > 0
+        else None
+    )
+
+    pnl_vs_budget_pct: float | None = None
+    max_dd_vs_budget_pct: float | None = None
+    current_capital: float | None = None
+    if budget is not None and budget > 0:
+        pnl_vs_budget_pct = round((total_pnl / budget) * 100.0, 4)
+        max_dd_vs_budget_pct = round((perf["max_drawdown_quote"] / budget) * 100.0, 4)
+    if adjusted_capital is not None:
+        current_capital = round(adjusted_capital + total_pnl, 8)
+
+    open_base = perf["open_base_position"]
+    open_basis = perf["open_cost_basis_quote"]
+    realized_pnl = perf["realized_pnl_quote"]
+    capital_source = str(bot_row.get("capital_source") or "budget")
+
+    base_value_quote: float | None = None
+    if open_base > 1e-12:
+        if mark_price is not None and mark_price > 0:
+            base_value_quote = round(open_base * mark_price, 8)
+        else:
+            base_value_quote = round(open_basis, 8)
+
+    quote_remaining: float | None = None
+    base_alloc_pct: float | None = None
+    quote_alloc_pct: float | None = None
+    if adjusted_capital is not None:
+        qr = adjusted_capital + realized_pnl - open_basis
+        quote_remaining = round(max(0.0, qr), 8)
+        portfolio_total = (base_value_quote or 0.0) + quote_remaining
+        if portfolio_total > 1e-12:
+            base_alloc_pct = round(((base_value_quote or 0.0) / portfolio_total) * 100, 2)
+            quote_alloc_pct = round(100.0 - base_alloc_pct, 2)
+        else:
+            base_alloc_pct = 0.0
+            quote_alloc_pct = 100.0
+
+    return {
+        "execution_mode": mode,
+        "capital_source": capital_source,
+        "realized_pnl_quote": round(perf["realized_pnl_quote"], 8),
+        "unrealized_pnl_quote": (
+            round(perf["unrealized_pnl_quote"], 8)
+            if perf["unrealized_pnl_quote"] is not None
+            else None
+        ),
+        "open_base_position": round(perf["open_base_position"], 8),
+        "open_cost_basis_quote": round(perf["open_cost_basis_quote"], 8),
+        "closed_trades": perf["closed_trades"],
+        "winning_trades": perf["winning_trades"],
+        "losing_trades": perf["losing_trades"],
+        "breakeven_trades": perf["breakeven_trades"],
+        "win_rate_pct": (
+            round(perf["win_rate_pct"], 2) if perf["win_rate_pct"] is not None else None
+        ),
+        "max_drawdown_quote": round(perf["max_drawdown_quote"], 8),
+        "max_drawdown_pct": (
+            round(perf["max_drawdown_pct"], 4) if perf["max_drawdown_pct"] is not None else None
+        ),
+        "quote_currency": perf["quote_currency"],
+        "mark_price": round(mark_price, 8) if mark_price is not None else None,
+        "total_pnl_quote": round(total_pnl, 8),
+        "initial_budget_quote": round(budget, 8) if budget is not None else None,
+        "adjusted_initial_capital_quote": (
+            round(adjusted_capital, 8) if adjusted_capital is not None else None
+        ),
+        "net_capital_flow_quote": round(net_capital_flow, 8),
+        "capital_flows": get_bot_capital_flows(bot_id, mode),
+        "current_capital_quote": current_capital,
+        "pnl_return_on_budget_pct": pnl_vs_budget_pct,
+        "max_drawdown_vs_budget_pct": max_dd_vs_budget_pct,
+        "base_value_quote": base_value_quote,
+        "quote_remaining": quote_remaining,
+        "base_alloc_pct": base_alloc_pct,
+        "quote_alloc_pct": quote_alloc_pct,
+    }
+
+
+def _execution_history_payload(
+    bot_id: str,
+    bot_row: dict[str, Any],
+    mode: str,
+    *,
+    active_mode: str | None = None,
+) -> dict[str, Any]:
+    order_stats, fills = fetch_bot_orders_panel(bot_id, order_limit=100, mode=mode)
+    orders_asc = fetch_bot_orders_chronological(bot_id, mode=mode)
+    trades = compute_closed_trades(orders_asc, str(bot_row.get("symbol") or ""))
+    metrics = _build_strategy_health_for_mode(
+        bot_id=bot_id,
+        bot_row=bot_row,
+        mode=mode,
+    )
+    realized_values = [float(t["realized_pnl"]) for t in trades if t.get("realized_pnl") is not None]
+    return {
+        "mode": mode,
+        "active_execution_mode": active_mode or bot_row.get("execution_mode") or "testnet",
+        "order_stats": order_stats,
+        "fills": fills,
+        "trades": trades,
+        "metrics": metrics,
+        "realized_pnl_quote": metrics["realized_pnl_quote"],
+        "win_rate_pct": metrics["win_rate_pct"],
+        "best_trade_pnl": max(realized_values) if realized_values else None,
+        "worst_trade_pnl": min(realized_values) if realized_values else None,
+    }
+
+
 def _row_to_bot(row) -> dict:
     if hasattr(row, "keys"):
         return {k: row[k] for k in row.keys()}
@@ -1475,23 +1652,35 @@ def list_bots():
         cur.execute("SELECT * FROM bots ORDER BY created_at")
         rows = [_row_to_bot(r) for r in cur.fetchall()]
         for row in rows:
-            raw_params = row.get("strategy_params_json")
-            row["initial_budget_quote"] = initial_budget_from_strategy_params_json(
-                raw_params if isinstance(raw_params, str) else None
-            )
-            # Compute lightweight P&L from stored orders (no exchange call)
             bot_id = row.get("bot_id", "")
-            sym = str(row.get("symbol") or "")
+            row["capital_source"] = row.get("capital_source") or "budget"
+            # Compute lightweight P&L from stored orders (no exchange call)
+            row["metrics"] = {}
             try:
-                orders_asc = fetch_bot_orders_chronological(bot_id)
-                perf = compute_strategy_performance(orders_asc, sym)
-                row["realized_pnl_quote"] = round(perf["realized_pnl_quote"], 4)
-                row["win_rate_pct"] = perf["win_rate_pct"]
-                row["closed_trades"] = perf["closed_trades"]
+                row["metrics"] = {
+                    mode: _build_strategy_health_for_mode(
+                        bot_id=bot_id,
+                        bot_row=row,
+                        mode=mode,
+                    )
+                    for mode in EXECUTION_MODES
+                }
+                active_mode = str(row.get("execution_mode") or "testnet")
+                active_metrics = row["metrics"].get(active_mode) or row["metrics"]["testnet"]
+                row["initial_budget_quote"] = active_metrics["initial_budget_quote"]
+                row["realized_pnl_quote"] = round(active_metrics["realized_pnl_quote"], 4)
+                row["win_rate_pct"] = active_metrics["win_rate_pct"]
+                row["closed_trades"] = active_metrics["closed_trades"]
+                row["current_capital_quote"] = active_metrics["current_capital_quote"]
             except Exception:
+                row["initial_budget_quote"] = _initial_capital_for_mode(
+                    row,
+                    str(row.get("execution_mode") or "testnet"),
+                )
                 row["realized_pnl_quote"] = None
                 row["win_rate_pct"] = None
                 row["closed_trades"] = None
+                row["current_capital_quote"] = None
             row["risk_settings"] = get_effective_bot_risk_settings(bot_id)
         return {"bots": rows}
     finally:
@@ -1570,7 +1759,13 @@ def post_create_bot(body: CreateBotBody):
 
     params_json = json.dumps(params, default=str)
     try:
-        bot = create_bot(body.name, body.symbol, body.strategy, params_json)
+        bot = create_bot(
+            body.name,
+            body.symbol,
+            body.strategy,
+            params_json,
+            testnet_initial_capital_quote=body.initial_budget_quote,
+        )
         risk_settings = (
             save_bot_risk_settings(bot["bot_id"], body.risk_settings)
             if body.risk_settings
@@ -1617,6 +1812,18 @@ class BotExecutionModeBody(BaseModel):
     execution_mode: str  # "testnet" | "live"
 
 
+class PromoteToLiveBody(BaseModel):
+    initial_capital_quote: float = Field(gt=0)
+    confirm_real_money: bool = False
+
+
+class CapitalFlowBody(BaseModel):
+    execution_mode: str = Field(pattern="^(testnet|live)$")
+    amount_quote: float = Field(gt=0)
+    flow_type: str = Field(pattern="^(deposit|withdrawal|adjustment)$")
+    reason: str | None = None
+
+
 @app.put("/api/bots/{bot_id}/execution-mode")
 def put_bot_execution_mode(bot_id: str, body: BotExecutionModeBody):
     """
@@ -1632,6 +1839,57 @@ def put_bot_execution_mode(bot_id: str, body: BotExecutionModeBody):
         raise HTTPException(status_code=code, detail=msg) from e
     publish_bot_event(bot_id, "bot_updated", {"bot": bot})
     return {"bot": bot}
+
+
+@app.post("/api/bots/{bot_id}/promote-to-live")
+def post_promote_bot_to_live(bot_id: str, body: PromoteToLiveBody):
+    if not body.confirm_real_money:
+        raise HTTPException(
+            status_code=400,
+            detail="confirm_real_money must be true to promote a bot to live trading",
+        )
+    try:
+        bot = promote_bot_to_live(
+            bot_id,
+            initial_capital_quote=body.initial_capital_quote,
+        )
+    except ValueError as e:
+        msg = str(e)
+        code = 409 if "stop" in msg or "running" in msg else 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from e
+    logging.getLogger("bots").warning(
+        "Bot promoted to live mode bot_id=%s initial_capital_quote=%s mode=live",
+        bot_id,
+        body.initial_capital_quote,
+    )
+    publish_bot_event(bot_id, "bot_updated", {"bot": bot})
+    publish_bots_event("bots_changed", {"action": "promoted_to_live", "bot": bot})
+    return {"bot": bot}
+
+
+@app.post("/api/bots/{bot_id}/capital-flows")
+def post_bot_capital_flow(bot_id: str, body: CapitalFlowBody):
+    try:
+        flow = record_bot_capital_flow(
+            bot_id,
+            body.execution_mode,
+            body.amount_quote,
+            body.flow_type,
+            body.reason,
+        )
+    except ValueError as e:
+        msg = str(e)
+        code = 404 if "not found" in msg else 400
+        raise HTTPException(status_code=code, detail=msg) from e
+    logging.getLogger("bots").info(
+        "Bot capital flow bot_id=%s mode=%s type=%s amount=%s",
+        bot_id,
+        body.execution_mode,
+        body.flow_type,
+        body.amount_quote,
+    )
+    publish_bot_event(bot_id, "capital_flow", {"flow": flow})
+    return {"flow": flow}
 
 
 # TTL caches to rate-limit expensive exchange calls in GET /api/bots/{id}.
@@ -1681,8 +1939,7 @@ def get_bot(bot_id: str):
             except Exception:
                 pass
 
-        order_stats, orders = fetch_bot_orders_panel(bot_id, order_limit=50)
-        orders_asc = fetch_bot_orders_chronological(bot_id)
+        order_stats, orders = fetch_bot_orders_panel(bot_id, order_limit=50, mode=bot_mode)
 
         # Rate-limit the mark-price fetch: reuse cached value within TTL.
         mark_price: float | None = None
@@ -1701,97 +1958,26 @@ def get_bot(bot_id: str):
                     _mark_price_cache[bot_id] = (mark_price, now)
             except Exception:
                 mark_price = cached[0] if cached else None
-        perf = compute_strategy_performance(orders_asc, sym, mark_price=mark_price)
-        total_pnl = perf["realized_pnl_quote"] + (perf["unrealized_pnl_quote"] or 0.0)
-        raw_params = bot_row.get("strategy_params_json")
         bot_row["risk_settings"] = (
             db_row_to_risk_settings(get_bot_risk_settings(bot_id))
             or get_global_risk_defaults()
         )
-        budget = initial_budget_from_strategy_params_json(
-            raw_params if isinstance(raw_params, str) else None
-        )
-        pnl_vs_budget_pct: float | None = None
-        max_dd_vs_budget_pct: float | None = None
-        if budget is not None and budget > 0:
-            pnl_vs_budget_pct = round((total_pnl / budget) * 100.0, 4)
-            max_dd_vs_budget_pct = round((perf["max_drawdown_quote"] / budget) * 100.0, 4)
-        current_capital: float | None = None
-        if budget is not None and budget > 0:
-            current_capital = round(budget + total_pnl, 8)
-
-        # Portfolio distribution: how much is in the base asset vs quote currency.
-        # quote_remaining is computed from cost-basis accounting (independent of
-        # mark-price), so it stays accurate even if the bot overspent its budget
-        # due to a bug in an older runner version.
-        #   quote_remaining = budget + realized_pnl - open_cost_basis
-        # This equals: money we started with, plus profits booked, minus what is
-        # currently locked in the open position.
-        open_base = perf["open_base_position"]
-        open_basis = perf["open_cost_basis_quote"]
-        realized_pnl = perf["realized_pnl_quote"]
-
-        base_value_quote: float | None = None
-        if open_base > 1e-12:
-            if mark_price is not None and mark_price > 0:
-                base_value_quote = round(open_base * mark_price, 8)
-            else:
-                base_value_quote = round(open_basis, 8)
-
-        quote_remaining: float | None = None
-        base_alloc_pct: float | None = None
-        quote_alloc_pct: float | None = None
-
-        if budget is not None and budget > 0:
-            # Actual USDT still available = budget + closed-trade profits - cost of open lots
-            qr = budget + realized_pnl - open_basis
-            quote_remaining = round(max(0.0, qr), 8)
-            bv = base_value_quote or 0.0
-            # Portfolio denominator: current value of open position + free quote
-            portfolio_total = bv + quote_remaining
-            if portfolio_total > 1e-12:
-                base_alloc_pct = round((bv / portfolio_total) * 100, 2)
-                quote_alloc_pct = round(100.0 - base_alloc_pct, 2)
-            else:
-                base_alloc_pct = 0.0
-                quote_alloc_pct = 100.0
-
-        strategy_health = {
-            "realized_pnl_quote": round(perf["realized_pnl_quote"], 8),
-            "unrealized_pnl_quote": (
-                round(perf["unrealized_pnl_quote"], 8)
-                if perf["unrealized_pnl_quote"] is not None
-                else None
-            ),
-            "open_base_position": round(perf["open_base_position"], 8),
-            "open_cost_basis_quote": round(perf["open_cost_basis_quote"], 8),
-            "closed_trades": perf["closed_trades"],
-            "winning_trades": perf["winning_trades"],
-            "losing_trades": perf["losing_trades"],
-            "breakeven_trades": perf["breakeven_trades"],
-            "win_rate_pct": (
-                round(perf["win_rate_pct"], 2) if perf["win_rate_pct"] is not None else None
-            ),
-            "max_drawdown_quote": round(perf["max_drawdown_quote"], 8),
-            "max_drawdown_pct": (
-                round(perf["max_drawdown_pct"], 4) if perf["max_drawdown_pct"] is not None else None
-            ),
-            "quote_currency": perf["quote_currency"],
-            "mark_price": round(mark_price, 8) if mark_price is not None else None,
-            "total_pnl_quote": round(total_pnl, 8),
-            "initial_budget_quote": round(budget, 8) if budget is not None else None,
-            "current_capital_quote": current_capital,
-            "pnl_return_on_budget_pct": pnl_vs_budget_pct,
-            "max_drawdown_vs_budget_pct": max_dd_vs_budget_pct,
-            "base_value_quote": base_value_quote,
-            "quote_remaining": quote_remaining,
-            "base_alloc_pct": base_alloc_pct,
-            "quote_alloc_pct": quote_alloc_pct,
+        metrics = {
+            mode: _build_strategy_health_for_mode(
+                bot_id=bot_id,
+                bot_row=bot_row,
+                mode=mode,
+                mark_price=mark_price,
+            )
+            for mode in EXECUTION_MODES
         }
+        strategy_health = metrics.get(bot_mode) or metrics["testnet"]
         return {
             "bot": bot_row,
             "logs": logs,
             "execution_mode": bot_mode,
+            "capital_source": bot_row.get("capital_source") or "budget",
+            "metrics": metrics,
             "order_stats": order_stats,
             "orders": orders,
             "strategy_health": strategy_health,
@@ -1801,7 +1987,10 @@ def get_bot(bot_id: str):
 
 
 @app.get("/api/bots/{bot_id}/trade-summary")
-def get_bot_trade_summary(bot_id: str):
+def get_bot_trade_summary(
+    bot_id: str,
+    mode: str | None = Query(default="current", description="testnet | live | both | current"),
+):
     """
     Return per-trade FIFO-matched closed trades for the bot.
 
@@ -1818,29 +2007,80 @@ def get_bot_trade_summary(bot_id: str):
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Bot not found")
+        bot_row = _row_to_bot(row)
         sym = str(row["symbol"] or "")
         bot_mode = str(row["execution_mode"] or "testnet")
     finally:
         conn.close()
 
-    orders_asc = fetch_bot_orders_chronological(bot_id)
+    effective_mode = _resolve_mode_for_bot(mode, bot_mode)
+    orders_asc = fetch_bot_orders_chronological(bot_id, mode=effective_mode)
     trades = compute_closed_trades(orders_asc, sym)
     return {
         "trades": trades,
         "symbol": sym,
-        "execution_mode": bot_mode,
+        "execution_mode": effective_mode,
+        "active_execution_mode": bot_mode,
         "total_closed": len(trades),
     }
 
 
 @app.get("/api/bots/{bot_id}/voter-signals")
-def get_voter_signals(bot_id: str):
+def get_voter_signals(
+    bot_id: str,
+    mode: str | None = Query(default="current", description="testnet | live | both | current"),
+):
     """
     Return the latest signal cast by each voter for the given bot.
     Polled by the Bot Detail page to keep voter cards live.
     """
-    rows = get_latest_voter_signals(bot_id)
-    return {"voter_signals": rows}
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT execution_mode FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        bot_mode = str(row["execution_mode"] or "testnet")
+    finally:
+        conn.close()
+    effective_mode = _resolve_mode_for_bot(mode, bot_mode)
+    rows = get_latest_voter_signals(bot_id, mode=effective_mode)
+    return {
+        "voter_signals": rows,
+        "execution_mode": effective_mode,
+        "active_execution_mode": bot_mode,
+    }
+
+
+@app.get("/api/bots/{bot_id}/execution-history")
+def get_bot_execution_history(
+    bot_id: str,
+    mode: str | None = Query(default="current", description="testnet | live | both | current"),
+):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Bot not found")
+        bot_row = _row_to_bot(row)
+        bot_mode = str(bot_row.get("execution_mode") or "testnet")
+    finally:
+        conn.close()
+
+    effective_mode = _resolve_mode_for_bot(mode, bot_mode)
+    if effective_mode == "both":
+        return {
+            "mode": "both",
+            "active_execution_mode": bot_mode,
+            "histories": {
+                m: _execution_history_payload(bot_id, bot_row, m)
+                for m in EXECUTION_MODES
+            },
+        }
+    return _execution_history_payload(bot_id, bot_row, effective_mode, active_mode=bot_mode)
 
 
 @app.patch("/api/bots/{bot_id}/strategy-params")
@@ -1875,13 +2115,17 @@ def patch_bot_strategy_params(bot_id: str, body: dict[str, Any] = Body(...)):
 
 
 @app.post("/api/bots/{bot_id}/optimize-weights")
-def post_optimize_bot_weights(bot_id: str):
+def post_optimize_bot_weights(
+    bot_id: str,
+    mode: str | None = Query(default="current", description="testnet | live | current"),
+):
     """
     Run scripts/metamagi_labeled_export.py with blended voter weights, update bots.strategy_params_json,
     stream SSE logs + terminal-friendly script stderr lines.
     """
+    resolved = _normalize_mode_query(mode, allow_both=False)
     return StreamingResponse(
-        _optimize_weights_sse(bot_id),
+        _optimize_weights_sse(bot_id, resolved),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -1952,7 +2196,7 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT bot_id, symbol, strategy_params_json FROM bots WHERE bot_id = ?",
+                "SELECT bot_id, symbol, strategy_params_json, execution_mode FROM bots WHERE bot_id = ?",
             (bot_id,),
         )
         bot_row = cur.fetchone()
@@ -1985,7 +2229,10 @@ def set_bot_status(bot_id: str, body: BotStatusBody):
         budget = initial_budget_from_strategy_params_json(
             raw_params if isinstance(raw_params, str) else None
         )
-        orders = fetch_bot_orders_chronological(bot_id)
+        orders = fetch_bot_orders_chronological(
+            bot_id,
+            mode=str(bot_row["execution_mode"] or "testnet"),
+        )
         state = risk_resume_state(
             orders_oldest_first=orders,
             symbol=str(bot_row["symbol"] or ""),

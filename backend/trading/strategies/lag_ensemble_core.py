@@ -102,7 +102,11 @@ def run_lag_consensus(
     base_weights: dict[str, float] = dict(
         params.get("voter_weights", {v: 1.0 for v in voters})
     )
-    dynamic_weights = get_metatrader().get_dynamic_weights(voters)
+    execution_mode = str(params.get("execution_mode") or "testnet")
+    dynamic_weights = get_metatrader().get_dynamic_weights(
+        voters,
+        execution_mode,
+    )
     weights: dict[str, float] = {**base_weights, **dynamic_weights}
 
     votes: dict[str, float] = {"buy": 0.0, "sell": 0.0, "hold": 0.0}

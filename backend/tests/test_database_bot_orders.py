@@ -114,6 +114,90 @@ class TestDatabaseBotOrders(unittest.TestCase):
         self.assertEqual(orders[0]["display_price"], 50_000.0)
         self.assertEqual(orders[0]["display_status"], "CLOSED")
 
+    def test_order_helpers_filter_by_execution_mode(self) -> None:
+        db.record_bot_order(
+            "1",
+            "testnet",
+            {
+                "id": "tn-1",
+                "symbol": "BTC/USDT",
+                "side": "buy",
+                "type": "market",
+                "amount": 1.0,
+                "cost": 100.0,
+                "filled": 1.0,
+                "status": "closed",
+            },
+        )
+        db.record_bot_order(
+            "1",
+            "live",
+            {
+                "id": "lv-1",
+                "symbol": "BTC/USDT",
+                "side": "sell",
+                "type": "market",
+                "amount": 1.0,
+                "cost": 110.0,
+                "filled": 1.0,
+                "status": "closed",
+            },
+        )
+
+        stats_testnet, orders_testnet = db.fetch_bot_orders_panel("1", mode="testnet")
+        stats_live, orders_live = db.fetch_bot_orders_panel("1", mode="live")
+        stats_both, _ = db.fetch_bot_orders_panel("1")
+
+        self.assertEqual(stats_testnet["total_orders"], 1)
+        self.assertEqual(orders_testnet[0]["exchange_order_id"], "tn-1")
+        self.assertEqual(stats_live["total_orders"], 1)
+        self.assertEqual(orders_live[0]["exchange_order_id"], "lv-1")
+        self.assertEqual(stats_both["total_orders"], 2)
+        self.assertEqual(len(db.fetch_bot_orders_chronological("1", mode="testnet")), 1)
+        self.assertEqual(len(db.fetch_bot_orders_chronological("1", mode="live")), 1)
+
+    def test_promote_to_live_requires_explicit_capital(self) -> None:
+        with self.assertRaises(ValueError):
+            db.promote_bot_to_live("1", initial_capital_quote=0)
+
+        promoted = db.promote_bot_to_live(
+            "1",
+            initial_capital_quote=125.0,
+        )
+        self.assertEqual(promoted["execution_mode"], "live")
+        self.assertEqual(promoted["capital_source"], "budget")
+        self.assertEqual(promoted["live_initial_capital_quote"], 125.0)
+
+    def test_capital_flows_are_signed_and_summed(self) -> None:
+        db.record_bot_capital_flow("1", "live", 25.0, "deposit", "top up")
+        db.record_bot_capital_flow("1", "live", 10.0, "withdrawal", "cash out")
+        db.record_bot_capital_flow("1", "testnet", 99.0, "deposit", "ignore")
+
+        flows = db.get_bot_capital_flows("1", "live")
+        self.assertEqual(len(flows), 2)
+        self.assertAlmostEqual(db.get_bot_net_capital_flow("1", "live"), 15.0)
+        self.assertAlmostEqual(
+            db.get_bot_net_capital_flow("1", "testnet"),
+            99.0,
+        )
+
+    def test_voter_feedback_stores_execution_mode(self) -> None:
+        db.insert_voter_feedback(
+            {
+                "bot_id": "1",
+                "execution_mode": "live",
+                "timestamp": 1_700_000_000_000,
+                "target_asset": "BTC/USDT",
+                "ensemble_signal": "buy",
+                "voter_name": "sma_cross",
+                "voter_signal": "buy",
+            }
+        )
+        rows = db.get_latest_voter_signals("1", mode="live")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["execution_mode"], "live")
+        self.assertEqual(db.get_latest_voter_signals("1", mode="testnet"), [])
+
     def test_fork_bot_preserves_source_history(self) -> None:
         conn = db.get_db_connection()
         try:
