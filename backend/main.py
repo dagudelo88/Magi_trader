@@ -1,8 +1,10 @@
 import json
 import logging
+import math
 import sys
 import os
 import subprocess
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -10,8 +12,9 @@ from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Configure structured logging before anything else so all loggers
 # (monitoring, data_collector, meta_training_loop, etc.) emit to stdout.
@@ -36,6 +39,8 @@ from database import (
     sync_bot_orders_from_logs,
     refresh_stale_bot_orders_from_exchange,
     fork_bot,
+    metamagi_label_voter_feedback_catchup,
+    peer_voter_weights_for_new_ensemble_bot,
     set_bot_execution_mode,
     update_bot_risk_state,
     update_bot,
@@ -85,6 +90,312 @@ _backend_dir = os.path.dirname(os.path.abspath(__file__))
 _repo_root = os.path.abspath(os.path.join(_backend_dir, ".."))
 load_dotenv(os.path.join(_repo_root, ".env"))
 load_dotenv(os.path.join(_backend_dir, ".env"), override=True)
+
+_METAMAGI_LABELED_EXPORT_SCRIPT = os.path.join(_repo_root, "scripts", "metamagi_labeled_export.py")
+# Subprocess must drain stdout while the child runs; otherwise large --json output fills the pipe
+# and the child deadlocks (looks like a timeout). Allow env override for huge DBs.
+_METAMAGI_EXPORT_TIMEOUT_SEC = max(30, int(os.getenv("METAMAGI_EXPORT_TIMEOUT_SEC", "300")))
+_BLEND_EDGE_FRAC = 0.65
+_BLEND_ACC_FRAC = 0.35
+_WEIGHT_CLAMP_MIN = 0.5
+_WEIGHT_CLAMP_MAX_MULT = 2.0
+
+
+def _sse_event(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+def _coerce_positive_float(v: Any) -> float | None:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x):
+        return None
+    return x
+
+
+def _compute_blended_voter_weights(edge: dict[str, Any], acc: dict[str, Any]) -> dict[str, float]:
+    """65% suggested_edge_weights + 35% suggested_accuracy_weights, mean-renormalized + clamped."""
+    voters = sorted(set(edge) | set(acc))
+    raw: dict[str, float] = {}
+    for v in voters:
+        ev = _coerce_positive_float(edge.get(v)) if v in edge else None
+        av = _coerce_positive_float(acc.get(v)) if v in acc else None
+        if ev is None and av is None:
+            continue
+        if ev is None:
+            raw[v] = av if av is not None else 1.0
+        elif av is None:
+            raw[v] = ev
+        else:
+            raw[v] = _BLEND_EDGE_FRAC * ev + _BLEND_ACC_FRAC * av
+    if not raw:
+        return {}
+    avg = sum(raw.values()) / len(raw)
+    if avg <= 0:
+        return {v: 1.0 for v in raw}
+    max_w = avg * _WEIGHT_CLAMP_MAX_MULT
+    out: dict[str, float] = {}
+    for v, val in raw.items():
+        ratio = val / avg
+        w = max(_WEIGHT_CLAMP_MIN, min(max_w, ratio))
+        out[v] = round(w, 4)
+    return out
+
+
+def _merge_blended_voter_weights_into_params(
+    existing_json: str | None,
+    blended: dict[str, float],
+) -> dict[str, Any]:
+    merged = merge_strategy_params_json(existing_json if isinstance(existing_json, str) else None, {})
+    voters = merged.get("voters")
+    prev_w = merged.get("voter_weights")
+    prev_map: dict[str, float] = {}
+    if isinstance(prev_w, dict):
+        for k, v in prev_w.items():
+            fv = _coerce_positive_float(v)
+            if fv is not None:
+                prev_map[str(k)] = fv
+    if isinstance(voters, list):
+        out_w: dict[str, float] = {}
+        for v in voters:
+            if not isinstance(v, str):
+                continue
+            if v in blended:
+                out_w[v] = blended[v]
+            else:
+                out_w[v] = prev_map.get(v, 1.0)
+        merged["voter_weights"] = out_w
+    else:
+        merged["voter_weights"] = dict(blended)
+    return merged
+
+
+def _optimize_weights_sse(bot_id: str):
+    log = logging.getLogger("optimize_weights")
+
+    yield _sse_event(
+        {
+            "type": "log",
+            "level": "info",
+            "message": f"Starting MetaMagi weight optimization for bot {bot_id}…",
+        }
+    )
+
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT strategy_params_json FROM bots WHERE bot_id = ?", (bot_id,))
+        row = cur.fetchone()
+        if not row:
+            yield _sse_event({"type": "log", "level": "error", "message": "Bot not found."})
+            yield _sse_event({"type": "done", "ok": False})
+            return
+        existing_snapshot = row["strategy_params_json"]
+    finally:
+        conn.close()
+
+    yield _sse_event({"type": "log", "level": "info", "message": "Connecting to database…"})
+
+    # Script argparse supports edge|accuracy|both only (not "blended"); JSON always includes both maps.
+    cmd = [
+        sys.executable,
+        _METAMAGI_LABELED_EXPORT_SCRIPT,
+        "--bot",
+        bot_id,
+        "--weight-method",
+        "both",
+        "--hours",
+        "720",
+        "--sample-rows",
+        "0",
+        "--json",
+    ]
+    yield _sse_event(
+        {
+            "type": "log",
+            "level": "info",
+            "message": (
+                "Running: python scripts/metamagi_labeled_export.py "
+                f"--bot {bot_id} --weight-method both --hours 720 --sample-rows 0 --json"
+            ),
+        }
+    )
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=_repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as e:
+        log.exception("Failed to spawn metamagi export")
+        yield _sse_event({"type": "log", "level": "error", "message": f"Could not run export script: {e}"})
+        yield _sse_event({"type": "done", "ok": False})
+        return
+
+    stderr_lines: list[str] = []
+    stdout_chunks: list[str] = []
+
+    def pump_stderr() -> None:
+        assert proc.stderr is not None
+        try:
+            for line in iter(proc.stderr.readline, ""):
+                stderr_lines.append(line.rstrip())
+        except Exception:
+            log.exception("stderr pump failed for metamagi export")
+
+    def drain_stdout() -> None:
+        assert proc.stdout is not None
+        try:
+            stdout_chunks.append(proc.stdout.read())
+        except Exception:
+            log.exception("stdout drain failed for metamagi export")
+
+    th_err = threading.Thread(target=pump_stderr, daemon=True)
+    th_out = threading.Thread(target=drain_stdout, daemon=True)
+    th_out.start()
+    th_err.start()
+
+    rc = 0
+    try:
+        rc = proc.wait(timeout=_METAMAGI_EXPORT_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            log.warning("metamagi export kill wait timed out for bot %s", bot_id)
+        yield _sse_event(
+            {
+                "type": "log",
+                "level": "error",
+                "message": (
+                    f"MetaMagi export timed out after {_METAMAGI_EXPORT_TIMEOUT_SEC} seconds "
+                    "(set METAMAGI_EXPORT_TIMEOUT_SEC if your DB needs longer)."
+                ),
+            }
+        )
+        yield _sse_event({"type": "done", "ok": False})
+        th_out.join(timeout=15)
+        th_err.join(timeout=15)
+        return
+
+    th_out.join(timeout=120)
+    th_err.join(timeout=30)
+    stdout_text = stdout_chunks[0] if stdout_chunks else ""
+
+    for sl in stderr_lines:
+        if sl.strip():
+            yield _sse_event({"type": "log", "level": "info", "message": sl})
+
+    if rc != 0:
+        yield _sse_event({"type": "log", "level": "error", "message": f"Export script exited with code {rc}."})
+        tail = stdout_text.strip()
+        if tail:
+            yield _sse_event({"type": "log", "level": "error", "message": tail[:4000]})
+        yield _sse_event({"type": "done", "ok": False})
+        return
+
+    try:
+        payload = json.loads(stdout_text.strip())
+    except json.JSONDecodeError as e:
+        yield _sse_event({"type": "log", "level": "error", "message": f"Invalid JSON from export script: {e}"})
+        yield _sse_event({"type": "done", "ok": False})
+        return
+
+    hints = payload.get("llm_hints") or {}
+    blended_raw = hints.get("suggested_blended_weights")
+    blended: dict[str, float]
+    if isinstance(blended_raw, dict) and blended_raw:
+        blended = {}
+        for k, v in blended_raw.items():
+            fv = _coerce_positive_float(v)
+            if fv is not None:
+                blended[str(k)] = round(fv, 4)
+    else:
+        edge = hints.get("suggested_edge_weights") or {}
+        acc = hints.get("suggested_accuracy_weights") or {}
+        if not isinstance(edge, dict) or not isinstance(acc, dict):
+            yield _sse_event(
+                {"type": "log", "level": "error", "message": "Export payload missing suggested edge/accuracy weight maps."}
+            )
+            yield _sse_event({"type": "done", "ok": False})
+            return
+        blended = _compute_blended_voter_weights(edge, acc)
+
+    if not blended:
+        yield _sse_event(
+            {"type": "log", "level": "error", "message": "No blended weights computed (insufficient labeled voter data?)."}
+        )
+        yield _sse_event({"type": "done", "ok": False})
+        return
+
+    counts = payload.get("counts") or {}
+    nt = int(counts.get("total_rows") or 0)
+    nl = int(counts.get("labeled_forward_roc_30s") or 0)
+    yield _sse_event(
+        {"type": "log", "level": "info", "message": f"Analyzing {nt:,} labeled rows (last 720 hours)…"}
+    )
+    yield _sse_event(
+        {
+            "type": "log",
+            "level": "info",
+            "message": f"{nl:,} rows carry forward ROC (30s) labels in this window.",
+        }
+    )
+    yield _sse_event(
+        {
+            "type": "log",
+            "level": "info",
+            "message": "Computing blended weights (65% edge + 35% accuracy)…",
+        }
+    )
+
+    try:
+        merged = _merge_blended_voter_weights_into_params(
+            existing_snapshot if isinstance(existing_snapshot, str) else None,
+            blended,
+        )
+        vw = merged.get("voter_weights") or {}
+        if isinstance(vw, dict):
+            n_applied = len(vw)
+        else:
+            n_applied = len(blended)
+        yield _sse_event(
+            {"type": "log", "level": "info", "message": f"Updated {n_applied} voter weights successfully."}
+        )
+
+        out_json = json.dumps(merged, default=str)
+        conn_u = get_db_connection()
+        try:
+            cur_u = conn_u.cursor()
+            cur_u.execute(
+                "UPDATE bots SET strategy_params_json = ? WHERE bot_id = ?",
+                (out_json, bot_id),
+            )
+            conn_u.commit()
+        finally:
+            conn_u.close()
+
+        yield _sse_event({"type": "log", "level": "info", "message": "Done. New weights applied."})
+        yield _sse_event(
+            {
+                "type": "done",
+                "ok": True,
+                "voter_weights": vw if isinstance(vw, dict) else {},
+                "strategy_params": merged,
+                "strategy_params_json": out_json,
+            }
+        )
+    except Exception as e:
+        log.exception("optimize_weights DB update failed for bot %s", bot_id)
+        yield _sse_event({"type": "log", "level": "error", "message": str(e)})
+        yield _sse_event({"type": "done", "ok": False})
 
 
 async def _meta_training_loop() -> None:
@@ -765,10 +1076,12 @@ def get_db_stats():
         "bot_orders",
         "bot_logs",
         "bot_decisions",
+        "voter_feedback",
         "market_depth",
         "bots",
     ]
     table_counts: dict[str, int] = {}
+    metamagi_counts: dict[str, int] = {}
     conn = get_db_connection()
     try:
         cur = conn.cursor()
@@ -778,6 +1091,16 @@ def get_db_stats():
                 table_counts[tbl] = cur.fetchone()[0]
             except Exception:
                 table_counts[tbl] = 0
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM voter_feedback "
+                "WHERE forward_roc_30s IS NULL OR forward_roc_5m IS NULL"
+            )
+            metamagi_counts["unlabeled_rows"] = cur.fetchone()[0]
+            metamagi_counts["total_rows"] = table_counts.get("voter_feedback", 0)
+        except Exception:
+            metamagi_counts["unlabeled_rows"] = 0
+            metamagi_counts["total_rows"] = table_counts.get("voter_feedback", 0)
     finally:
         conn.close()
 
@@ -800,7 +1123,112 @@ def get_db_stats():
         "total_ticks": table_counts.get("market_ticks", 0),
         "total_orders": table_counts.get("bot_orders", 0),
         "distribution": distribution,
+        "metamagi": metamagi_counts,
     }
+
+
+class MetamagiLabelCatchupBody(BaseModel):
+    """Optional tuning for voter_feedback catch-up labeling."""
+
+    lookback_days: float | None = Field(
+        default=None,
+        ge=0.001,
+        le=3660.0,
+        description=(
+            "Restrict scan to the last N days. Omit for full-table scan "
+            "(see METAMAGI_CATCHUP_LOOKBACK_MINUTES)."
+        ),
+    )
+    max_seconds: float | None = Field(
+        default=None,
+        ge=1.0,
+        description=(
+            "Optional wall-clock cap for this request. Omit for no cap (runs until backlog "
+            "is gone). Same as env METAMAGI_CATCHUP_MAX_SECONDS when unset."
+        ),
+    )
+
+
+@app.post("/api/data/metamagi-label-catchup")
+async def metamagi_label_catchup(
+    body: MetamagiLabelCatchupBody | None = Body(default=None),
+):
+    """Drain voter_feedback ROC backlog; response is NDJSON (``application/x-ndjson``).
+
+    Each line is a JSON object: ``start`` (initial row count), ``progress`` (after
+    each batch), optional ``db_busy``, then ``done`` (full summary) or ``error``.
+    """
+    import asyncio
+
+    log = logging.getLogger("metamagi_catchup")
+    lb_days = body.lookback_days if body else None
+    max_sec = body.max_seconds if body else None
+    lookback_minutes = (
+        int(round(lb_days * 24 * 60)) if lb_days is not None else None
+    )
+
+    log.info(
+        "HTTP POST /api/data/metamagi-label-catchup (NDJSON stream) "
+        "lookback_days=%s max_seconds=%s resolved_lookback_minutes=%s",
+        lb_days,
+        max_sec,
+        lookback_minutes,
+    )
+
+    async def ndjson_events():
+        loop = asyncio.get_running_loop()
+        q: asyncio.Queue = asyncio.Queue()
+
+        def worker() -> None:
+            try:
+
+                def send(ev: dict[str, Any]) -> None:
+                    asyncio.run_coroutine_threadsafe(q.put(ev), loop).result(
+                        timeout=None
+                    )
+
+                result = metamagi_label_voter_feedback_catchup(
+                    lookback_minutes=lookback_minutes,
+                    max_seconds=max_sec,
+                    progress_callback=send,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "done", **result}), loop
+                ).result(timeout=None)
+            except Exception as exc:
+                log.exception(
+                    "HTTP /api/data/metamagi-label-catchup stream worker failed "
+                    "(lookback_days=%s max_seconds=%s)",
+                    lb_days,
+                    max_sec,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    q.put({"type": "error", "detail": str(exc)}), loop
+                ).result(timeout=None)
+            finally:
+                asyncio.run_coroutine_threadsafe(q.put(None), loop).result(
+                    timeout=None
+                )
+
+        task = asyncio.create_task(asyncio.to_thread(worker))
+        try:
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                yield json.dumps(item, default=str) + "\n"
+        finally:
+            await task
+
+    return StreamingResponse(
+        ndjson_events(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/data/purge-sim-logs")
@@ -1059,6 +1487,38 @@ def post_create_bot(body: CreateBotBody):
         safe_keys = set(params.keys()) | universal_keys
         params.update({k: v for k, v in body.strategy_params.items() if k in safe_keys})
     params["initial_budget_quote"] = body.initial_budget_quote
+
+    vv_raw = params.get("voters")
+    if (
+        isinstance(vv_raw, list)
+        and vv_raw
+        and all(isinstance(x, str) for x in vv_raw)
+        and (
+            body.strategy.startswith("magi_ensemble_")
+            or body.strategy.startswith("magi_lag_ensemble_")
+        )
+    ):
+        peer_w = peer_voter_weights_for_new_ensemble_bot(body.strategy, vv_raw)
+        if peer_w:
+            tmpl_w = params.get("voter_weights")
+            tmpl_map: dict[str, Any] = tmpl_w if isinstance(tmpl_w, dict) else {}
+            merged_vw: dict[str, float] = {}
+            for v in vv_raw:
+                if v in peer_w:
+                    merged_vw[v] = peer_w[v]
+                    continue
+                raw_tw = tmpl_map.get(v, 1.0)
+                try:
+                    merged_vw[v] = round(float(raw_tw), 4)
+                except (TypeError, ValueError):
+                    merged_vw[v] = 1.0
+            params["voter_weights"] = merged_vw
+            logging.getLogger(__name__).info(
+                "New ensemble bot: inherited voter_weights from peer (%s, %d weights)",
+                body.strategy,
+                len(peer_w),
+            )
+
     params_json = json.dumps(params, default=str)
     try:
         bot = create_bot(body.name, body.symbol, body.strategy, params_json)
@@ -1363,6 +1823,23 @@ def patch_bot_strategy_params(bot_id: str, body: dict[str, Any] = Body(...)):
         return {"strategy_params": merged, "strategy_params_json": out_json}
     finally:
         conn.close()
+
+
+@app.post("/api/bots/{bot_id}/optimize-weights")
+def post_optimize_bot_weights(bot_id: str):
+    """
+    Run scripts/metamagi_labeled_export.py with blended voter weights, update bots.strategy_params_json,
+    stream SSE logs + terminal-friendly script stderr lines.
+    """
+    return StreamingResponse(
+        _optimize_weights_sse(bot_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/bots/{bot_id}/fork")

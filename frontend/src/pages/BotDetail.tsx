@@ -641,6 +641,10 @@ export default function BotDetail() {
   const [configBusy, setConfigBusy] = useState(false);
   const [configError, setConfigError] = useState<string | null>(null);
   const [configSuccess, setConfigSuccess] = useState<string | null>(null);
+  const [weightsOptimizeBusy, setWeightsOptimizeBusy] = useState(false);
+  const [weightsOptimizeLogOpen, setWeightsOptimizeLogOpen] = useState(false);
+  const [weightsOptimizeLines, setWeightsOptimizeLines] = useState<Array<{ level: string; text: string }>>([]);
+  const weightsOptimizeLogRef = useRef<HTMLDivElement>(null);
   const [promoteBusy, setPromoteBusy] = useState(false);
   const [followLogBottom, setFollowLogBottom] = useState(true);
   const [logsCopied, setLogsCopied] = useState(false);
@@ -816,21 +820,27 @@ export default function BotDetail() {
   useEffect(() => {
     if (!showConfigModal) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !configBusy) {
+      if (event.key === 'Escape' && !configBusy && !weightsOptimizeBusy) {
         setShowConfigModal(false);
         setConfigError(null);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [showConfigModal, configBusy]);
+  }, [showConfigModal, configBusy, weightsOptimizeBusy]);
+
+  useEffect(() => {
+    const el = weightsOptimizeLogRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [weightsOptimizeLines]);
 
   const closeConfigModal = useCallback(() => {
-    if (configBusy) return;
+    if (configBusy || weightsOptimizeBusy) return;
     setShowConfigModal(false);
     setConfigError(null);
     setConfigSuccess(null);
-  }, [configBusy]);
+  }, [configBusy, weightsOptimizeBusy]);
 
   const updateConfigRisk = useCallback(<K extends keyof RiskSettings>(key: K, value: RiskSettings[K]) => {
     setConfigRiskDraft((current) => (current ? { ...current, [key]: value } : current));
@@ -989,6 +999,119 @@ export default function BotDetail() {
       setConfigBusy(false);
     }
   };
+
+  const runOptimizeWeights = useCallback(async () => {
+    if (!id || weightsOptimizeBusy) return;
+    setWeightsOptimizeBusy(true);
+    setWeightsOptimizeLogOpen(true);
+    setWeightsOptimizeLines([]);
+    setConfigError(null);
+    setConfigSuccess(null);
+    let sawDone = false;
+    let doneOk = false;
+    try {
+      const res = await fetch(`${API_BASE}/api/bots/${id}/optimize-weights`, {
+        method: 'POST',
+        headers: { Accept: 'text/event-stream' },
+      });
+      if (!res.ok) {
+        let detail = `Request failed (${res.status})`;
+        try {
+          const j = (await res.json()) as { detail?: unknown };
+          if (typeof j.detail === 'string') detail = j.detail;
+        } catch {
+          /* ignore non-JSON error body */
+        }
+        throw new Error(detail);
+      }
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error('No response body from optimize-weights');
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const normalized = buffer.replace(/\r\n/g, '\n');
+        const parts = normalized.split('\n\n');
+        buffer = parts.pop() ?? '';
+        for (const block of parts) {
+          for (const ln of block.split('\n')) {
+            if (!ln.startsWith('data:')) continue;
+            const raw = ln.slice(5).trimStart();
+            let evt: unknown;
+            try {
+              evt = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              continue;
+            }
+            if (!evt || typeof evt !== 'object') continue;
+            const o = evt as {
+              type?: string;
+              level?: string;
+              message?: string;
+              ok?: boolean;
+            };
+            if (o.type === 'log' && typeof o.message === 'string') {
+              const level = typeof o.level === 'string' ? o.level : 'info';
+              setWeightsOptimizeLines((prev) => [...prev, { level, text: o.message as string }]);
+            } else if (o.type === 'done') {
+              sawDone = true;
+              doneOk = Boolean(o.ok);
+            }
+          }
+        }
+      }
+      const tail = buffer.replace(/\r\n/g, '\n').trim();
+      if (tail) {
+        for (const block of tail.split('\n\n')) {
+          if (!block.trim()) continue;
+          for (const ln of block.split('\n')) {
+            if (!ln.startsWith('data:')) continue;
+            const raw = ln.slice(5).trimStart();
+            let evt: unknown;
+            try {
+              evt = JSON.parse(raw) as Record<string, unknown>;
+            } catch {
+              continue;
+            }
+            if (!evt || typeof evt !== 'object') continue;
+            const o = evt as {
+              type?: string;
+              level?: string;
+              message?: string;
+              ok?: boolean;
+            };
+            if (o.type === 'log' && typeof o.message === 'string') {
+              const level = typeof o.level === 'string' ? o.level : 'info';
+              setWeightsOptimizeLines((prev) => [...prev, { level, text: o.message as string }]);
+            } else if (o.type === 'done') {
+              sawDone = true;
+              doneOk = Boolean(o.ok);
+            }
+          }
+        }
+      }
+      if (!sawDone) {
+        setWeightsOptimizeLines((prev) => [
+          ...prev,
+          { level: 'error', text: 'Stream ended without a completion event from the server.' },
+        ]);
+      } else if (!doneOk) {
+        setConfigError('MetaMagi weight optimization did not complete successfully.');
+      } else {
+        await refresh();
+        setConfigSuccess('MetaMagi blended weights applied and saved.');
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'MetaMagi optimization failed';
+      setWeightsOptimizeLines((prev) => [...prev, { level: 'error', text: msg }]);
+      setConfigError(msg);
+    } finally {
+      setWeightsOptimizeBusy(false);
+    }
+  }, [id, weightsOptimizeBusy, refresh]);
 
   const saveBotConfiguration = async () => {
     if (!id || !configRiskDraft) return;
@@ -1767,7 +1890,7 @@ export default function BotDetail() {
               <button
                 type="button"
                 onClick={closeConfigModal}
-                disabled={configBusy}
+                disabled={configBusy || weightsOptimizeBusy}
                 className="rounded border border-magi-grid/30 bg-black/20 p-2 text-magi-muted transition-colors hover:border-magi-primary/40 hover:text-magi-primary disabled:opacity-40"
                 aria-label="Close bot configuration"
               >
@@ -2157,6 +2280,37 @@ export default function BotDetail() {
                           </p>
                         </div>
                       )}
+
+                      <div className="flex flex-col gap-2">
+                        <button
+                          type="button"
+                          disabled={weightsOptimizeBusy || configBusy}
+                          onClick={() => void runOptimizeWeights()}
+                          className="rounded bg-magi-primary px-5 py-2 text-[11px] font-black uppercase tracking-widest text-black shadow-lg shadow-orange-900/20 transition-colors hover:brightness-110 disabled:opacity-40 self-start"
+                        >
+                          {weightsOptimizeBusy ? 'Optimizing…' : 'Auto-Optimize Weights (MetaMagi)'}
+                        </button>
+                        {weightsOptimizeLogOpen && (
+                          <div
+                            ref={weightsOptimizeLogRef}
+                            className="max-h-52 overflow-y-auto rounded-lg border border-magi-grid/30 bg-black/85 px-3 py-2 font-mono text-[10px] leading-relaxed text-magi-tertiary/90"
+                            aria-live="polite"
+                          >
+                            {weightsOptimizeLines.length === 0 && weightsOptimizeBusy ? (
+                              <span className="text-magi-muted/50">Waiting for output…</span>
+                            ) : (
+                              weightsOptimizeLines.map((line, i) => (
+                                <div
+                                  key={`${i}-${line.text.slice(0, 48)}`}
+                                  className={line.level === 'error' ? 'text-red-400' : undefined}
+                                >
+                                  {line.text}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
                     </>
                   ) : (
                     <p className="text-sm text-magi-muted/60">No ensemble voter params found for this bot.</p>

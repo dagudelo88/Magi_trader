@@ -1,4 +1,5 @@
 import json
+import logging
 import queue
 import re
 import secrets
@@ -8,7 +9,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any
+from typing import Any, Callable
 
 # Log lines emitted by bot_runner (legacy + current) — used to backfill bot_orders.
 _RE_BUY_FROM_LOG = re.compile(
@@ -21,6 +22,8 @@ _RE_SELL_FROM_LOG = re.compile(
 )
 
 _last_exchange_refresh_mono: dict[str, float] = {}
+
+_metamagi_catchup_log = logging.getLogger("metamagi_catchup")
 
 
 def _f(x: Any) -> float | None:
@@ -1461,9 +1464,47 @@ def _roc_for_window(
     return (fwd_price - base_price) / base_price
 
 
+def voter_feedback_label_window_bounds(
+    lookback_minutes: int | None,
+) -> tuple[int, int]:
+    """`(cutoff_ms, upper_ms)` aligned with ``label_voter_feedback_forward_roc_batch``."""
+    if lookback_minutes is None:
+        cutoff_ms = 0
+    else:
+        cutoff_ms = int((time.time() - lookback_minutes * 60) * 1000)
+    trailing_gap_ms = 300_000
+    upper_ms = int(time.time() * 1000) - trailing_gap_ms
+    return cutoff_ms, upper_ms
+
+
+def count_voter_feedback_unlabeled(
+    *,
+    lookback_minutes: int | None,
+    busy_timeout_ms: int = 500,
+) -> int:
+    """Rows in the label window that still need at least one forward ROC field."""
+    cutoff_ms, upper_ms = voter_feedback_label_window_bounds(lookback_minutes)
+    conn = get_direct_db_connection(timeout_ms=busy_timeout_ms)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COUNT(*) FROM voter_feedback
+            WHERE (forward_roc_30s IS NULL OR forward_roc_5m IS NULL)
+              AND timestamp >= ?
+              AND timestamp <= ?
+            """,
+            (cutoff_ms, upper_ms),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
 def label_voter_feedback_forward_roc_batch(
     *,
-    lookback_minutes: int = 180,
+    lookback_minutes: int | None = 180,
     batch_size: int = 50,
     busy_timeout_ms: int = 250,
 ) -> dict[str, Any]:
@@ -1472,12 +1513,11 @@ def label_voter_feedback_forward_roc_batch(
     The previous implementation ran two broad UPDATE statements over a large
     window and held SQLite's writer lock long enough to freeze live bots. This
     function does indexed reads first, then commits one tiny update batch.
+
+    ``lookback_minutes=None`` scans from the beginning of time (``timestamp >= 0``)
+    for catch-up jobs; an integer limits rows to those newer than that window.
     """
-    cutoff_ms = int((time.time() - lookback_minutes * 60) * 1000)
-    # Leave a 5-minute gap at the trailing edge so both forward windows (30s
-    # and 5m) have time to arrive in market_ticks before we attempt labeling.
-    trailing_gap_ms = 300_000
-    upper_ms = int(time.time() * 1000) - trailing_gap_ms
+    cutoff_ms, upper_ms = voter_feedback_label_window_bounds(lookback_minutes)
     t0 = time.perf_counter()
     result: dict[str, Any] = {
         "selected": 0,
@@ -1574,6 +1614,389 @@ def label_voter_feedback_forward_roc(lookback_minutes: int = 60) -> int:
             break
         total += updated
     return total
+
+
+def metamagi_label_voter_feedback_catchup(
+    *,
+    lookback_minutes: int | None = None,
+    batch_size: int | None = None,
+    busy_timeout_ms: int | None = None,
+    max_seconds: float | None = None,
+    max_batches: int | None = None,
+    batch_sleep_sec: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Label `voter_feedback` until nothing eligible remains (within scan window).
+
+    Runs batch after batch until a batch selects **zero** rows (`stopped_reason`
+    ``no_rows``), meaning there are no rows left that still need ROC fields inside
+    the chosen lookback (or entire table when ``lookback_minutes`` is ``None``).
+
+    Unlike `_meta_training_loop`, uses ``lookback_minutes=None`` by default (via env)
+    so the scan covers **all history**, not only the last few hours.
+
+    Optional caps ``max_seconds`` / ``max_batches`` (API or env
+    ``METAMAGI_CATCHUP_MAX_SECONDS`` / ``METAMAGI_CATCHUP_MAX_BATCHES``) truncate a
+    run for emergencies; leave unset or ``0`` / ``unlimited`` for no cap.
+
+    On SQLite ``db_busy``, sleeps and retries (see ``METAMAGI_CATCHUP_MAX_CONSECUTIVE_DB_BUSY``).
+
+    Emits structured logs on logger ``metamagi_catchup``.
+
+    Optional ``progress_callback`` receives dict events for streaming UIs:
+    ``start``, ``progress``, ``db_busy`` (shape documented at emit sites).
+    """
+    log = _metamagi_catchup_log
+
+    def _emit(event: dict[str, Any]) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(event)
+        except Exception:
+            log.exception(
+                "MetaMagi catch-up progress_callback failed — continuing labeling"
+            )
+
+    try:
+        # Scan window: explicit arg wins; env empty / all / full / 0 => entire table
+        if lookback_minutes is not None:
+            lb: int | None = lookback_minutes
+        else:
+            raw_lb = os.environ.get("METAMAGI_CATCHUP_LOOKBACK_MINUTES", "").strip().lower()
+            if raw_lb in ("", "all", "full", "0"):
+                lb = None
+            else:
+                try:
+                    lb = int(raw_lb)
+                except ValueError:
+                    log.warning(
+                        "METAMAGI_CATCHUP_LOOKBACK_MINUTES=%r invalid — using full table",
+                        raw_lb,
+                    )
+                    lb = None
+
+        bs = (
+            batch_size
+            if batch_size is not None
+            else int(os.environ.get("METAMAGI_CATCHUP_BATCH_SIZE", "120"))
+        )
+        bt = (
+            busy_timeout_ms
+            if busy_timeout_ms is not None
+            else int(os.environ.get("METAMAGI_CATCHUP_DB_BUSY_TIMEOUT_MS", "500"))
+        )
+
+        if max_seconds is not None:
+            cap_sec: float | None = max_seconds
+        else:
+            raw_sec = os.environ.get("METAMAGI_CATCHUP_MAX_SECONDS", "").strip().lower()
+            cap_sec = (
+                None
+                if raw_sec in ("", "0", "none", "unlimited")
+                else float(raw_sec)
+            )
+
+        if max_batches is not None:
+            cap_batches: int | None = max_batches
+        else:
+            raw_mb = os.environ.get("METAMAGI_CATCHUP_MAX_BATCHES", "").strip().lower()
+            cap_batches = (
+                None
+                if raw_mb in ("", "0", "none", "unlimited")
+                else int(raw_mb)
+            )
+
+        sleep_s = (
+            batch_sleep_sec
+            if batch_sleep_sec is not None
+            else float(os.environ.get("METAMAGI_CATCHUP_BATCH_SLEEP_SEC", "0.05"))
+        )
+        busy_retry_sleep = float(
+            os.environ.get("METAMAGI_CATCHUP_DB_BUSY_RETRY_SLEEP_SEC", "0.25")
+        )
+        max_consecutive_busy = int(
+            os.environ.get("METAMAGI_CATCHUP_MAX_CONSECUTIVE_DB_BUSY", "0")
+        )
+
+        lb_desc = "full_table" if lb is None else str(lb)
+        log.info(
+            "MetaMagi catch-up starting lookback_minutes=%s batch_size=%d "
+            "busy_timeout_ms=%d max_seconds=%s max_batches=%s batch_sleep_sec=%.3f "
+            "db_busy_retry_sleep=%.3f max_consecutive_db_busy=%d",
+            lb_desc,
+            bs,
+            bt,
+            cap_sec,
+            cap_batches,
+            sleep_s,
+            busy_retry_sleep,
+            max_consecutive_busy,
+        )
+
+        initial_remaining = count_voter_feedback_unlabeled(
+            lookback_minutes=lb, busy_timeout_ms=bt
+        )
+        last_remaining = initial_remaining
+        _emit(
+            {
+                "type": "start",
+                "unlabeled_remaining": initial_remaining,
+                "lookback_scan": "full_table" if lb is None else "window",
+                "lookback_minutes": lb,
+            }
+        )
+        log.info(
+            "MetaMagi catch-up unlabeled rows in scan window at start: %d",
+            initial_remaining,
+        )
+
+        deadline = (
+            time.monotonic() + float(cap_sec) if cap_sec is not None else None
+        )
+        t0 = time.perf_counter()
+        batches_run = 0
+        selected_total = 0
+        updated_30s_total = 0
+        updated_5m_total = 0
+        consecutive_busy = 0
+        stop_reason = "no_rows"
+
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                stop_reason = "max_seconds"
+                log.info(
+                    "MetaMagi catch-up stopping: max_seconds=%s cap — "
+                    "omit METAMAGI_CATCHUP_MAX_SECONDS for a full drain",
+                    cap_sec,
+                )
+                break
+            if cap_batches is not None and batches_run >= cap_batches:
+                stop_reason = "max_batches"
+                log.info(
+                    "MetaMagi catch-up stopping: max_batches=%s cap — "
+                    "omit METAMAGI_CATCHUP_MAX_BATCHES for a full drain",
+                    cap_batches,
+                )
+                break
+
+            batch = label_voter_feedback_forward_roc_batch(
+                lookback_minutes=lb,
+                batch_size=bs,
+                busy_timeout_ms=bt,
+            )
+
+            if batch.get("db_busy"):
+                consecutive_busy += 1
+                log.warning(
+                    "MetaMagi catch-up SQLite busy consecutive=%d sleeping %.3fs",
+                    consecutive_busy,
+                    busy_retry_sleep,
+                )
+                if max_consecutive_busy > 0 and consecutive_busy >= max_consecutive_busy:
+                    stop_reason = "db_busy"
+                    log.error(
+                        "MetaMagi catch-up stopping: %d consecutive db_busy "
+                        "(set METAMAGI_CATCHUP_MAX_CONSECUTIVE_DB_BUSY=0 to retry "
+                        "without limit)",
+                        consecutive_busy,
+                    )
+                    break
+                _emit(
+                    {
+                        "type": "db_busy",
+                        "consecutive_busy": consecutive_busy,
+                        "unlabeled_remaining": last_remaining,
+                    }
+                )
+                time.sleep(busy_retry_sleep)
+                continue
+
+            consecutive_busy = 0
+            batches_run += 1
+            sel = int(batch.get("selected") or 0)
+            u30 = int(batch.get("updated_30s") or 0)
+            u5 = int(batch.get("updated_5m") or 0)
+            batch_ms = float(batch.get("elapsed_ms") or 0.0)
+            selected_total += sel
+            updated_30s_total += u30
+            updated_5m_total += u5
+
+            remaining = count_voter_feedback_unlabeled(
+                lookback_minutes=lb, busy_timeout_ms=bt
+            )
+            last_remaining = remaining
+            _emit(
+                {
+                    "type": "progress",
+                    "batches_run": batches_run,
+                    "unlabeled_remaining": remaining,
+                    "batch_selected": sel,
+                    "updated_forward_roc_30s": u30,
+                    "updated_forward_roc_5m": u5,
+                    "batch_elapsed_ms": round(batch_ms, 3),
+                }
+            )
+
+            cap_b_txt = str(cap_batches) if cap_batches is not None else "∞"
+            log.info(
+                "MetaMagi catch-up batch n=%s/%s selected=%d updated_30s=%d "
+                "updated_5m=%d batch_elapsed_ms=%.1f unlabeled_remaining=%d",
+                batches_run,
+                cap_b_txt,
+                sel,
+                u30,
+                u5,
+                batch_ms,
+                remaining,
+            )
+
+            if sel == 0:
+                stop_reason = "no_rows"
+                log.info(
+                    "MetaMagi catch-up stopping: no unlabeled rows in scan window "
+                    "(batch_passes=%d)",
+                    batches_run,
+                )
+                break
+            if u30 == 0 and u5 == 0:
+                stop_reason = "no_updatable_rows"
+                log.warning(
+                    "MetaMagi catch-up stopping: selected=%d rows but no ROC "
+                    "computed (missing market_ticks for oldest backlog?). batch_pass=%d",
+                    sel,
+                    batches_run,
+                )
+                break
+
+            time.sleep(max(0.0, sleep_s))
+
+        updated_cells = updated_30s_total + updated_5m_total
+        wall_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+        log.info(
+            "MetaMagi catch-up finished stopped_reason=%s batches_run=%d "
+            "selected_rows_total=%d updated_30s_total=%d updated_5m_total=%d "
+            "updated_label_cells=%d wall_ms=%.1f",
+            stop_reason,
+            batches_run,
+            selected_total,
+            updated_30s_total,
+            updated_5m_total,
+            updated_cells,
+            wall_ms,
+        )
+        return {
+            "lookback_minutes": lb,
+            "lookback_scan": "full_table" if lb is None else "window",
+            "batch_size": bs,
+            "busy_timeout_ms": bt,
+            "max_seconds_cap": cap_sec,
+            "max_batches_cap": cap_batches,
+            "batches_run": batches_run,
+            "selected_rows": selected_total,
+            "updated_forward_roc_30s": updated_30s_total,
+            "updated_forward_roc_5m": updated_5m_total,
+            "updated_label_cells": updated_cells,
+            "stopped_reason": stop_reason,
+            "elapsed_ms": wall_ms,
+            "unlabeled_remaining_at_end": last_remaining,
+        }
+    except Exception:
+        log.exception(
+            "MetaMagi catch-up aborted: unexpected error "
+            "(lookback_minutes=%r batch_size=%r max_seconds=%r)",
+            lookback_minutes,
+            batch_size,
+            max_seconds,
+        )
+        raise
+
+
+def peer_voter_weights_for_new_ensemble_bot(
+    strategy: str,
+    voters: list[str],
+) -> dict[str, float] | None:
+    """
+    Find an existing bot with the same ``strategy`` and identical voter set (order-independent),
+    preferring the one with the most ``voter_feedback`` rows. Returns that bot's ``voter_weights``
+    restricted to ``voters``, or ``None`` if no suitable peer exists.
+
+    Used when creating a new ensemble bot so static weights start from data-rich peers instead of
+    cold template defaults.
+    """
+    if not voters or not strategy.strip():
+        return None
+    target_key = tuple(sorted(str(v) for v in voters))
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT bot_id, strategy_params_json FROM bots WHERE strategy = ?",
+            (strategy,),
+        )
+        peers: dict[str, dict[str, float]] = {}
+        for row in cur.fetchall():
+            raw = row["strategy_params_json"]
+            if raw is None or not str(raw).strip():
+                continue
+            try:
+                pj = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(pj, dict):
+                continue
+            vv = pj.get("voters")
+            if not isinstance(vv, list) or not vv:
+                continue
+            if not all(isinstance(x, str) for x in vv):
+                continue
+            if tuple(sorted(vv)) != target_key:
+                continue
+            vw = pj.get("voter_weights")
+            if not isinstance(vw, dict) or not vw:
+                continue
+            cleaned: dict[str, float] = {}
+            for k, val in vw.items():
+                if not isinstance(k, str):
+                    continue
+                fv = _f(val)
+                if fv is None:
+                    continue
+                cleaned[k] = fv
+            if not cleaned:
+                continue
+            peers[str(row["bot_id"])] = cleaned
+        if not peers:
+            return None
+        ids = tuple(peers.keys())
+        placeholders = ",".join("?" * len(ids))
+        cur.execute(
+            f"""
+            SELECT b.bot_id, COUNT(*) AS fc
+            FROM bots b
+            LEFT JOIN voter_feedback vf ON vf.bot_id = b.bot_id
+            WHERE b.bot_id IN ({placeholders})
+            GROUP BY b.bot_id
+            ORDER BY fc DESC, b.created_at ASC
+            LIMIT 1
+            """,
+            ids,
+        )
+        winner = cur.fetchone()
+        if winner is None:
+            return None
+        best_id = str(winner["bot_id"])
+        src = peers.get(best_id)
+        if not src:
+            return None
+        out: dict[str, float] = {}
+        for v in voters:
+            vs = str(v)
+            if vs in src:
+                out[vs] = round(src[vs], 4)
+        return out or None
+    finally:
+        conn.close()
 
 
 def create_bot(
