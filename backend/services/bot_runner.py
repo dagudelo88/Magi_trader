@@ -824,6 +824,26 @@ def _ceil_amount_to_min_notional(
     return round(math.ceil(round(min_qty / step, 9)) * step, precision)
 
 
+def _expand_sell_amount_to_avoid_dust(
+    sell_amt: float,
+    available: float,
+    min_notional: float,
+    last_close: float,
+) -> tuple[float, bool]:
+    """Sell the full position when a partial sell would leave unsellable dust."""
+    if sell_amt <= 0 or available <= 0:
+        return sell_amt, False
+    sell_amt = min(sell_amt, available)
+    if min_notional <= 0 or last_close <= 0:
+        return sell_amt, False
+    remaining = max(0.0, available - sell_amt)
+    if remaining <= 1e-12:
+        return sell_amt, False
+    if remaining * last_close < min_notional:
+        return available, True
+    return sell_amt, False
+
+
 def _process_bot(
     ex,
     bot: dict[str, Any],
@@ -1229,10 +1249,25 @@ def _process_bot(
                 _close_decision()
                 return
             # Cap by what the exchange actually holds (safety net)
-            sell_amt = min(open_base * base_fraction, free_base)
+            available_base = min(open_base, free_base)
+            sell_amt = available_base * base_fraction
         else:
             # No budget configured — use exchange wallet as fallback
-            sell_amt = free_base * base_fraction
+            available_base = free_base
+            sell_amt = available_base * base_fraction
+
+        dust_remaining_notional = max(0.0, available_base - sell_amt) * last_close
+        sell_amt, expanded_to_full_position = _expand_sell_amount_to_avoid_dust(
+            sell_amt,
+            available_base,
+            min_cost,
+            last_close,
+        )
+        if expanded_to_full_position:
+            _log(bot_id, "info", execution_mode,
+                 f"SELL: fractional exit would leave dust below {min_cost} {quote_cur}"
+                 f" (remaining ~{dust_remaining_notional:.4f} {quote_cur})"
+                 f" — selling full available position")
 
         # Minimum base-amount check
         if min_amt and sell_amt < min_amt:
@@ -1249,18 +1284,38 @@ def _process_bot(
             if notional < min_cost:
                 # Bump sell_amt up to exactly the minimum notional, capped by position.
                 min_sell_amt = min_cost / last_close
-                available = open_base if initial_budget > 0 else free_base
+                available = available_base
                 if min_sell_amt <= available:
                     _log(bot_id, "info", execution_mode,
                          f"SELL: fractional notional {notional:.4f} {quote_cur} < min {min_cost}"
                          f" — bumping to minimum ({min_sell_amt:.8f} {base_cur})")
                     sell_amt = min_sell_amt
+                    dust_remaining_notional = max(0.0, available - sell_amt) * last_close
+                    sell_amt, expanded_after_bump = _expand_sell_amount_to_avoid_dust(
+                        sell_amt,
+                        available,
+                        min_cost,
+                        last_close,
+                    )
+                    if expanded_after_bump and not expanded_to_full_position:
+                        _log(bot_id, "info", execution_mode,
+                             f"SELL: minimum-size exit would leave dust below "
+                             f"{min_cost} {quote_cur}"
+                             f" (remaining ~{dust_remaining_notional:.4f} {quote_cur})"
+                             f" — selling full available position")
+                        expanded_to_full_position = True
                 else:
-                    # Entire position is below minimum — nothing we can do.
+                    # Existing dust cannot clear Binance's notional filter; avoid
+                    # warning every cycle while preserving occasional visibility.
                     full_notional = available * last_close
-                    _log(bot_id, "warn", execution_mode,
-                         f"SELL skipped — full position notional {full_notional:.4f} {quote_cur}"
-                         f" below exchange minimum {min_cost} {quote_cur}")
+                    _log_info_throttled(
+                        bot_id,
+                        execution_mode,
+                        f"sell_dust_below_min:{symbol}",
+                        f"SELL dust ignored — full position notional "
+                        f"{full_notional:.4f} {quote_cur} below exchange minimum "
+                        f"{min_cost} {quote_cur}",
+                    )
                     _close_decision()
                     return
 
@@ -1271,6 +1326,24 @@ def _process_bot(
             _close_decision()
             return
 
+        rounded_dust_notional = max(0.0, available_base - float(sell_prec)) * last_close
+        if (
+            min_cost > 0
+            and last_close > 0
+            and 0 < rounded_dust_notional < min_cost
+            and not expanded_to_full_position
+        ):
+            full_sell_prec = data_ex.amount_to_precision(symbol, available_base)
+            if float(full_sell_prec) > float(sell_prec):
+                full_notional = float(full_sell_prec) * last_close
+                if full_notional >= min_cost:
+                    sell_prec = full_sell_prec
+                    _log(bot_id, "info", execution_mode,
+                         f"SELL: rounded exit would leave dust below {min_cost} {quote_cur}"
+                         f" (remaining ~{rounded_dust_notional:.4f} {quote_cur})"
+                         f" — selling full available position")
+                    expanded_to_full_position = True
+
         # Final notional guard after precision rounding.
         # amount_to_precision truncates (rounds down), so the bumped amount can land
         # on a step that is still below min_cost.  Mirror the BUY-side fix: use
@@ -1278,7 +1351,7 @@ def _process_bot(
         # >= the minimum notional requirement.
         final_notional = float(sell_prec) * last_close
         if min_cost > 0 and final_notional < min_cost:
-            available = (open_base if initial_budget > 0 else free_base)
+            available = available_base
             ceiled = False
             ceiled_qty = _ceil_amount_to_min_notional(market, min_cost, last_close)
             if ceiled_qty is not None:
