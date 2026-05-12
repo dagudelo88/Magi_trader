@@ -162,6 +162,7 @@ const COMMON_STRATEGY_FIELDS = [
   'target_asset',
   'lag_lookback_sec',
 ];
+const SELL_PROTECTION_KEYS = new Set(['min_profit_pct', 'fee_pct']);
 const ENSEMBLE_STRATEGY_KEYS = new Set(['voters', 'voter_weights', 'consensus_mode', 'consensus_threshold']);
 const RISK_TOGGLES: Array<{ key: RiskBooleanKey; label: string }> = [
   { key: 'enable_daily_loss_limit', label: 'Daily loss limit' },
@@ -873,14 +874,32 @@ export default function BotDetail() {
     });
   }, []);
 
+  const updateStrategyDraftMany = useCallback((updates: StrategyDraft) => {
+    setConfigStrategyDraft((current) => {
+      const next = { ...current, ...updates };
+      setConfigStrategyJsonDraft(prettyStrategyParams(next));
+      return next;
+    });
+  }, []);
+
   const editableStrategyKeys = useMemo(() => {
     const primitiveKeys = Object.entries(configStrategyDraft)
-      .filter(([key, value]) => !ENSEMBLE_STRATEGY_KEYS.has(key) && value !== null && typeof value !== 'object')
+      .filter(
+        ([key, value]) =>
+          !ENSEMBLE_STRATEGY_KEYS.has(key) &&
+          !SELL_PROTECTION_KEYS.has(key) &&
+          value !== null &&
+          typeof value !== 'object',
+      )
       .map(([key]) => key);
     const ordered = COMMON_STRATEGY_FIELDS.filter((key) => primitiveKeys.includes(key));
     const rest = primitiveKeys.filter((key) => key !== 'initial_budget_quote' && !ordered.includes(key)).sort();
     return [...ordered, ...rest];
   }, [configStrategyDraft]);
+
+  const sellProtectionMinProfit = Number(configStrategyDraft.min_profit_pct);
+  const sellProtectionFee = Number(configStrategyDraft.fee_pct);
+  const sellProtectionEnabled = Number.isFinite(sellProtectionMinProfit) && sellProtectionMinProfit > 0;
 
   const configEnsembleParams = useMemo<EnsembleParams | null>(() => {
     if (!isEnsemble) return null;
@@ -1183,6 +1202,10 @@ export default function BotDetail() {
       const strategyPayload: StrategyDraft = {
         ...configStrategyDraft,
         initial_budget_quote: budget,
+        min_profit_pct: sellProtectionEnabled
+          ? (Number.isFinite(sellProtectionMinProfit) ? sellProtectionMinProfit : 0.42)
+          : 0,
+        fee_pct: Number.isFinite(sellProtectionFee) ? sellProtectionFee : 0.08,
       };
       const strategyRes = await fetch(`${API_BASE}/api/bots/${id}/strategy-params`, {
         method: 'PATCH',
@@ -2194,6 +2217,63 @@ export default function BotDetail() {
                       className={configInputClass}
                     />
                   </label>
+
+                  <div className="rounded-lg border border-magi-grid/25 bg-black/20 px-3 py-3">
+                    <label
+                      className={`flex cursor-pointer items-center justify-between gap-3 rounded border px-3 py-2 text-[10px] font-bold uppercase tracking-wider transition-colors ${
+                        sellProtectionEnabled
+                          ? 'border-magi-primary/35 bg-magi-primary/10 text-magi-primary'
+                          : 'border-magi-grid/25 bg-magi-grid/5 text-magi-muted/60'
+                      }`}
+                    >
+                      <span>Enable Sell Protection (Never sell at a loss)</span>
+                      <input
+                        type="checkbox"
+                        checked={sellProtectionEnabled}
+                        onChange={(e) =>
+                          updateStrategyDraftMany(
+                            e.currentTarget.checked
+                              ? {
+                                  min_profit_pct: Number.isFinite(sellProtectionMinProfit)
+                                    && sellProtectionMinProfit > 0
+                                    ? sellProtectionMinProfit
+                                    : 0.42,
+                                  fee_pct: Number.isFinite(sellProtectionFee) ? sellProtectionFee : 0.08,
+                                }
+                              : { min_profit_pct: 0, fee_pct: Number.isFinite(sellProtectionFee) ? sellProtectionFee : 0.08 },
+                          )
+                        }
+                        className="h-4 w-4 accent-magi-primary"
+                      />
+                    </label>
+
+                    {sellProtectionEnabled && (
+                      <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        <label className={configLabelClass}>
+                          Minimum Profit %
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={Number.isFinite(sellProtectionMinProfit) ? sellProtectionMinProfit : 0.42}
+                            onChange={(e) => updateStrategyDraft('min_profit_pct', Number(e.currentTarget.value))}
+                            className={configInputClass}
+                          />
+                        </label>
+                        <label className={configLabelClass}>
+                          Fee %
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            value={Number.isFinite(sellProtectionFee) ? sellProtectionFee : 0.08}
+                            onChange={(e) => updateStrategyDraft('fee_pct', Number(e.currentTarget.value))}
+                            className={configInputClass}
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </div>
 
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                     {editableStrategyKeys.length === 0 ? (

@@ -1274,14 +1274,35 @@ def _process_bot(
     elif result.signal == "sell":
         base_fraction = float(params["base_fraction"])
         initial_budget = float(params.get("initial_budget_quote") or 0)
+        cached_position = (
+            position_cache.get((bot_id, symbol, execution_mode))
+            if position_cache is not None
+            else None
+        )
+        if cached_position is None:
+            cached_position = _get_cached_bot_position(bot_id, symbol, execution_mode)
+        open_base_position, open_cost_basis_quote = cached_position
+
+        # ============================================================
+        # SELL PROTECTION (activated by checkbox in frontend)
+        # ============================================================
+        min_profit_pct = float(params.get("min_profit_pct", 0.0))
+        fee_pct = float(params.get("fee_pct", 0.10))
+
+        if open_base_position > 1e-12 and last_close > 0 and min_profit_pct > 0:
+            avg_entry_price = open_cost_basis_quote / open_base_position
+            required_sell_price = avg_entry_price * (1 + min_profit_pct / 100.0 + fee_pct / 100.0)
+
+            if last_close < required_sell_price:
+                _log(bot_id, "info", execution_mode,
+                     f"[SELL PROTECTION] SELL ignored — price {last_close:.4f} < required {required_sell_price:.4f} "
+                     f"(entry {avg_entry_price:.4f} + {min_profit_pct}% + {fee_pct}% fee) → HOLD")
+                _close_decision()
+                return
 
         if initial_budget > 0:
             # Sell only the base position this bot acquired with its own budget
-            open_base, _ = (
-                position_cache.get((bot_id, symbol, execution_mode))
-                if position_cache is not None and (bot_id, symbol, execution_mode) in position_cache
-                else _get_cached_bot_position(bot_id, symbol, execution_mode)
-            )
+            open_base = open_base_position
             if open_base <= 1e-12:
                 _log(bot_id, "info", execution_mode,
                      "SELL skipped — no open position in this bot's budget")
