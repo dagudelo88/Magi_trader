@@ -7,6 +7,7 @@ import {
   type StrategyHealth,
   type ExecutionMode,
   type BotSignal,
+  type BotRow,
 } from '../stores/realtimeStore';
 
 function formatUptime(startedAtSec: number | null, status: string): string {
@@ -208,6 +209,33 @@ function BotAllocationCell({
   );
 }
 
+interface BotSegmentStats {
+  count: number;
+  totalPnl: number;
+  totalBudget: number;
+  totalTrades: number;
+  avgWR: number | null;
+  botsWithTradesCount: number;
+}
+
+function botSegmentStats(botsSlice: BotRow[]): BotSegmentStats {
+  const count = botsSlice.length;
+  const totalPnl = botsSlice.reduce((s, b) => s + (b.realized_pnl_quote ?? 0), 0);
+  const totalBudget = botsSlice.reduce((s, b) => s + (b.initial_budget_quote ?? 0), 0);
+  const totalTrades = botsSlice.reduce((s, b) => s + (b.closed_trades ?? 0), 0);
+  const withWR = botsSlice.filter((b) => b.win_rate_pct != null && (b.closed_trades ?? 0) > 0);
+  const avgWR =
+    withWR.length > 0 ? withWR.reduce((s, b) => s + (b.win_rate_pct ?? 0), 0) / withWR.length : null;
+  return {
+    count,
+    totalPnl,
+    totalBudget,
+    totalTrades,
+    avgWR,
+    botsWithTradesCount: withWR.length,
+  };
+}
+
 export default function Dashboard() {
   const navigate = useNavigate();
   const tickers = useRealtimeStore((state) => state.marketTickers);
@@ -290,17 +318,14 @@ export default function Dashboard() {
   const viewLabel = walletView === 'live' ? 'Mainnet' : 'Testnet';
 
   // Bot aggregates
-  const runningBots   = bots.filter((b) => b.status === 'running');
-  const liveBots      = runningBots.filter((b) => b.execution_mode === 'live').length;
-  const simBots       = runningBots.filter((b) => b.execution_mode !== 'live').length;
-  const totalPnl      = bots.reduce((s, b) => s + (b.realized_pnl_quote ?? 0), 0);
-  const totalBudget   = bots.reduce((s, b) => s + (b.initial_budget_quote ?? 0), 0);
-  const totalTrades   = bots.reduce((s, b) => s + (b.closed_trades ?? 0), 0);
-  const botsWithWR    = bots.filter((b) => b.win_rate_pct != null && (b.closed_trades ?? 0) > 0);
-  const avgWR         = botsWithWR.length > 0
-    ? botsWithWR.reduce((s, b) => s + (b.win_rate_pct ?? 0), 0) / botsWithWR.length
-    : null;
-  const pnlPositive   = totalPnl >= 0;
+  const runningBots = bots.filter((b) => b.status === 'running');
+  const liveBots = runningBots.filter((b) => b.execution_mode === 'live').length;
+  const simBots = runningBots.filter((b) => b.execution_mode !== 'live').length;
+
+  const liveBotRows = bots.filter((b) => b.execution_mode === 'live');
+  const testnetBotRows = bots.filter((b) => b.execution_mode !== 'live');
+  const statsLive = botSegmentStats(liveBotRows);
+  const statsTestnet = botSegmentStats(testnetBotRows);
 
   return (
     <main className="flex-1 overflow-y-auto p-6 bg-background text-white">
@@ -334,28 +359,98 @@ export default function Dashboard() {
             </p>
           </div>
 
-          {/* Realized P&L across all bots */}
+          {/* Realized P&L — mainnet vs testnet (side by side) */}
           <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Bot Realized P&L</h3>
-            <div className={`text-2xl font-mono font-bold ${pnlPositive ? 'text-green-400' : 'text-red-400'}`}>
-              {bots.length === 0
-                ? '---'
-                : `${pnlPositive ? '+' : ''}${totalPnl.toFixed(4)} USDT`}
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">
+              Bot Realized P&L
+            </h3>
+            <div className="grid grid-cols-2 gap-4 border-t border-border/40 pt-3">
+              <div className="min-w-0 border-r border-border/50 pr-3 flex flex-col gap-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-red-400">
+                  Mainnet
+                </span>
+                {statsLive.count === 0 ? (
+                  <span className="text-sm font-mono text-gray-500">—</span>
+                ) : (
+                  <span
+                    className={`text-lg font-mono font-bold tabular-nums truncate ${
+                      statsLive.totalPnl >= 0 ? 'text-green-400' : 'text-red-400'
+                    }`}
+                  >
+                    {statsLive.totalPnl >= 0 ? '+' : ''}
+                    {statsLive.totalPnl.toFixed(4)} USDT
+                  </span>
+                )}
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  {statsLive.count === 0
+                    ? 'No live bots'
+                    : `${statsLive.totalTrades} closed trades · initial capital ${statsLive.totalBudget.toLocaleString()} USDT`}
+                </p>
+              </div>
+              <div className="min-w-0 flex flex-col gap-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400">
+                  Testnet
+                </span>
+                {statsTestnet.count === 0 ? (
+                  <span className="text-sm font-mono text-gray-500">—</span>
+                ) : (
+                  <span
+                    className={`text-lg font-mono font-bold tabular-nums truncate ${
+                      statsTestnet.totalPnl >= 0 ? 'text-green-400' : 'text-red-400'
+                    }`}
+                  >
+                    {statsTestnet.totalPnl >= 0 ? '+' : ''}
+                    {statsTestnet.totalPnl.toFixed(4)} USDT
+                  </span>
+                )}
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  {statsTestnet.count === 0
+                    ? 'No testnet bots'
+                    : `${statsTestnet.totalTrades} closed trades · initial capital ${statsTestnet.totalBudget.toLocaleString()} USDT`}
+                </p>
+              </div>
             </div>
-            <p className="text-xs mt-1 text-gray-500">
-              {totalTrades} closed trades · initial capital {totalBudget.toLocaleString()} USDT
-            </p>
           </div>
 
-          {/* Win rate */}
+          {/* Win rate — mainnet vs testnet (side by side) */}
           <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Avg Win Rate</h3>
-            <div className="text-2xl font-mono font-bold">
-              {avgWR != null ? `${avgWR.toFixed(1)}%` : '—'}
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">Avg Win Rate</h3>
+            <div className="grid grid-cols-2 gap-4 border-t border-border/40 pt-3">
+              <div className="min-w-0 border-r border-border/50 pr-3 flex flex-col gap-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-red-400">
+                  Mainnet
+                </span>
+                <span className="text-lg font-mono font-bold tabular-nums">
+                  {statsLive.count === 0
+                    ? '—'
+                    : statsLive.avgWR != null
+                      ? `${statsLive.avgWR.toFixed(1)}%`
+                      : '—'}
+                </span>
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  {statsLive.count === 0
+                    ? 'No live bots'
+                    : `across ${statsLive.botsWithTradesCount} bot${statsLive.botsWithTradesCount !== 1 ? 's' : ''} with trades`}
+                </p>
+              </div>
+              <div className="min-w-0 flex flex-col gap-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400">
+                  Testnet
+                </span>
+                <span className="text-lg font-mono font-bold tabular-nums">
+                  {statsTestnet.count === 0
+                    ? '—'
+                    : statsTestnet.avgWR != null
+                      ? `${statsTestnet.avgWR.toFixed(1)}%`
+                      : '—'}
+                </span>
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  {statsTestnet.count === 0
+                    ? 'No testnet bots'
+                    : `across ${statsTestnet.botsWithTradesCount} bot${statsTestnet.botsWithTradesCount !== 1 ? 's' : ''} with trades`}
+                </p>
+              </div>
             </div>
-            <p className="text-xs mt-1 text-gray-500">
-              across {botsWithWR.length} bot{botsWithWR.length !== 1 ? 's' : ''} with trades
-            </p>
           </div>
         </div>
 

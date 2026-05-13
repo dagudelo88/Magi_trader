@@ -53,6 +53,7 @@ export function TopNav() {
   const latencyMs = useRealtimeStore((state) => state.lastApiLatencyMs);
   const apiOk = useRealtimeStore((state) => state.apiOk);
   const botsStatus = useRealtimeStore((state) => state.channelStatuses['/ws/bots']);
+  const marketStatus = useRealtimeStore((state) => state.channelStatuses['/ws/market']);
 
   const isActive = (path: string) => {
     if (path === '/bots') {
@@ -64,6 +65,7 @@ export function TopNav() {
   const lat = latencyTone(latencyMs);
   const api = apiTone(apiOk);
   const ws = wsTone(botsStatus);
+  const marketWs = wsTone(marketStatus);
 
   return (
     <header
@@ -79,14 +81,31 @@ export function TopNav() {
         </Link>
         <div className="ml-4 hidden gap-4 md:flex">
           <span
-            className={`font-label px-2 py-1 text-[10px] font-bold uppercase tracking-tighter ${TONE_TEXT[lat]}`}
+            className={`font-label inline-flex items-center gap-1.5 px-2 py-1 text-[10px] font-bold uppercase tracking-tighter ${TONE_TEXT[marketWs]}`}
             title={
-              latencyMs == null
-                ? 'Waiting for latency sample'
-                : `API latency ${latencyMs} ms (green ≤${LATENCY_GOOD_MS}, amber ≤${LATENCY_WARN_MS})`
+              marketStatus === 'closed'
+                ? 'Market ticker WebSocket closed'
+                : marketStatus === 'open'
+                  ? 'Live market feed connected (tracked pairs / Binance stream)'
+                  : marketStatus === undefined
+                    ? 'Market feed status unknown'
+                    : 'Connecting market feed or using fallback polling'
             }
           >
-            LATENCY: {latencyMs != null ? `${latencyMs}MS` : '—'}
+            {marketStatus === 'open' ? (
+              <span className="relative flex h-3 w-3 shrink-0">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                <span className="relative inline-flex h-3 w-3 rounded-full bg-green-500" />
+              </span>
+            ) : (
+              <span
+                className={`h-3 w-3 shrink-0 rounded-full ${
+                  marketStatus === 'closed' ? 'bg-red-500' : 'bg-gray-600'
+                }`}
+                aria-hidden
+              />
+            )}
+            MARKET FEED
           </span>
           <span
             className={`font-label border-b-2 px-2 py-1 pb-1 text-[10px] font-bold uppercase tracking-tighter ${TONE_API[api]}`}
@@ -105,6 +124,16 @@ export function TopNav() {
             }
           >
             WebSocket: {botsStatus?.toUpperCase() ?? '—'}
+          </span>
+          <span
+            className={`font-label px-2 py-1 text-[10px] font-bold uppercase tracking-tighter ${TONE_TEXT[lat]}`}
+            title={
+              latencyMs == null
+                ? 'Waiting for latency sample'
+                : `API latency ${latencyMs} ms (green ≤${LATENCY_GOOD_MS}, amber ≤${LATENCY_WARN_MS})`
+            }
+          >
+            LATENCY: {latencyMs != null ? `${latencyMs}MS` : '—'}
           </span>
         </div>
       </div>
