@@ -175,6 +175,13 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "magitrader.db")
 # return it to the pool via close().
 
 DB_POOL_SIZE: int = int(os.environ.get("DB_POOL_SIZE", "10"))
+DB_POOL_BUSY_TIMEOUT_MS: int = int(os.environ.get("DB_POOL_BUSY_TIMEOUT_MS", "15000"))
+SQLITE_WRITE_RETRY_ATTEMPTS: int = int(
+    os.environ.get("SQLITE_WRITE_RETRY_ATTEMPTS", "4")
+)
+SQLITE_WRITE_RETRY_BACKOFF_MS: int = int(
+    os.environ.get("SQLITE_WRITE_RETRY_BACKOFF_MS", "50")
+)
 
 _pool_logger = __import__("logging").getLogger("db_pool")
 
@@ -242,11 +249,17 @@ class _ConnectionPool:
 
     def _make_conn(self) -> sqlite3.Connection:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+        busy_timeout_ms = max(1, int(DB_POOL_BUSY_TIMEOUT_MS))
+        conn = sqlite3.connect(
+            DB_PATH,
+            timeout=max(0.001, busy_timeout_ms / 1000.0),
+            check_same_thread=False,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=10000")
         conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
         with self._lock:
             self._created += 1
             n = self._created
@@ -326,6 +339,34 @@ def _report_db_timing(label: str, duration_ms: float) -> None:
         monitor.record_db_op(label, duration_ms)
     except Exception:
         pass
+
+
+def _is_sqlite_busy_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _retry_sqlite_write(label: str, operation: Callable[[], Any]) -> Any:
+    """Retry short SQLite writer-lock collisions without hiding real DB errors."""
+    attempts = max(1, int(SQLITE_WRITE_RETRY_ATTEMPTS))
+    base_sleep = max(0, int(SQLITE_WRITE_RETRY_BACKOFF_MS)) / 1000.0
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except sqlite3.OperationalError as exc:
+            if not _is_sqlite_busy_error(exc) or attempt >= attempts - 1:
+                raise
+            sleep_sec = base_sleep * (2**attempt)
+            _pool_logger.warning(
+                "SQLite writer busy during %s; retry %d/%d in %.0fms",
+                label,
+                attempt + 1,
+                attempts - 1,
+                sleep_sec * 1000,
+            )
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
+    return None
 
 
 def get_db_connection() -> _PooledConnection:
@@ -884,40 +925,50 @@ def record_bot_order(bot_id: str, execution_mode: str, order: dict[str, Any]) ->
     st = order.get("status")
     st_str = str(st).strip() if st is not None else ""
 
-    conn = get_db_connection()
+    def _insert_order() -> None:
+        conn = get_db_connection()
+        try:
+            conn.execute(
+                """
+                INSERT INTO bot_orders (
+                    bot_id, execution_mode, exchange_order_id, symbol, side, order_type,
+                    amount, cost, average, filled, status, raw_response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    bot_id,
+                    execution_mode,
+                    str(oid) if oid is not None else None,
+                    str(order.get("symbol") or ""),
+                    str(order.get("side") or "").lower(),
+                    str(order.get("type") or ""),
+                    order.get("amount"),
+                    order.get("cost"),
+                    avg,
+                    order.get("filled"),
+                    st_str if st_str else None,
+                    raw,
+                    now,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     try:
-        conn.execute(
-            """
-            INSERT INTO bot_orders (
-                bot_id, execution_mode, exchange_order_id, symbol, side, order_type,
-                amount, cost, average, filled, status, raw_response_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                bot_id,
-                execution_mode,
-                str(oid) if oid is not None else None,
-                str(order.get("symbol") or ""),
-                str(order.get("side") or "").lower(),
-                str(order.get("type") or ""),
-                order.get("amount"),
-                order.get("cost"),
-                avg,
-                order.get("filled"),
-                st_str if st_str else None,
-                raw,
-                now,
-            ),
-        )
-        conn.commit()
+        _retry_sqlite_write(f"record_bot_order({bot_id})", _insert_order)
     except Exception:
         # Order may already be live on the exchange; do not fail the runner.
         print(
             f"[record_bot_order] FAILED bot_id={bot_id!r}: {traceback.format_exc()}",
             file=sys.stderr,
         )
-    finally:
-        conn.close()
 
 
 def upsert_ohlcv_candles(
@@ -1447,49 +1498,64 @@ def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
 
     now_ms = int(time.time() * 1000)
     t0 = time.perf_counter()
-    conn = get_db_connection()
+
+    def _insert_decisions() -> None:
+        conn = get_db_connection()
+        try:
+            cur = conn.cursor()
+
+            # Resolve the latest tick_id for each unique symbol in one connection.
+            unique_symbols = {d["symbol"] for d in decisions}
+            tick_map: dict[str, int | None] = {}
+            for sym in unique_symbols:
+                cur.execute(
+                    "SELECT tick_id FROM market_ticks "
+                    "WHERE target_asset = ? ORDER BY timestamp DESC LIMIT 1",
+                    (sym,),
+                )
+                row = cur.fetchone()
+                tick_map[sym] = int(row["tick_id"]) if row else None
+
+            rows = [
+                (
+                    d["bot_id"],
+                    tick_map.get(d["symbol"]),
+                    d["mode"],
+                    d["action"].upper(),
+                    d.get("confidence"),
+                    int(d["executed"]),
+                    now_ms,
+                )
+                for d in decisions
+            ]
+            cur.executemany(
+                """
+                INSERT INTO bot_decisions
+                  (bot_id, tick_id, mode, action, confidence, executed, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     try:
-        cur = conn.cursor()
-
-        # Resolve the latest tick_id for each unique symbol in a single connection.
-        unique_symbols = {d["symbol"] for d in decisions}
-        tick_map: dict[str, int | None] = {}
-        for sym in unique_symbols:
-            cur.execute(
-                "SELECT tick_id FROM market_ticks "
-                "WHERE target_asset = ? ORDER BY timestamp DESC LIMIT 1",
-                (sym,),
-            )
-            row = cur.fetchone()
-            tick_map[sym] = int(row["tick_id"]) if row else None
-
-        rows = [
-            (
-                d["bot_id"],
-                tick_map.get(d["symbol"]),
-                d["mode"],
-                d["action"].upper(),
-                d.get("confidence"),
-                int(d["executed"]),
-                now_ms,
-            )
-            for d in decisions
-        ]
-        cur.executemany(
-            """
-            INSERT INTO bot_decisions
-              (bot_id, tick_id, mode, action, confidence, executed, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
+        _retry_sqlite_write(
+            f"batch_record_bot_decisions({len(decisions)})",
+            _insert_decisions,
         )
-        conn.commit()
     finally:
-        conn.close()
-    _report_db_timing(
-        f"batch_record_bot_decisions({len(decisions)})",
-        (time.perf_counter() - t0) * 1000,
-    )
+        _report_db_timing(
+            f"batch_record_bot_decisions({len(decisions)})",
+            (time.perf_counter() - t0) * 1000,
+        )
 
 
 def fetch_latest_bot_decisions_by_bot_and_mode() -> dict[tuple[str, str], dict[str, Any]]:

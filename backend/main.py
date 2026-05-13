@@ -847,14 +847,15 @@ async def lifespan(_app: FastAPI):
         conn.close()
     bot_task = asyncio.create_task(_bot_runner_async(), name="bot_runner")
     collector_task = asyncio.create_task(_data_collector_async(), name="data_collector")
-    meta_task = asyncio.create_task(_meta_training_loop(), name="meta_training_loop")
+    _lifespan_logger.info(
+        "MetaMagi background labeling disabled; use manual catchup endpoint."
+    )
     cleanup_task = asyncio.create_task(_db_cleanup_loop(), name="db_cleanup_loop")
     watchdog_task = asyncio.create_task(_watchdog_loop(), name="watchdog_loop")
     lag_task = asyncio.create_task(_event_loop_lag_monitor(), name="event_loop_lag")
     for task, name in (
         (bot_task, "bot_runner"),
         (collector_task, "data_collector"),
-        (meta_task, "meta_training_loop"),
         (cleanup_task, "db_cleanup_loop"),
         (watchdog_task, "watchdog_loop"),
         (lag_task, "event_loop_lag"),
@@ -866,7 +867,6 @@ async def lifespan(_app: FastAPI):
         for t in (
             bot_task,
             collector_task,
-            meta_task,
             cleanup_task,
             watchdog_task,
             lag_task,
