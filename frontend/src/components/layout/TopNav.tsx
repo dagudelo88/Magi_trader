@@ -4,8 +4,8 @@ import { useRealtimeStore } from '../../stores/realtimeStore';
 
 const NAV = [
   { to: '/', label: 'OVERVIEW' },
-  { to: '/bots', label: 'TACTICAL' },
-  { to: '/performance', label: 'HISTORY' },
+  { to: '/bots', label: 'BOTS' },
+  { to: '/performance', label: 'ANALYTICS' },
   { to: '/database', label: 'DATA' },
   { to: '/settings', label: 'CONFIG' },
 ] as const;
