@@ -11,7 +11,7 @@ import {
   type DrawdownAction,
   type RiskSettings,
 } from '../riskSettings';
-import { botLogIdentity, useRealtimeStore, type ExecutionMode } from '../stores/realtimeStore';
+import { botLogIdentity, useRealtimeStore, type ExecutionMode, type Ticker } from '../stores/realtimeStore';
 
 /** Pixels from bottom to consider the user "at" the latest log line. */
 const LOG_BOTTOM_THRESHOLD_PX = 72;
@@ -637,6 +637,65 @@ function PortfolioDistribution({
   );
 }
 
+function SpotPriceRow({
+  quoteCurrency,
+  spotTicker,
+  markPrice,
+}: {
+  quoteCurrency: string;
+  spotTicker: Ticker | undefined;
+  markPrice: number | null;
+}) {
+  const pctRaw = spotTicker ? Number(spotTicker.changePercent) : NaN;
+  const pctOk = Number.isFinite(pctRaw);
+  return (
+    <div
+      className="flex flex-wrap items-baseline gap-x-3 gap-y-0.5 rounded border border-magi-grid/20 bg-magi-bg/40 px-2.5 py-1.5"
+      title="Spot from the mainnet market WebSocket when this pair is in the tracked list; otherwise the exchange mark price used for unrealized P&L."
+    >
+      <span className="font-label text-[9px] uppercase tracking-widest text-magi-muted/55 shrink-0">
+        Current price
+      </span>
+      {spotTicker ? (
+        <>
+          <span className="font-mono text-[15px] font-bold tabular-nums text-magi-on-bg leading-none">
+            {Number.parseFloat(spotTicker.price).toLocaleString(undefined, {
+              minimumFractionDigits: 2,
+              maximumFractionDigits: 8,
+            })}
+          </span>
+          <span className="font-label text-[10px] text-magi-muted/60">{quoteCurrency}</span>
+          {pctOk ? (
+            <span
+              className={`font-mono text-[11px] font-bold tabular-nums ${
+                pctRaw >= 0 ? 'text-magi-tertiary' : 'text-red-400'
+              }`}
+            >
+              {pctRaw >= 0 ? '+' : ''}
+              {pctRaw.toFixed(2)}%
+            </span>
+          ) : null}
+          <span className="font-label text-[8px] uppercase tracking-wider text-magi-muted/35">
+            live feed
+          </span>
+        </>
+      ) : markPrice != null && Number.isFinite(markPrice) ? (
+        <>
+          <span className="font-mono text-[15px] font-bold tabular-nums text-magi-on-bg leading-none">
+            {formatExecPrice(markPrice)}
+          </span>
+          <span className="font-label text-[10px] text-magi-muted/60">{quoteCurrency}</span>
+          <span className="font-label text-[8px] uppercase tracking-wider text-magi-muted/40">
+            mark · API
+          </span>
+        </>
+      ) : (
+        <span className="font-mono text-xs text-magi-muted/45">—</span>
+      )}
+    </div>
+  );
+}
+
 export default function BotDetail() {
   const { id } = useParams();
   const detail = useRealtimeStore((state) => (id ? state.botDetailsById[id] : undefined));
@@ -646,7 +705,13 @@ export default function BotDetail() {
   const loadVoterSignals = useRealtimeStore((state) => state.loadVoterSignals);
   const handleBotDetailMessage = useRealtimeStore((state) => state.handleBotDetailMessage);
   const setChannelStatus = useRealtimeStore((state) => state.setChannelStatus);
+  const marketTickers = useRealtimeStore((state) => state.marketTickers);
   const bot = detail?.bot ?? null;
+  const spotTickerKey = useMemo(
+    () => (bot?.symbol ? bot.symbol.replace('/', '').toUpperCase() : ''),
+    [bot?.symbol],
+  );
+  const spotTicker = spotTickerKey ? marketTickers[spotTickerKey] : undefined;
   const logs = detail?.logs ?? EMPTY_LOGS;
   const orderStats = detail?.orderStats ?? null;
   const orders = detail?.orders ?? [];
@@ -1376,6 +1441,11 @@ export default function BotDetail() {
                 {(bot?.status ?? '—').toUpperCase()}
               </p>
             </div>
+            <SpotPriceRow
+              quoteCurrency={qc}
+              spotTicker={spotTicker}
+              markPrice={effectiveStrategyHealth?.mark_price ?? null}
+            />
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"

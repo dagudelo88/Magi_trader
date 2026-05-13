@@ -3,7 +3,7 @@ import { ShieldAlert, Terminal } from 'lucide-react';
 import { useRealtimeStore } from '../../stores/realtimeStore';
 
 const NAV = [
-  { to: '/', label: 'OVERVIEW' },
+  { to: '/', label: 'DASHBOARD' },
   { to: '/bots', label: 'BOTS' },
   { to: '/performance', label: 'ANALYTICS' },
   { to: '/database', label: 'DATA' },
