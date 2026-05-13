@@ -75,6 +75,16 @@ export const BOT_TEMPLATES: BotTemplate[] = [
       'Three high-reliability lag voters on 15-minute bars. Equivalent to 2/3 majority but resistant to all-hold bias. Best for larger initial capital.',
     defaultSymbol: 'ETH/USDT',
   },
+  // ── Standalone Pyramiding Strategies ──────────────────────────────────────
+  {
+    id: 'fixed_profit_rinse_repeat',
+    strategy: 'fixed_profit_rinse_repeat',
+    name: 'Fixed Profit Rinse Repeat',
+    tagline: 'Pyramiding · 5m · per-entry exits',
+    description:
+      'Builds multiple independent spot entries when directional voters align near recent swing lows. Each entry is tracked separately and only sold after that specific fill reaches its profit target.',
+    defaultSymbol: 'ETH/USDT',
+  },
 ];
 
 export const SUPPORTED_SYMBOLS = [

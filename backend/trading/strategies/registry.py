@@ -32,6 +32,9 @@ _STRATEGY_MODULE_MAP: dict[str, str] = {
     "obv_price": "trading.strategies.obv_price",
     "price_breakout": "trading.strategies.price_breakout",
     "spot_grid": "trading.strategies.spot_grid",
+    "fixed_profit_rinse_repeat": (
+        "trading.strategies.fixed_profit_rinse_repeat"
+    ),
     # Magi Ensemble — many voters → one consensus signal → one bot execution
     "magi_ensemble_high": "trading.strategies.magi_ensemble_high",
     "magi_ensemble_mid": "trading.strategies.magi_ensemble_mid",
@@ -65,6 +68,7 @@ STRATEGY_DISPLAY_NAMES: dict[str, str] = {
     "obv_price": "OBV + Price",
     "price_breakout": "Price Breakout",
     "spot_grid": "Spot Grid",
+    "fixed_profit_rinse_repeat": "Fixed Profit Rinse Repeat",
     "magi_ensemble_high": "Magi Ensemble — High Frequency",
     "magi_ensemble_mid": "Magi Ensemble — Mid Frequency",
     "magi_ensemble_low": "Magi Ensemble — Low Frequency",

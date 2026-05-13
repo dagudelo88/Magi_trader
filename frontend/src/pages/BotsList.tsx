@@ -561,6 +561,7 @@ export default function BotsList() {
                 {BOT_TEMPLATES.map((tpl) => {
                   const p = strategyDefaults[tpl.strategy] ?? {};
                   const isEnsemble = tpl.strategy.includes('ensemble');
+                  const isFixedProfit = tpl.strategy === 'fixed_profit_rinse_repeat';
                   return (
                   <button
                     key={tpl.id}
@@ -586,6 +587,11 @@ export default function BotsList() {
                           <span>voters={(p.voters as string[] | undefined)?.length ?? '…'}</span>
                           <span>mode={(p.consensus_mode as string) ?? '…'}</span>
                           <span>threshold={p.consensus_threshold !== undefined ? `${(p.consensus_threshold as number) * 100}%` : '…'}</span>
+                        </>
+                      ) : isFixedProfit ? (
+                        <>
+                          <span>target={p.profit_target !== undefined ? `${((p.profit_target as number) * 100).toFixed(2)}%` : '…'}</span>
+                          <span>entries={(p.max_open_entries as number | undefined) ?? '…'}</span>
                         </>
                       ) : (
                         <>
@@ -621,6 +627,17 @@ export default function BotsList() {
                     {createConfig.template.strategy.includes('ensemble') ? (
                       <> · {createConfig.voters.length} voters
                         · {(createConfig.params.consensus_mode as string) ?? '…'}</>
+                    ) : createConfig.template.strategy === 'fixed_profit_rinse_repeat' ? (
+                      <>
+                        {' '}· target={
+                          createConfig.params.profit_target !== undefined
+                            ? `${((createConfig.params.profit_target as number) * 100).toFixed(2)}%`
+                            : '…'
+                        }
+                        {' '}· entries={
+                          (createConfig.params.max_open_entries as number | undefined) ?? '…'
+                        }
+                      </>
                     ) : (
                       <> · fast={(createConfig.params.fast_period as number | undefined) ?? '…'}
                         / slow={(createConfig.params.slow_period as number | undefined) ?? '…'}</>

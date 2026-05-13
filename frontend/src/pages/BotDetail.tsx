@@ -105,6 +105,8 @@ const VOTER_META: Record<string, { label: string; role: string }> = {
   bb_breakout:   { label: 'BB Breakout',     role: 'Breakout' },
   rsi_cross:     { label: 'RSI Cross',       role: 'Mean-Rev' },
   supertrend:    { label: 'Supertrend',      role: 'Trend' },
+  ema_alignment: { label: 'EMA Alignment',   role: 'Trend' },
+  rsi_not_extreme:{ label: 'RSI Floor',       role: 'Mean-Rev' },
   dual_ema:      { label: 'Dual EMA',        role: 'Trend' },
   bb_rsi:        { label: 'BB + RSI',        role: 'Mean-Rev' },
   ema_ribbon:    { label: 'EMA Ribbon',      role: 'Trend' },
@@ -149,11 +151,26 @@ type RiskBooleanKey =
 
 const CONSENSUS_MODES = ['directional_net', 'majority', 'weighted_majority', 'threshold', 'weighted'];
 const COMMON_STRATEGY_FIELDS = [
+  'profit_target',
+  'max_open_entries',
+  'min_aligned_conditions',
+  'swing_lookback',
+  'max_swing_low_distance',
   'fast_period',
   'slow_period',
   'signal_period',
   'rsi_period',
   'bb_period',
+  'supertrend_period',
+  'supertrend_multiplier',
+  'dual_ema_fast',
+  'dual_ema_slow',
+  'macd_fast',
+  'macd_slow',
+  'macd_signal',
+  'rsi_floor',
+  'obv_period',
+  'price_period',
   'ohlcv_timeframe',
   'ohlcv_limit',
   'quote_fraction',
@@ -162,6 +179,12 @@ const COMMON_STRATEGY_FIELDS = [
   'target_asset',
   'lag_lookback_sec',
 ];
+const NUMERIC_STRATEGY_FIELDS = new Set([
+  ...COMMON_STRATEGY_FIELDS.filter((key) => key !== 'target_asset'),
+  'consensus_threshold',
+  'fee_pct',
+  'min_profit_pct',
+]);
 const SELL_PROTECTION_KEYS = new Set(['min_profit_pct', 'fee_pct']);
 const ENSEMBLE_STRATEGY_KEYS = new Set(['voters', 'voter_weights', 'consensus_mode', 'consensus_threshold']);
 const RISK_TOGGLES: Array<{ key: RiskBooleanKey; label: string }> = [
@@ -194,18 +217,18 @@ function draftString(value: unknown): string {
   return typeof value === 'string' ? value : String(value);
 }
 
-function parseStrategyInput(value: string, previous: unknown): unknown {
-  const trimmed = value.trim();
-  if (trimmed === '') return null;
-  if (typeof previous === 'number') {
-    const parsed = Number(trimmed);
-    return Number.isFinite(parsed) ? parsed : previous;
-  }
-  if (typeof previous === 'boolean') return trimmed === 'true';
-  const parsedNumber = Number(trimmed);
-  return Number.isFinite(parsedNumber) && trimmed !== '' && !Number.isNaN(parsedNumber)
-    ? parsedNumber
-    : value;
+function normalizeStrategyDraftForSave(draft: StrategyDraft): StrategyDraft {
+  return Object.fromEntries(
+    Object.entries(draft).map(([key, value]) => {
+      if (typeof value !== 'string') return [key, value];
+      const trimmed = value.trim();
+      if (trimmed === '') return [key, null];
+      if (trimmed === 'true') return [key, true];
+      if (trimmed === 'false') return [key, false];
+      const numeric = Number(trimmed);
+      return Number.isFinite(numeric) ? [key, numeric] : [key, value];
+    }),
+  );
 }
 
 function consensusPreview(
@@ -811,10 +834,34 @@ export default function BotDetail() {
   const isEnsemble =
     (bot?.strategy?.startsWith('magi_ensemble') ||
      bot?.strategy?.startsWith('magi_lag_ensemble')) ?? false;
+  const isFixedProfitRinseRepeat = bot?.strategy === 'fixed_profit_rinse_repeat';
+  const hasVoterCards = isEnsemble || isFixedProfitRinseRepeat;
   const ensembleParams = useMemo(
     () => (isEnsemble ? parseEnsembleParams(bot?.strategy_params_json ?? null) : null),
     [isEnsemble, bot?.strategy_params_json],
   );
+  const fixedProfitVoterParams = useMemo<EnsembleParams | null>(() => {
+    if (!isFixedProfitRinseRepeat) return null;
+    const params = parseStrategyParams(bot?.strategy_params_json);
+    const voters = [
+      'supertrend',
+      'ema_alignment',
+      'macd_rsi',
+      'obv_price',
+      'rsi_not_extreme',
+    ];
+    const minAligned =
+      typeof params.min_aligned_conditions === 'number'
+        ? params.min_aligned_conditions
+        : 3;
+    return {
+      voters,
+      voterWeights: Object.fromEntries(voters.map((voter) => [voter, 1])),
+      consensusMode: 'threshold',
+      consensusThreshold: Math.min(1, Math.max(0, minAligned / voters.length)),
+    };
+  }, [bot?.strategy_params_json, isFixedProfitRinseRepeat]);
+  const voterCardParams = ensembleParams ?? fixedProfitVoterParams;
 
   useEffect(() => {
     if (!showConfigModal) return;
@@ -939,12 +986,12 @@ export default function BotDetail() {
   }, [configEnsembleParams, liveVoterSignals]);
 
   useEffect(() => {
-    if (!id || !isEnsemble) return;
+    if (!id || !hasVoterCards) return;
     void loadVoterSignals(id, activeModeView);
     if (!detailWs.isFallbackPolling) return;
     const timer = setInterval(() => void loadVoterSignals(id, activeModeView), 30_000);
     return () => clearInterval(timer);
-  }, [activeModeView, id, isEnsemble, detailWs.isFallbackPolling, loadVoterSignals]);
+  }, [activeModeView, id, hasVoterCards, detailWs.isFallbackPolling, loadVoterSignals]);
 
   const promoteBot = async (targetMode: 'testnet' | 'live') => {
     if (!id) return;
@@ -1199,8 +1246,9 @@ export default function BotDetail() {
       if (!riskRes.ok)
         throw new Error(typeof riskData.detail === 'string' ? riskData.detail : 'Could not save risk settings');
 
+      const normalizedStrategyDraft = normalizeStrategyDraftForSave(configStrategyDraft);
       const strategyPayload: StrategyDraft = {
-        ...configStrategyDraft,
+        ...normalizedStrategyDraft,
         initial_budget_quote: budget,
         min_profit_pct: sellProtectionEnabled
           ? (Number.isFinite(sellProtectionMinProfit) ? sellProtectionMinProfit : 0.42)
@@ -1384,10 +1432,10 @@ export default function BotDetail() {
             </div>
           )}
 
-          {/* Voter Council (ensemble) or strategy params label (non-ensemble) */}
-          {ensembleParams ? (
+          {/* Voter Council (ensemble/composite) or strategy params label */}
+          {voterCardParams ? (
             <VoterCouncil
-              ensemble={ensembleParams}
+              ensemble={voterCardParams}
               liveSignals={liveVoterSignals}
               lastUpdated={voterSignalsUpdatedAt}
             />
@@ -2281,14 +2329,16 @@ export default function BotDetail() {
                     ) : (
                       editableStrategyKeys.map((key) => {
                         const current = configStrategyDraft[key];
+                        const isNumericField =
+                          typeof current === 'number' || NUMERIC_STRATEGY_FIELDS.has(key);
                         return (
                           <label key={key} className={configLabelClass}>
                             {key}
                             <input
-                              type={typeof current === 'number' ? 'number' : 'text'}
-                              step={typeof current === 'number' ? 'any' : undefined}
+                              type="text"
+                              inputMode={isNumericField ? 'decimal' : undefined}
                               value={draftString(current)}
-                              onChange={(e) => updateStrategyDraft(key, parseStrategyInput(e.currentTarget.value, current))}
+                              onChange={(e) => updateStrategyDraft(key, e.currentTarget.value)}
                               className={configInputClass}
                             />
                           </label>

@@ -894,6 +894,8 @@ def _process_bot(
     symbol = bot["symbol"]
     strategy_name = bot.get("strategy") or "sma_cross"
     params = _merge_params(strategy_name, bot.get("strategy_params_json"))
+    params["bot_id"] = bot_id
+    params["symbol"] = symbol
     params["execution_mode"] = execution_mode
     mode_budget = _f_order(bot.get(f"{execution_mode}_initial_capital_quote"))
     if mode_budget > 0:
@@ -1224,6 +1226,23 @@ def _process_bot(
             filled_base = _f_order(order.get("filled"))
             cost_quote = _f_order(order.get("cost")) or actual_spend
             avg_price = _f_order(order.get("average")) or (cost_quote / filled_base if filled_base > 0 else 0.0)
+            if hasattr(strategy, "on_buy_filled"):
+                try:
+                    strategy.on_buy_filled(
+                        bot_id=bot_id,
+                        symbol=symbol,
+                        execution_mode=execution_mode,
+                        order=order,
+                        fallback_entry_price=avg_price,
+                        fallback_quantity=filled_base,
+                    )
+                except Exception:
+                    _log(
+                        bot_id,
+                        "error",
+                        execution_mode,
+                        f"BUY fill hook failed: {traceback.format_exc()}",
+                    )
             t_sub = time.perf_counter()
             _log(bot_id, "info", execution_mode,
                  f"[OK] BUY filled — spent {cost_quote:.4f} {quote_cur} "
@@ -1282,6 +1301,17 @@ def _process_bot(
         if cached_position is None:
             cached_position = _get_cached_bot_position(bot_id, symbol, execution_mode)
         open_base_position, open_cost_basis_quote = cached_position
+        result_meta = result.meta if isinstance(result.meta, dict) else {}
+        exact_sell_quantity = _f_order(result_meta.get("sell_quantity"))
+        target_entry_price = _f_order(result_meta.get("target_entry_price"))
+        target_entry_id: int | None = None
+        try:
+            raw_target_entry_id = result_meta.get("target_entry_id")
+            if raw_target_entry_id is not None:
+                target_entry_id = int(raw_target_entry_id)
+        except (TypeError, ValueError):
+            target_entry_id = None
+        exact_entry_sell = exact_sell_quantity > 1e-12 and target_entry_id is not None
 
         # ============================================================
         # SELL PROTECTION (activated by checkbox in frontend)
@@ -1289,7 +1319,23 @@ def _process_bot(
         min_profit_pct = float(params.get("min_profit_pct", 0.0))
         fee_pct = float(params.get("fee_pct", 0.10))
 
-        if open_base_position > 1e-12 and last_close > 0 and min_profit_pct > 0:
+        if exact_entry_sell and target_entry_price > 0 and last_close < target_entry_price:
+            _log(
+                bot_id,
+                "warn",
+                execution_mode,
+                f"SELL skipped — target entry {target_entry_id} would exit below "
+                f"entry {target_entry_price:.8f} at price {last_close:.8f}",
+            )
+            _close_decision()
+            return
+
+        if (
+            not exact_entry_sell
+            and open_base_position > 1e-12
+            and last_close > 0
+            and min_profit_pct > 0
+        ):
             avg_entry_price = open_cost_basis_quote / open_base_position
             required_sell_price = avg_entry_price * (1 + min_profit_pct / 100.0 + fee_pct / 100.0)
 
@@ -1310,11 +1356,21 @@ def _process_bot(
                 return
             # Cap by what the exchange actually holds (safety net)
             available_base = min(open_base, free_base)
-            sell_amt = available_base * base_fraction
+            sell_amt = min(exact_sell_quantity, available_base) if exact_entry_sell else available_base * base_fraction
         else:
             # No budget configured — use exchange wallet as fallback
-            available_base = free_base
-            sell_amt = available_base * base_fraction
+            available_base = min(exact_sell_quantity, free_base) if exact_entry_sell else free_base
+            sell_amt = available_base if exact_entry_sell else available_base * base_fraction
+
+        if exact_entry_sell and sell_amt <= 1e-12:
+            _log(
+                bot_id,
+                "warn",
+                execution_mode,
+                f"SELL skipped — target entry {target_entry_id} has no available base to sell",
+            )
+            _close_decision()
+            return
 
         is_unsellable_dust, full_notional = _full_position_is_unsellable_dust(
             available_base,
@@ -1340,12 +1396,14 @@ def _process_bot(
             return
 
         dust_remaining_notional = max(0.0, available_base - sell_amt) * last_close
-        sell_amt, expanded_to_full_position = _expand_sell_amount_to_avoid_dust(
-            sell_amt,
-            available_base,
-            min_cost,
-            last_close,
-        )
+        expanded_to_full_position = False
+        if not exact_entry_sell:
+            sell_amt, expanded_to_full_position = _expand_sell_amount_to_avoid_dust(
+                sell_amt,
+                available_base,
+                min_cost,
+                last_close,
+            )
         if expanded_to_full_position:
             _log(bot_id, "info", execution_mode,
                  f"SELL: fractional exit would leave dust below {min_cost} {quote_cur}"
@@ -1365,6 +1423,17 @@ def _process_bot(
         if min_cost > 0 and last_close > 0:
             notional = sell_amt * last_close
             if notional < min_cost:
+                if exact_entry_sell:
+                    _log(
+                        bot_id,
+                        "warn",
+                        execution_mode,
+                        f"SELL skipped — target entry {target_entry_id} notional "
+                        f"{notional:.4f} {quote_cur} below exchange minimum "
+                        f"{min_cost} {quote_cur}; refusing to add other entries",
+                    )
+                    _close_decision()
+                    return
                 # Bump sell_amt up to exactly the minimum notional, capped by position.
                 min_sell_amt = min_cost / last_close
                 available = available_base
@@ -1415,6 +1484,7 @@ def _process_bot(
             and last_close > 0
             and 0 < rounded_dust_notional < min_cost
             and not expanded_to_full_position
+            and not exact_entry_sell
         ):
             full_sell_prec = data_ex.amount_to_precision(symbol, available_base)
             if float(full_sell_prec) > float(sell_prec):
@@ -1434,6 +1504,17 @@ def _process_bot(
         # >= the minimum notional requirement.
         final_notional = float(sell_prec) * last_close
         if min_cost > 0 and final_notional < min_cost:
+            if exact_entry_sell:
+                _log(
+                    bot_id,
+                    "warn",
+                    execution_mode,
+                    f"SELL skipped — target entry {target_entry_id} rounds to "
+                    f"{final_notional:.4f} {quote_cur}, below exchange minimum "
+                    f"{min_cost} {quote_cur}; refusing to add other entries",
+                )
+                _close_decision()
+                return
             available = available_base
             ceiled = False
             ceiled_qty = _ceil_amount_to_min_notional(market, min_cost, last_close)
@@ -1484,6 +1565,23 @@ def _process_bot(
             filled_base = _f_order(order.get("filled"))
             cost_quote = _f_order(order.get("cost"))
             avg_price = _f_order(order.get("average")) or (cost_quote / filled_base if filled_base > 0 else 0.0)
+            if hasattr(strategy, "on_sell_filled"):
+                try:
+                    strategy.on_sell_filled(
+                        bot_id=bot_id,
+                        symbol=symbol,
+                        execution_mode=execution_mode,
+                        order=order,
+                        target_entry_id=target_entry_id,
+                        fallback_quantity=filled_base or float(sell_prec),
+                    )
+                except Exception:
+                    _log(
+                        bot_id,
+                        "error",
+                        execution_mode,
+                        f"SELL fill hook failed: {traceback.format_exc()}",
+                    )
             t_sub = time.perf_counter()
             _log(bot_id, "info", execution_mode,
                  f"[OK] SELL filled — sold {filled_base:.8f} {base_cur} "

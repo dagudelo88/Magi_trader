@@ -846,6 +846,26 @@ def init_db():
         "ON ohlcv_candles(symbol, timeframe, ts_open)"
     )
 
+    # Per-entry strategy ledger for strategies that pyramid and need to close
+    # individual fills independently instead of using aggregate FIFO position.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_open_entries (
+            entry_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_id TEXT NOT NULL,
+            execution_mode TEXT NOT NULL DEFAULT 'testnet',
+            symbol TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            quantity REAL NOT NULL,
+            exchange_order_id TEXT,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (bot_id) REFERENCES bots(bot_id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_open_entries_bot_symbol "
+        "ON strategy_open_entries(bot_id, execution_mode, symbol, created_at)"
+    )
+
     conn.commit()
     conn.close()
 
