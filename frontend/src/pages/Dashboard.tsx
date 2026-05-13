@@ -319,11 +319,13 @@ export default function Dashboard() {
 
   // Bot aggregates
   const runningBots = bots.filter((b) => b.status === 'running');
-  const liveBots = runningBots.filter((b) => b.execution_mode === 'live').length;
-  const simBots = runningBots.filter((b) => b.execution_mode !== 'live').length;
+  const runningLiveCount = runningBots.filter((b) => b.execution_mode === 'live').length;
+  const runningTestnetCount = runningBots.filter((b) => b.execution_mode !== 'live').length;
 
   const liveBotRows = bots.filter((b) => b.execution_mode === 'live');
   const testnetBotRows = bots.filter((b) => b.execution_mode !== 'live');
+  const totalLiveConfigured = liveBotRows.length;
+  const totalTestnetConfigured = testnetBotRows.length;
   const statsLive = botSegmentStats(liveBotRows);
   const statsTestnet = botSegmentStats(testnetBotRows);
 
@@ -335,37 +337,60 @@ export default function Dashboard() {
         {/* Top Stats */}
         <div className="grid grid-cols-4 gap-4 mb-6">
           {/* Wallet value */}
-          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Total Value (Est)</h3>
-            <div className="text-2xl font-mono font-bold">
-              {error
-                ? '---'
-                : `$${totalWalletValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md text-center">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">Total Value (Est)</h3>
+            <div className="border-t border-border/40 pt-3 flex flex-col gap-1 items-center">
+              <div className="text-3xl font-mono font-bold tabular-nums">
+                {error
+                  ? '---'
+                  : `$${totalWalletValue.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
+              </div>
+              <p className="text-xs text-gray-500 leading-snug">
+                Based on {viewLabel} wallet & matching spot prices
+              </p>
             </div>
-            <p className="text-xs text-gray-500 mt-1">Based on {viewLabel} wallet & matching spot prices</p>
           </div>
 
-          {/* Active bots (live) */}
-          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-2">Active Bots</h3>
-            <div className="text-2xl font-mono font-bold">
-              {runningBots.length}
-              <span className="text-sm font-sans ml-2 text-gray-400">/ {bots.length} total</span>
+          {/* Active bots — mainnet vs testnet (side by side) */}
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md text-center">
+            <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">Active Bots</h3>
+            <div className="grid grid-cols-2 gap-4 border-t border-border/40 pt-3">
+              <div className="min-w-0 border-r border-border/50 px-2 flex flex-col gap-1 items-center text-center">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-red-400">
+                  Mainnet
+                </span>
+                <span className="text-lg font-mono font-bold tabular-nums">
+                  {totalLiveConfigured === 0 ? '—' : runningLiveCount}
+                </span>
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  {totalLiveConfigured === 0
+                    ? 'No live bots'
+                    : `${totalLiveConfigured} live bot${totalLiveConfigured !== 1 ? 's' : ''} configured`}
+                </p>
+              </div>
+              <div className="min-w-0 px-2 flex flex-col gap-1 items-center text-center">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400">
+                  Testnet
+                </span>
+                <span className="text-lg font-mono font-bold tabular-nums">
+                  {totalTestnetConfigured === 0 ? '—' : runningTestnetCount}
+                </span>
+                <p className="text-[10px] text-gray-500 leading-snug">
+                  {totalTestnetConfigured === 0
+                    ? 'No testnet bots'
+                    : `${totalTestnetConfigured} testnet bot${totalTestnetConfigured !== 1 ? 's' : ''} configured`}
+                </p>
+              </div>
             </div>
-            <p className="text-xs mt-1 text-gray-500">
-              {liveBots > 0 && <span className="text-red-400 font-semibold">{liveBots} Live </span>}
-              {simBots > 0 && <span className="text-blue-400 font-semibold">{simBots} Testnet</span>}
-              {runningBots.length === 0 && 'None running'}
-            </p>
           </div>
 
           {/* Realized P&L — mainnet vs testnet (side by side) */}
-          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md text-center">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">
               Bot Realized P&L
             </h3>
             <div className="grid grid-cols-2 gap-4 border-t border-border/40 pt-3">
-              <div className="min-w-0 border-r border-border/50 pr-3 flex flex-col gap-1">
+              <div className="min-w-0 border-r border-border/50 px-2 flex flex-col gap-1 items-center text-center">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-red-400">
                   Mainnet
                 </span>
@@ -373,7 +398,7 @@ export default function Dashboard() {
                   <span className="text-sm font-mono text-gray-500">—</span>
                 ) : (
                   <span
-                    className={`text-lg font-mono font-bold tabular-nums truncate ${
+                    className={`text-lg font-mono font-bold tabular-nums ${
                       statsLive.totalPnl >= 0 ? 'text-green-400' : 'text-red-400'
                     }`}
                   >
@@ -387,7 +412,7 @@ export default function Dashboard() {
                     : `${statsLive.totalTrades} closed trades · initial capital ${statsLive.totalBudget.toLocaleString()} USDT`}
                 </p>
               </div>
-              <div className="min-w-0 flex flex-col gap-1">
+              <div className="min-w-0 px-2 flex flex-col gap-1 items-center text-center">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400">
                   Testnet
                 </span>
@@ -395,7 +420,7 @@ export default function Dashboard() {
                   <span className="text-sm font-mono text-gray-500">—</span>
                 ) : (
                   <span
-                    className={`text-lg font-mono font-bold tabular-nums truncate ${
+                    className={`text-lg font-mono font-bold tabular-nums ${
                       statsTestnet.totalPnl >= 0 ? 'text-green-400' : 'text-red-400'
                     }`}
                   >
@@ -413,10 +438,10 @@ export default function Dashboard() {
           </div>
 
           {/* Win rate — mainnet vs testnet (side by side) */}
-          <div className="bg-panel border border-border p-5 rounded-custom shadow-md">
+          <div className="bg-panel border border-border p-5 rounded-custom shadow-md text-center">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-400 mb-3">Avg Win Rate</h3>
             <div className="grid grid-cols-2 gap-4 border-t border-border/40 pt-3">
-              <div className="min-w-0 border-r border-border/50 pr-3 flex flex-col gap-1">
+              <div className="min-w-0 border-r border-border/50 px-2 flex flex-col gap-1 items-center text-center">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-red-400">
                   Mainnet
                 </span>
@@ -433,7 +458,7 @@ export default function Dashboard() {
                     : `across ${statsLive.botsWithTradesCount} bot${statsLive.botsWithTradesCount !== 1 ? 's' : ''} with trades`}
                 </p>
               </div>
-              <div className="min-w-0 flex flex-col gap-1">
+              <div className="min-w-0 px-2 flex flex-col gap-1 items-center text-center">
                 <span className="text-[10px] font-bold uppercase tracking-wider text-blue-400">
                   Testnet
                 </span>

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
+import { Settings } from 'lucide-react';
 import { API_BASE } from '../config';
 import { BOT_TEMPLATES, SUPPORTED_SYMBOLS, type BotTemplate } from '../botTemplates';
 import { useRealtimeStore, type BotRow } from '../stores/realtimeStore';
@@ -58,16 +59,10 @@ const ALL_VOTERS: { id: string; label: string }[] = [
   { id: 'price_breakout', label: 'Price Breakout' },
 ];
 
-// ── Edit modal state ────────────────────────────────────────────────────────
-
-interface EditForm {
-  name: string;
-  symbol: string;
-}
-
 // ── Component ───────────────────────────────────────────────────────────────
 
 export default function BotsList() {
+  const navigate = useNavigate();
   const bots = useRealtimeStore((state) => state.bots);
   const executionMode = useRealtimeStore((state) => state.tradingSettings?.execution_mode ?? null);
   const loadBots = useRealtimeStore((state) => state.loadBots);
@@ -86,12 +81,6 @@ export default function BotsList() {
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const budgetRef = useRef<HTMLInputElement>(null);
-
-  // edit modal
-  const [editBotId, setEditBotId] = useState<string | null>(null);
-  const [editForm, setEditForm] = useState<EditForm>({ name: '', symbol: '' });
-  const [editBusy, setEditBusy] = useState(false);
-  const [editError, setEditError] = useState<string | null>(null);
 
   const loadStrategies = async (signal?: AbortSignal) => {
     try {
@@ -311,37 +300,6 @@ export default function BotsList() {
     }
   };
 
-  const openEdit = (bot: BotRow) => {
-    setEditBotId(bot.bot_id);
-    setEditForm({ name: bot.name, symbol: bot.symbol });
-    setEditError(null);
-  };
-
-  const handleEdit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editBotId) return;
-    setEditError(null);
-    setEditBusy(true);
-    try {
-      const res = await fetch(`${API_BASE}/api/bots/${editBotId}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: editForm.name.trim() || undefined,
-          symbol: editForm.symbol.trim() || undefined,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Update failed');
-      setEditBotId(null);
-      await loadBots();
-    } catch (e) {
-      setEditError(e instanceof Error ? e.message : 'Update failed');
-    } finally {
-      setEditBusy(false);
-    }
-  };
-
   // ── Render ───────────────────────────────────────────────────────────────
   const botSections = [
     { id: 'live', title: 'Live Bots', bots: bots.filter((bot) => bot.execution_mode === 'live') },
@@ -499,10 +457,15 @@ export default function BotsList() {
                     STOP
                   </button>
                 )}
-                <button type="button" disabled={isBusy}
-                  onClick={() => openEdit(bot)}
-                  className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-gray-700/60 hover:bg-gray-600 text-gray-200 rounded disabled:opacity-40 transition-colors">
-                  EDIT
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => navigate(`/bots/${bot.bot_id}`, { state: { openConfig: true } })}
+                  className="flex items-center gap-1 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider rounded border border-primary/40 bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-40 transition-colors"
+                  title="Configure name, pair, risk, strategy, and ensemble settings"
+                >
+                  <Settings size={13} aria-hidden />
+                  CONFIG
                 </button>
                 <button type="button" disabled={isBusy || isRunning}
                   onClick={() => void handleDelete(bot)}
@@ -510,10 +473,6 @@ export default function BotsList() {
                   className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-red-950/60 hover:bg-red-900/80 text-red-400 rounded disabled:opacity-40 transition-colors">
                   DELETE
                 </button>
-                <Link to={`/bots/${bot.bot_id}`}
-                  className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider bg-primary/20 hover:bg-primary/30 text-primary rounded transition-colors">
-                  MANAGE →
-                </Link>
               </div>
             </div>
           );
@@ -904,55 +863,6 @@ export default function BotsList() {
                 </div>
               </form>
             )}
-          </div>
-        </div>
-      )}
-
-      {/* ── EDIT BOT MODAL ───────────────────────────────────────────────── */}
-      {editBotId && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-          <div className="bg-[#161616] border border-[#2a2a2a] rounded-xl w-full max-w-md shadow-2xl">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-[#2a2a2a]">
-              <h2 className="text-sm font-black uppercase tracking-widest text-white">Edit Bot</h2>
-              <button type="button" onClick={() => setEditBotId(null)}
-                className="text-gray-500 hover:text-white text-xl leading-none transition-colors">
-                ×
-              </button>
-            </div>
-            <form onSubmit={(e) => void handleEdit(e)} className="px-6 py-5 flex flex-col gap-4">
-              {editError && (
-                <p className="text-red-400 text-xs border border-red-500/40 bg-red-950/20 rounded p-2">
-                  {editError}
-                </p>
-              )}
-              <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
-                Bot Name
-                <input type="text" value={editForm.name}
-                  onChange={(e) => setEditForm((f) => ({ ...f, name: e.target.value }))}
-                  className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none" />
-              </label>
-              <label className="flex flex-col gap-1.5 text-[11px] uppercase tracking-wider text-gray-400">
-                Trading Pair
-                <select value={editForm.symbol}
-                  onChange={(e) => setEditForm((f) => ({ ...f, symbol: e.target.value }))}
-                  className="rounded border border-[#2a2a2a] bg-black/40 px-3 py-2 text-sm text-white focus:border-primary/60 focus:outline-none">
-                  {SUPPORTED_SYMBOLS.map((s) => <option key={s} value={s}>{s}</option>)}
-                </select>
-              </label>
-              <p className="text-[10px] text-gray-600">
-                To change initial capital, open the bot detail → Initial Capital &amp; New Instance.
-              </p>
-              <div className="flex gap-2 pt-1">
-                <button type="submit" disabled={editBusy}
-                  className="flex-1 py-2.5 bg-primary text-black text-[11px] font-black uppercase tracking-widest rounded hover:brightness-110 disabled:opacity-40 transition-all">
-                  {editBusy ? 'Saving…' : 'Save Changes'}
-                </button>
-                <button type="button" onClick={() => setEditBotId(null)}
-                  className="px-4 py-2.5 border border-[#2a2a2a] text-gray-400 text-[11px] font-bold uppercase tracking-widest rounded hover:border-gray-500 transition-all">
-                  Cancel
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}

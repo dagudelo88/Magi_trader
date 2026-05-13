@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { Copy, ChevronDown, Info, Settings, X } from 'lucide-react';
 import { BotTacticalChart } from '../components/BotTacticalChart';
+import { SUPPORTED_SYMBOLS } from '../botTemplates';
 import { API_BASE, CHART_OHLCV_POLL_INTERVAL_MS } from '../config';
 import { useMagiWebSocket, type MagiWebSocketMessage } from '../hooks/useMagiWebSocket';
 import {
@@ -139,7 +140,7 @@ interface EnsembleParams {
   consensusThreshold: number;
 }
 
-type ConfigTab = 'risk' | 'strategy' | 'ensemble';
+type ConfigTab = 'general' | 'risk' | 'strategy' | 'ensemble';
 type StrategyDraft = Record<string, unknown>;
 type RiskBooleanKey =
   | 'enable_daily_loss_limit'
@@ -698,8 +699,11 @@ function SpotPriceRow({
 
 export default function BotDetail() {
   const { id } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   const detail = useRealtimeStore((state) => (id ? state.botDetailsById[id] : undefined));
   const loadBotDetail = useRealtimeStore((state) => state.loadBotDetail);
+  const loadBots = useRealtimeStore((state) => state.loadBots);
   const loadTradeSummary = useRealtimeStore((state) => state.loadTradeSummary);
   const loadExecutionHistory = useRealtimeStore((state) => state.loadExecutionHistory);
   const loadVoterSignals = useRealtimeStore((state) => state.loadVoterSignals);
@@ -725,7 +729,9 @@ export default function BotDetail() {
   const [yoloBusy, setYoloBusy] = useState(false);
   const [showPromoteModal, setShowPromoteModal] = useState(false);
   const [showConfigModal, setShowConfigModal] = useState(false);
-  const [activeConfigTab, setActiveConfigTab] = useState<ConfigTab>('risk');
+  const [activeConfigTab, setActiveConfigTab] = useState<ConfigTab>('general');
+  const [configNameDraft, setConfigNameDraft] = useState('');
+  const [configSymbolDraft, setConfigSymbolDraft] = useState('');
   const [configRiskDraft, setConfigRiskDraft] = useState<RiskSettings | null>(null);
   const [configStrategyDraft, setConfigStrategyDraft] = useState<StrategyDraft>({});
   const [configStrategyJsonDraft, setConfigStrategyJsonDraft] = useState('');
@@ -766,6 +772,14 @@ export default function BotDetail() {
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  /** Open configuration from bot list (navigate with `state: { openConfig: true }`). */
+  useEffect(() => {
+    const st = location.state as { openConfig?: boolean } | null | undefined;
+    if (!st?.openConfig) return;
+    setShowConfigModal(true);
+    navigate('.', { replace: true, state: {} });
+  }, [location.state, navigate]);
 
   useEffect(() => {
     setActiveModeView(activeBotMode);
@@ -933,13 +947,15 @@ export default function BotDetail() {
     const parsed = parseStrategyParams(bot?.strategy_params_json);
     const risk = bot?.risk_settings ?? GLOBAL_RISK_DEFAULTS;
     const budget = parsed.initial_budget_quote ?? effectiveStrategyHealth?.initial_budget_quote ?? null;
+    setConfigNameDraft(bot?.name ?? '');
+    setConfigSymbolDraft(bot?.symbol ?? '');
     setConfigRiskDraft(cloneRiskSettings(risk));
     setConfigStrategyDraft(parsed);
     setConfigStrategyJsonDraft(prettyStrategyParams(parsed));
     setConfigBudgetDraft(budget == null ? '' : String(budget));
     setConfigError(null);
     setConfigSuccess(null);
-    setActiveConfigTab((current) => (current === 'ensemble' && !isEnsemble ? 'risk' : current));
+    setActiveConfigTab((current) => (current === 'ensemble' && !isEnsemble ? 'general' : current));
   }, [
     showConfigModal,
     id,
@@ -970,6 +986,7 @@ export default function BotDetail() {
   const closeConfigModal = useCallback(() => {
     if (configBusy || weightsOptimizeBusy) return;
     setShowConfigModal(false);
+    setActiveConfigTab('general');
     setConfigError(null);
     setConfigSuccess(null);
   }, [configBusy, weightsOptimizeBusy]);
@@ -1302,6 +1319,24 @@ export default function BotDetail() {
     setConfigError(null);
     setConfigSuccess(null);
     try {
+      const nameTrim = configNameDraft.trim();
+      const symbolTrim = configSymbolDraft.trim();
+      const identityPatch: { name?: string; symbol?: string } = {};
+      if (nameTrim !== (bot?.name ?? '')) identityPatch.name = nameTrim || undefined;
+      if (symbolTrim !== (bot?.symbol ?? '')) identityPatch.symbol = symbolTrim || undefined;
+      if (Object.keys(identityPatch).length > 0) {
+        const identityRes = await fetch(`${API_BASE}/api/bots/${id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(identityPatch),
+        });
+        const identityData = await identityRes.json().catch(() => ({}));
+        if (!identityRes.ok)
+          throw new Error(
+            typeof identityData.detail === 'string' ? identityData.detail : 'Could not save bot name or pair',
+          );
+      }
+
       const riskRes = await fetch(`${API_BASE}/api/bots/${id}/risk-settings`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -1332,6 +1367,7 @@ export default function BotDetail() {
         );
 
       await refresh();
+      void loadBots();
       setConfigSuccess('Configuration saved.');
       setShowConfigModal(false);
       setConfigError(null);
@@ -1414,6 +1450,12 @@ export default function BotDetail() {
     : '—';
   const recordedOrderCount = effectiveOrderStats?.total_orders ?? 0;
   const yoloMode = bot?.risk_settings?.yolo_mode ?? false;
+  const configSymbolOptions = useMemo(() => {
+    const set = new Set(SUPPORTED_SYMBOLS);
+    const cur = configSymbolDraft.trim();
+    if (cur && !set.has(cur)) return [cur, ...SUPPORTED_SYMBOLS];
+    return [...SUPPORTED_SYMBOLS];
+  }, [configSymbolDraft]);
   const configInputClass =
     'rounded border border-magi-grid/30 bg-magi-bg px-3 py-2 font-mono text-sm text-magi-on-bg focus:border-magi-primary/50 focus:outline-none disabled:opacity-50';
   const configLabelClass = 'flex flex-col gap-1.5 font-label text-[10px] uppercase tracking-wider text-magi-muted/55';
@@ -1451,7 +1493,7 @@ export default function BotDetail() {
                 type="button"
                 onClick={() => setShowConfigModal(true)}
                 className="flex items-center gap-1.5 rounded border border-magi-primary/40 bg-magi-primary/10 px-2.5 py-1 text-[10px] font-bold uppercase tracking-widest text-magi-primary hover:bg-magi-primary/20 active:bg-magi-primary/30 transition-colors"
-                title="Configure risk, strategy, weights & consensus for this bot only"
+                title="Configure name, pair, risk, strategy, and ensemble settings for this bot"
               >
                 <Settings size={13} />
                 CONFIG
@@ -2118,7 +2160,7 @@ export default function BotDetail() {
                   Per-bot override
                 </p>
                 <h2 className="font-headline text-lg font-black uppercase italic tracking-tight text-magi-primary phosphor-amber">
-                  Bot Configuration — {symbolHeadline(bot?.symbol)}
+                  Bot Configuration — {symbolHeadline(configSymbolDraft || bot?.symbol)}
                 </h2>
               </div>
               <button
@@ -2133,6 +2175,9 @@ export default function BotDetail() {
             </div>
 
             <div className="flex flex-wrap gap-1 border-b border-magi-grid/20 bg-magi-container-low/50 px-4 pt-3">
+              <button type="button" className={configTabClass('general')} onClick={() => setActiveConfigTab('general')}>
+                Bot &amp; Pair
+              </button>
               <button type="button" className={configTabClass('risk')} onClick={() => setActiveConfigTab('risk')}>
                 Risk Management
               </button>
@@ -2156,6 +2201,45 @@ export default function BotDetail() {
                 <div className="mb-4 rounded border border-magi-tertiary/30 bg-magi-tertiary/10 px-3 py-2 text-xs text-magi-tertiary">
                   {configSuccess}
                 </div>
+              )}
+
+              {activeConfigTab === 'general' && (
+                <section className="flex flex-col gap-4">
+                  <div>
+                    <h3 className="font-label text-[12px] font-black uppercase tracking-widest text-magi-on-bg">
+                      Bot &amp; trading pair
+                    </h3>
+                    <p className="mt-1 text-xs text-magi-muted/55">
+                      Display name and spot pair. Initial capital is set under Risk Management.
+                    </p>
+                  </div>
+                  <label className={configLabelClass}>
+                    Bot name
+                    <input
+                      type="text"
+                      value={configNameDraft}
+                      onChange={(e) => setConfigNameDraft(e.currentTarget.value)}
+                      disabled={configBusy}
+                      className={configInputClass}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label className={configLabelClass}>
+                    Trading pair
+                    <select
+                      value={configSymbolDraft}
+                      onChange={(e) => setConfigSymbolDraft(e.currentTarget.value)}
+                      disabled={configBusy}
+                      className={configInputClass}
+                    >
+                      {configSymbolOptions.map((s) => (
+                        <option key={s} value={s}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </section>
               )}
 
               {activeConfigTab === 'risk' && (
