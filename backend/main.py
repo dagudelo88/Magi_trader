@@ -40,6 +40,7 @@ from database import (
     fetch_bot_orders_chronological,
     sync_bot_orders_from_logs,
     refresh_stale_bot_orders_from_exchange,
+    fetch_latest_bot_decisions_by_bot_and_mode,
     fork_bot,
     metamagi_label_voter_feedback_catchup,
     peer_voter_weights_for_new_ensemble_bot,
@@ -877,7 +878,7 @@ async def lifespan(_app: FastAPI):
                 pass
 
 
-app = FastAPI(title="MagiTrader API", lifespan=lifespan)
+app = FastAPI(title="Magi_Trader API", lifespan=lifespan)
 
 
 def _cors_allow_origins() -> list[str]:
@@ -1651,9 +1652,22 @@ def list_bots():
         cur = conn.cursor()
         cur.execute("SELECT * FROM bots ORDER BY created_at")
         rows = [_row_to_bot(r) for r in cur.fetchall()]
+        latest_decisions = fetch_latest_bot_decisions_by_bot_and_mode()
+
+        def _normalized_last_signal(bot_id_key: str, mode_key: str) -> str | None:
+            rec = latest_decisions.get((bot_id_key, mode_key))
+            if not rec:
+                return None
+            raw = str(rec.get("action") or "").strip().lower()
+            if raw in ("buy", "sell", "hold"):
+                return raw
+            return None
+
         for row in rows:
             bot_id = row.get("bot_id", "")
             row["capital_source"] = row.get("capital_source") or "budget"
+            active_mode = str(row.get("execution_mode") or "testnet")
+            row["last_signal"] = _normalized_last_signal(str(bot_id), active_mode)
             # Compute lightweight P&L from stored orders (no exchange call)
             row["metrics"] = {}
             try:
@@ -1665,7 +1679,6 @@ def list_bots():
                     )
                     for mode in EXECUTION_MODES
                 }
-                active_mode = str(row.get("execution_mode") or "testnet")
                 active_metrics = row["metrics"].get(active_mode) or row["metrics"]["testnet"]
                 row["initial_budget_quote"] = active_metrics["initial_budget_quote"]
                 row["realized_pnl_quote"] = round(active_metrics["realized_pnl_quote"], 4)

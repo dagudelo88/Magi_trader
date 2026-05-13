@@ -1492,6 +1492,48 @@ def batch_record_bot_decisions(decisions: list[dict[str, Any]]) -> None:
     )
 
 
+def fetch_latest_bot_decisions_by_bot_and_mode() -> dict[tuple[str, str], dict[str, Any]]:
+    """
+    Return the most recent bot_decisions row per (bot_id, mode).
+
+    Keys are (bot_id, mode) with mode matching bots.execution_mode values
+    (e.g. 'testnet', 'live'). Values include action (BUY/SELL/HOLD), confidence,
+    executed flag, and created_at when present.
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.bot_id, d.mode, d.action, d.confidence, d.executed, d.created_at
+            FROM bot_decisions d
+            INNER JOIN (
+                SELECT bot_id, mode, MAX(decision_id) AS max_id
+                FROM bot_decisions
+                GROUP BY bot_id, mode
+            ) latest
+              ON d.bot_id = latest.bot_id
+             AND d.mode = latest.mode
+             AND d.decision_id = latest.max_id
+            """
+        )
+        out: dict[tuple[str, str], dict[str, Any]] = {}
+        for r in cur.fetchall():
+            bot_id = str(r["bot_id"] or "")
+            mode = str(r["mode"] or "")
+            if not bot_id or not mode:
+                continue
+            out[(bot_id, mode)] = {
+                "action": r["action"],
+                "confidence": r["confidence"],
+                "executed": bool(r["executed"]) if r["executed"] is not None else None,
+                "created_at": r["created_at"],
+            }
+        return out
+    finally:
+        conn.close()
+
+
 def get_latest_voter_signals(
     bot_id: str,
     mode: str | None = None,

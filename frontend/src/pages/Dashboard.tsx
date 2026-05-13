@@ -1,7 +1,13 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { API_BASE } from '../config';
-import { useRealtimeStore, type WalletItem } from '../stores/realtimeStore';
+import {
+  useRealtimeStore,
+  type WalletItem,
+  type StrategyHealth,
+  type ExecutionMode,
+  type BotSignal,
+} from '../stores/realtimeStore';
 
 function formatUptime(startedAtSec: number | null, status: string): string {
   if (status !== 'running' || startedAtSec == null) return '—';
@@ -56,6 +62,150 @@ type ValuedWalletItem = WalletItem & { value: number };
 
 function hasUsdValue(item: WalletItem & { value?: number }): item is ValuedWalletItem {
   return typeof item.value === 'number' && Number.isFinite(item.value) && item.value > 0;
+}
+
+function formatQuoteVolCompact(quoteVolStr: string | undefined): string {
+  if (quoteVolStr == null || quoteVolStr === '') return '—';
+  const n = Number.parseFloat(quoteVolStr);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
+  if (n >= 1e9) return `$${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(2)}K`;
+  return `$${n.toFixed(0)}`;
+}
+
+function formatBaseVolCompact(baseVolStr: string | undefined, baseAsset: string): string {
+  if (baseVolStr == null || baseVolStr === '') return '—';
+  const n = Number.parseFloat(baseVolStr);
+  if (!Number.isFinite(n) || n < 0) return '—';
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M ${baseAsset}`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(2)}K ${baseAsset}`;
+  if (n >= 1) return `${n.toLocaleString('en-US', { maximumFractionDigits: 2 })} ${baseAsset}`;
+  return `${n.toFixed(4)} ${baseAsset}`;
+}
+
+function formatSignedUsd(changeStr: string | undefined): { text: string; positive: boolean | null } {
+  if (changeStr == null || changeStr === '') return { text: '—', positive: null };
+  const n = Number.parseFloat(changeStr);
+  if (!Number.isFinite(n)) return { text: '—', positive: null };
+  if (n === 0) return { text: '$0.00', positive: null };
+  const abs = Math.abs(n);
+  const body =
+    abs >= 1 ? abs.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : abs.toFixed(6);
+  return {
+    text: n > 0 ? `+$${body}` : `−$${body}`,
+    positive: n > 0,
+  };
+}
+
+function metricsForBotExecution(bot: {
+  execution_mode: string;
+  metrics?: Partial<Record<ExecutionMode, StrategyHealth>>;
+}): StrategyHealth | null {
+  const mode: ExecutionMode = bot.execution_mode === 'live' ? 'live' : 'testnet';
+  return bot.metrics?.[mode] ?? null;
+}
+
+function SignalBadge({ signal }: { signal: BotSignal | null | undefined }) {
+  if (signal == null) {
+    return <span className="text-gray-500 font-mono text-xs">—</span>;
+  }
+  const label = signal === 'buy' ? 'Buy' : signal === 'sell' ? 'Sell' : 'Hold';
+  const cls =
+    signal === 'buy'
+      ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/35'
+      : signal === 'sell'
+        ? 'bg-red-500/20 text-red-400 border-red-500/35'
+        : 'bg-slate-500/25 text-slate-300 border-slate-500/35';
+  return (
+    <span className={`text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded border whitespace-nowrap ${cls}`}>
+      {label}
+    </span>
+  );
+}
+
+/** Base symbol from pair e.g. BTCUSDT → BTC */
+function baseAssetFromSymbol(symbol: string): string {
+  return symbol.replace(/(USDT|USDC|FDUSD|BUSD)$/i, '') || symbol;
+}
+
+interface BotAllocationDisplay {
+  baseSym: string;
+  quoteSym: string;
+  basePct: number;
+  quotePct: number;
+  hasOpenBase: boolean;
+}
+
+function deriveBotAllocation(
+  bot: { symbol: string; execution_mode: string; metrics?: Partial<Record<ExecutionMode, StrategyHealth>> },
+  tickers: Record<string, { price: string }>,
+): BotAllocationDisplay | null {
+  const m = metricsForBotExecution(bot);
+  if (m == null) return null;
+  if (m.base_alloc_pct == null || m.quote_alloc_pct == null) return null;
+
+  const baseSym = baseAssetFromSymbol(bot.symbol);
+  const quoteSym = m.quote_currency || 'USDT';
+  const openBase = m.open_base_position ?? 0;
+  const hasOpenBase = openBase > 1e-12;
+
+  let basePct = m.base_alloc_pct;
+  let quotePct = m.quote_alloc_pct;
+  const t = tickers[bot.symbol];
+  const px = t ? Number.parseFloat(t.price) : NaN;
+  if (Number.isFinite(px) && px > 0 && hasOpenBase) {
+    const baseVal = openBase * px;
+    const qr = m.quote_remaining ?? 0;
+    const total = baseVal + qr;
+    if (total > 1e-12) {
+      basePct = Math.round((baseVal / total) * 10_000) / 100;
+      quotePct = Math.round((100 - basePct) * 100) / 100;
+    }
+  }
+
+  return { baseSym, quoteSym, basePct, quotePct, hasOpenBase };
+}
+
+function BotAllocationCell({
+  bot,
+  tickers,
+}: {
+  bot: { symbol: string; execution_mode: string; metrics?: Partial<Record<ExecutionMode, StrategyHealth>> };
+  tickers: Record<string, { price: string }>;
+}) {
+  const disp = deriveBotAllocation(bot, tickers);
+  if (disp == null) {
+    return <span className="text-gray-500 font-mono text-xs">—</span>;
+  }
+  const { baseSym, quoteSym, basePct, quotePct, hasOpenBase } = disp;
+
+  const showBaseSeg = hasOpenBase && basePct > 0;
+
+  return (
+    <div className="w-[9.5rem] max-w-[9.5rem] shrink-0">
+      <div className="flex h-1.5 w-full overflow-hidden rounded-sm bg-gray-700/55 mb-1">
+        {showBaseSeg && (
+          <div
+            className="h-full bg-emerald-500/85 transition-[width] duration-300 shrink-0"
+            style={{ width: `${Math.min(100, basePct)}%` }}
+          />
+        )}
+        <div
+          className="h-full bg-blue-500/45 transition-[width] duration-300"
+          style={{ width: showBaseSeg ? `${Math.min(100, quotePct)}%` : '100%' }}
+        />
+      </div>
+      <div className="text-[10px] font-mono text-gray-400 leading-snug truncate" title={`${baseSym} ${basePct.toFixed(1)}% · ${quoteSym} ${quotePct.toFixed(1)}%`}>
+        <span className="text-emerald-400/90">{basePct.toFixed(0)}%</span>
+        <span className="text-gray-500"> {baseSym}</span>
+        <span className="text-gray-600 mx-0.5">·</span>
+        <span className="text-blue-300/85">{quotePct.toFixed(0)}%</span>
+        <span className="text-gray-500"> {quoteSym}</span>
+      </div>
+    </div>
+  );
 }
 
 export default function Dashboard() {
@@ -223,8 +373,11 @@ export default function Dashboard() {
                     <th className="px-5 py-2 text-left font-semibold">Bot</th>
                     <th className="px-4 py-2 text-left font-semibold">Pair</th>
                     <th className="px-4 py-2 text-left font-semibold">Strategy</th>
+                    <th className="px-4 py-2 text-left font-semibold">Signal</th>
                     <th className="px-4 py-2 text-left font-semibold">Status</th>
                     <th className="px-4 py-2 text-right font-semibold">Initial Capital</th>
+                    <th className="px-4 py-2 text-right font-semibold whitespace-nowrap">Current Capital</th>
+                    <th className="px-4 py-2 text-left font-semibold whitespace-nowrap">Allocation</th>
                     <th className="px-4 py-2 text-right font-semibold">Realized P&L</th>
                     <th className="px-4 py-2 text-right font-semibold">Win Rate</th>
                     <th className="px-4 py-2 text-right font-semibold">Trades</th>
@@ -253,6 +406,9 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="px-4 py-2.5">
+                          <SignalBadge signal={bot.last_signal} />
+                        </td>
+                        <td className="px-4 py-2.5">
                           <span className={`text-[9px] font-bold uppercase tracking-widest px-2 py-0.5 rounded ${
                             bot.status === 'running' ? 'bg-green-500/20 text-green-400 border border-green-500/30'
                             : bot.status === 'paused' ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
@@ -266,6 +422,14 @@ export default function Dashboard() {
                         </td>
                         <td className="px-4 py-2.5 text-right font-mono text-gray-300 text-xs">
                           {bot.initial_budget_quote != null ? `${bot.initial_budget_quote.toLocaleString()} USDT` : '—'}
+                        </td>
+                        <td className="px-4 py-2.5 text-right font-mono text-gray-200 text-xs">
+                          {bot.current_capital_quote != null
+                            ? `${bot.current_capital_quote.toLocaleString(undefined, { maximumFractionDigits: 4 })} USDT`
+                            : '—'}
+                        </td>
+                        <td className="px-4 py-2.5 align-middle">
+                          <BotAllocationCell bot={bot} tickers={tickers} />
                         </td>
                         <td className={`px-4 py-2.5 text-right font-mono text-xs font-bold ${positive ? 'text-green-400' : 'text-red-400'}`}>
                           {bot.realized_pnl_quote != null
@@ -374,9 +538,9 @@ export default function Dashboard() {
           </div>
 
           {/* Spot Data Section */}
-          <div className="bg-panel border border-border p-6 rounded-custom overflow-y-auto shadow-md flex flex-col">
+          <div className="bg-panel border border-border p-6 rounded-custom overflow-hidden shadow-md flex flex-col min-h-0">
             <h2 className="text-xl font-bold mb-1 flex items-center gap-2">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
               </svg>
               Spot markets
@@ -384,45 +548,114 @@ export default function Dashboard() {
                 {viewLabel}
               </span>
             </h2>
-            <p className="text-xs text-gray-500 mb-4">Eight tracked pairs — prices from the mainnet market stream.</p>
-            <div className="flex-1 overflow-auto pr-2">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-border text-gray-400 text-sm uppercase">
-                    <th className="pb-3 font-semibold">Pair</th>
-                    <th className="pb-3 font-semibold text-right">Price</th>
-                    <th className="pb-3 font-semibold text-right">24h Change</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {trackedTickers.map((symbol) => {
-                    const data = tickers[symbol];
-                    const isPositive = data && parseFloat(data.changePercent) >= 0;
-
-                    return (
-                      <tr key={symbol} className="border-b border-border/50 hover:bg-border/30 transition-colors">
-                        <td className="py-4 font-medium flex items-center gap-2">
-                          <span className="font-bold">{symbol.replace('USDT', '')}</span>
-                          <span className="text-xs text-gray-500">/USDT</span>
-                        </td>
-                        <td className="py-4 text-right font-mono">
-                          {data ? `$${data.price}` : <span className="text-gray-500">Loading...</span>}
-                        </td>
-                        <td className={`py-4 text-right font-mono ${!data ? 'text-gray-500' : isPositive ? 'text-green-500' : 'text-red-500'}`}>
-                          {data ? (
-                            <span className="flex items-center justify-end gap-1">
-                              {isPositive ? '↑' : '↓'}
-                              {Math.abs(parseFloat(data.changePercent))}%
-                            </span>
-                          ) : (
-                            '...'
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+            <p className="text-xs text-gray-500 mb-4">
+              Tracked pairs — 24h OHLC, volumes, and best bid/ask spread from the Binance mainnet ticker stream (same
+              prices bots use for context).
+            </p>
+            <div className="flex-1 min-h-0 overflow-auto pr-1">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[920px] text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-border text-gray-500 text-[10px] uppercase tracking-wider">
+                      <th className="pb-2.5 pr-3 font-semibold">Pair</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">Last</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">24h Δ (USDT)</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">24h %</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap hidden lg:table-cell">Open</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">High</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">Low</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">Spread</th>
+                      <th className="pb-2.5 px-2 font-semibold text-right whitespace-nowrap">Vol USDT</th>
+                      <th className="pb-2.5 pl-2 font-semibold text-right whitespace-nowrap hidden sm:table-cell">Base vol</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trackedTickers.map((symbol) => {
+                      const data = tickers[symbol];
+                      const baseAsset = symbol.replace('USDT', '');
+                      const pctRaw = data ? Number.parseFloat(data.changePercent) : NaN;
+                      const pctOk = Number.isFinite(pctRaw);
+                      const pctPositive = pctOk && pctRaw > 0;
+                      const pctNegative = pctOk && pctRaw < 0;
+                      const deltaFmt = formatSignedUsd(data?.change);
+                      const titleLast =
+                        data?.weightedAvgPrice != null
+                          ? `Last trade · 24h weighted avg ${data.weightedAvgPrice} USDT`
+                          : 'Last trade (USDT)';
+                      return (
+                        <tr key={symbol} className="border-b border-border/50 hover:bg-border/30 transition-colors">
+                          <td className="py-3 pr-3 align-middle">
+                            <span className="font-bold text-white">{baseAsset}</span>
+                            <span className="text-gray-500">/USDT</span>
+                          </td>
+                          <td className="py-3 px-2 text-right font-mono text-xs text-white align-middle" title={titleLast}>
+                            {data ? (
+                              <span>${data.price}</span>
+                            ) : (
+                              <span className="text-gray-500">…</span>
+                            )}
+                          </td>
+                          <td
+                            className={`py-3 px-2 text-right font-mono text-xs align-middle ${
+                              deltaFmt.positive === true
+                                ? 'text-emerald-400'
+                                : deltaFmt.positive === false
+                                  ? 'text-red-400'
+                                  : 'text-gray-500'
+                            }`}
+                          >
+                            {deltaFmt.text}
+                          </td>
+                          <td
+                            className={`py-3 px-2 text-right font-mono text-xs align-middle ${
+                              !data
+                                ? 'text-gray-500'
+                                : pctPositive
+                                  ? 'text-emerald-400'
+                                  : pctNegative
+                                    ? 'text-red-400'
+                                    : 'text-gray-400'
+                            }`}
+                          >
+                            {data && pctOk ? (
+                              <span className="inline-flex items-center justify-end gap-0.5">
+                                {pctPositive ? '↑' : pctNegative ? '↓' : ' '}
+                                {Math.abs(pctRaw).toFixed(2)}%
+                              </span>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                          <td className="py-3 px-2 text-right font-mono text-xs text-gray-300 align-middle hidden lg:table-cell">
+                            {data?.open24h != null ? `$${data.open24h}` : '—'}
+                          </td>
+                          <td className="py-3 px-2 text-right font-mono text-xs text-emerald-400/90 align-middle">
+                            {data?.high24h != null ? `$${data.high24h}` : '—'}
+                          </td>
+                          <td className="py-3 px-2 text-right font-mono text-xs text-red-400/90 align-middle">
+                            {data?.low24h != null ? `$${data.low24h}` : '—'}
+                          </td>
+                          <td className="py-3 px-2 text-right font-mono text-xs text-gray-300 align-middle">
+                            {data?.spreadBps != null && data.bestBid != null && data.bestAsk != null ? (
+                              <span title={`Bid ${data.bestBid} · Ask ${data.bestAsk}`}>
+                                {data.spreadBps} bps
+                              </span>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                          <td className="py-3 px-2 text-right font-mono text-xs text-gray-300 align-middle">
+                            {formatQuoteVolCompact(data?.quoteVolume24h)}
+                          </td>
+                          <td className="py-3 pl-2 text-right font-mono text-[10px] text-gray-400 align-middle hidden sm:table-cell">
+                            {formatBaseVolCompact(data?.volume24h, baseAsset)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
         </div>

@@ -13,6 +13,17 @@ export interface Ticker {
   price: string;
   change: string;
   changePercent: string;
+  /** Base-asset volume over 24h (e.g. BTC for BTCUSDT). */
+  volume24h?: string;
+  /** Quote volume over 24h (USDT for *USDT pairs). */
+  quoteVolume24h?: string;
+  open24h?: string;
+  high24h?: string;
+  low24h?: string;
+  weightedAvgPrice?: string;
+  bestBid?: string;
+  bestAsk?: string;
+  spreadBps?: string;
 }
 
 export interface WalletItem {
@@ -24,6 +35,8 @@ export interface WalletItem {
   usd_value?: number | null;
   value?: number;
 }
+
+export type BotSignal = 'buy' | 'sell' | 'hold';
 
 export interface BotRow {
   bot_id: string;
@@ -43,6 +56,7 @@ export interface BotRow {
   closed_trades: number | null;
   risk_settings?: RiskSettings;
   current_capital_quote?: number | null;
+  last_signal?: BotSignal | null;
   metrics?: Partial<Record<ExecutionMode, StrategyHealth>>;
 }
 
@@ -373,6 +387,25 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
 
   handleBotsMessage: (message) => {
     const data = message.data;
+
+    if (message.type === 'bot_signal' && typeof data.bot_id === 'string' && typeof data.signal === 'string') {
+      const raw = data.signal.toLowerCase();
+      const signal: BotSignal | null =
+        raw === 'buy' || raw === 'sell' || raw === 'hold' ? raw : null;
+      const eventMode = typeof data.execution_mode === 'string' ? data.execution_mode : null;
+      if (signal != null) {
+        set((state) => ({
+          bots: state.bots.map((bot) =>
+            bot.bot_id === data.bot_id &&
+            (eventMode == null || bot.execution_mode === eventMode)
+              ? { ...bot, last_signal: signal }
+              : bot,
+          ),
+        }));
+      }
+      return;
+    }
+
     if (message.type === 'bot_status' && typeof data.bot_id === 'string') {
       get().patchBotStatus(data.bot_id, String(data.status ?? ''));
       return;
@@ -414,15 +447,48 @@ export const useRealtimeStore = create<RealtimeState>((set, get) => ({
     if (!Number.isFinite(price)) return;
     const change = Number(message.data.price_change);
     const changePercent = Number(message.data.price_change_percent);
+    const volBase = Number(message.data.volume_24h);
+    const volQuote = Number(message.data.quote_volume_24h);
+    const open24h = Number(message.data.open_24h);
+    const high24h = Number(message.data.high_24h);
+    const low24h = Number(message.data.low_24h);
+    const wavg = Number(message.data.weighted_avg_price);
+    const bestBid = Number(message.data.best_bid);
+    const bestAsk = Number(message.data.best_ask);
+    const spreadBps = Number(message.data.spread_bps);
+
+    const fmt = (n: number, frac: number) =>
+      Number.isFinite(n) ? n.toFixed(frac) : undefined;
+    const fmtPriceLike = (n: number) => {
+      if (!Number.isFinite(n) || n <= 0) return undefined;
+      if (n >= 1) return n.toFixed(n >= 100 ? 2 : 4);
+      return n.toFixed(8).replace(/\.?0+$/, '') || undefined;
+    };
 
     set((state) => ({
       marketTickers: {
         ...state.marketTickers,
         [symbol]: {
           symbol,
-          price: price.toFixed(2),
-          change: Number.isFinite(change) ? change.toFixed(2) : '0.00',
+          price: fmtPriceLike(price) ?? price.toFixed(8),
+          change: Number.isFinite(change) ? change.toFixed(4) : '0.0000',
           changePercent: Number.isFinite(changePercent) ? changePercent.toFixed(2) : '0.00',
+          volume24h: fmt(volBase, 4),
+          quoteVolume24h: fmt(volQuote, 2),
+          open24h: fmtPriceLike(open24h),
+          high24h: fmtPriceLike(high24h),
+          low24h: fmtPriceLike(low24h),
+          weightedAvgPrice: fmtPriceLike(wavg),
+          bestBid: fmtPriceLike(bestBid),
+          bestAsk: fmtPriceLike(bestAsk),
+          spreadBps:
+            Number.isFinite(spreadBps) &&
+            Number.isFinite(bestBid) &&
+            Number.isFinite(bestAsk) &&
+            bestBid > 0 &&
+            bestAsk > 0
+              ? spreadBps.toFixed(2)
+              : undefined,
         },
       },
       marketUpdatedAt: Date.now(),

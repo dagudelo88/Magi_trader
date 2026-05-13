@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { API_BASE } from '../config';
 import { useRealtimeStore, type TradingSettings } from '../stores/realtimeStore';
 import {
@@ -10,144 +10,187 @@ import {
 
 type RiskDraftSetter = (next: RiskSettings) => void;
 
+const RISK_INPUT_CLASS =
+  'w-full rounded border border-border bg-surface px-3 py-2 text-sm text-white focus:border-primary focus:outline-none';
+
 function numberValue(value: string): number | null {
   if (value.trim() === '') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function SubsectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <p className="font-label mb-3 text-[10px] font-bold uppercase tracking-widest text-gray-500">{children}</p>
+  );
+}
+
 function RiskFields({ value, onChange }: { value: RiskSettings; onChange: RiskDraftSetter }) {
   const set = <K extends keyof RiskSettings>(key: K, next: RiskSettings[K]) => {
     onChange({ ...value, [key]: next });
   };
-  const inputClass = 'w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-primary';
   return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Base risk %</span>
-          <input
-            type="number"
-            min="0.1"
-            step="0.1"
-            value={value.base_risk_pct}
-            onChange={(e) => set('base_risk_pct', Number(e.target.value))}
-            className={inputClass}
-          />
-        </label>
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Daily loss %</span>
-          <input
-            type="number"
-            min="0.1"
-            step="0.1"
-            value={value.daily_loss_limit_pct}
-            onChange={(e) => set('daily_loss_limit_pct', Number(e.target.value))}
-            className={inputClass}
-          />
-        </label>
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Max drawdown %</span>
-          <input
-            type="number"
-            min="0.1"
-            step="0.1"
-            value={value.max_drawdown_pct}
-            onChange={(e) => set('max_drawdown_pct', Number(e.target.value))}
-            className={inputClass}
-          />
-        </label>
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Loss streak</span>
-          <input
-            type="number"
-            min="1"
-            step="1"
-            value={value.consecutive_loss_limit}
-            onChange={(e) => set('consecutive_loss_limit', Number.parseInt(e.target.value, 10))}
-            className={inputClass}
-          />
-        </label>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-        {value.dynamic_tiers.map((tier, idx) => (
-          <label key={`${tier.min_score ?? 'min'}-${tier.max_score ?? 'max'}`} className="block">
-            <span className="block text-xs text-gray-500 mb-1">
-              {idx === 0 ? '< 0.40' : idx === 1 ? '0.40 - 0.70' : idx === 2 ? '0.70 - 0.85' : '> 0.85'} multiplier
-            </span>
+    <div className="space-y-6">
+      <div>
+        <SubsectionLabel>Core limits</SubsectionLabel>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">Base risk %</span>
             <input
               type="number"
               min="0.1"
-              step="0.05"
-              value={tier.multiplier}
-              onChange={(e) => {
-                const dynamic_tiers = value.dynamic_tiers.map((candidate, tierIdx) =>
-                  tierIdx === idx ? { ...candidate, multiplier: Number(e.target.value) } : candidate,
-                );
-                onChange({ ...value, dynamic_tiers });
-              }}
-              className={inputClass}
+              step="0.1"
+              value={value.base_risk_pct}
+              onChange={(e) => set('base_risk_pct', Number(e.target.value))}
+              className={RISK_INPUT_CLASS}
             />
           </label>
-        ))}
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">Daily loss %</span>
+            <input
+              type="number"
+              min="0.1"
+              step="0.1"
+              value={value.daily_loss_limit_pct}
+              onChange={(e) => set('daily_loss_limit_pct', Number(e.target.value))}
+              className={RISK_INPUT_CLASS}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">Max drawdown %</span>
+            <input
+              type="number"
+              min="0.1"
+              step="0.1"
+              value={value.max_drawdown_pct}
+              onChange={(e) => set('max_drawdown_pct', Number(e.target.value))}
+              className={RISK_INPUT_CLASS}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">Loss streak limit</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              value={value.consecutive_loss_limit}
+              onChange={(e) => set('consecutive_loss_limit', Number.parseInt(e.target.value, 10))}
+              className={RISK_INPUT_CLASS}
+            />
+          </label>
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Drawdown action</span>
-          <select
-            value={value.drawdown_action}
-            onChange={(e) => set('drawdown_action', e.target.value as DrawdownAction)}
-            className={inputClass}
-          >
-            <option value="reduce">Reduce position size</option>
-            <option value="pause">Pause bot</option>
-          </select>
-        </label>
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Drawdown reduce factor</span>
-          <input
-            type="number"
-            min="0.05"
-            max="1"
-            step="0.05"
-            value={value.drawdown_reduce_factor}
-            onChange={(e) => set('drawdown_reduce_factor', Number(e.target.value))}
-            className={inputClass}
-          />
-        </label>
+      <div>
+        <SubsectionLabel>Dynamic sizing (by consensus score)</SubsectionLabel>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {value.dynamic_tiers.map((tier, idx) => (
+            <label
+              key={`${tier.min_score ?? 'min'}-${tier.max_score ?? 'max'}-${idx}`}
+              className="block"
+            >
+              <span className="mb-1 block text-xs text-gray-500">
+                {idx === 0 ? '< 0.40' : idx === 1 ? '0.40 – 0.70' : idx === 2 ? '0.70 – 0.85' : '> 0.85'} multiplier
+              </span>
+              <input
+                type="number"
+                min="0.1"
+                step="0.05"
+                value={tier.multiplier}
+                onChange={(e) => {
+                  const dynamic_tiers = value.dynamic_tiers.map((candidate, tierIdx) =>
+                    tierIdx === idx ? { ...candidate, multiplier: Number(e.target.value) } : candidate,
+                  );
+                  onChange({ ...value, dynamic_tiers });
+                }}
+                className={RISK_INPUT_CLASS}
+              />
+            </label>
+          ))}
+        </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs text-gray-400">
-        {[
-          ['enable_dynamic_sizing', 'Dynamic sizing'],
-          ['enable_daily_loss_limit', 'Daily loss limit'],
-          ['enable_drawdown_protection', 'Drawdown protection'],
-          ['enable_consecutive_loss', 'Consecutive loss breaker'],
-          ['enable_volatility_pause', 'Volatility pause'],
-        ].map(([key, label]) => (
-          <label key={key} className="flex items-center gap-2">
+      <div>
+        <SubsectionLabel>Drawdown response</SubsectionLabel>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">Action</span>
+            <select
+              value={value.drawdown_action}
+              onChange={(e) => set('drawdown_action', e.target.value as DrawdownAction)}
+              className={RISK_INPUT_CLASS}
+            >
+              <option value="reduce">Reduce position size</option>
+              <option value="pause">Pause bot</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-gray-500">Reduce factor</span>
+            <input
+              type="number"
+              min="0.05"
+              max="1"
+              step="0.05"
+              value={value.drawdown_reduce_factor}
+              onChange={(e) => set('drawdown_reduce_factor', Number(e.target.value))}
+              className={RISK_INPUT_CLASS}
+            />
+          </label>
+        </div>
+      </div>
+
+      <div>
+        <SubsectionLabel>Protection toggles</SubsectionLabel>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {(
+            [
+              ['enable_dynamic_sizing', 'Dynamic sizing'],
+              ['enable_daily_loss_limit', 'Daily loss limit'],
+              ['enable_drawdown_protection', 'Drawdown protection'],
+              ['enable_consecutive_loss', 'Consecutive loss breaker'],
+            ] as const
+          ).map(([key, label]) => (
+            <label
+              key={key}
+              className="flex cursor-pointer items-center gap-3 rounded border border-border/60 bg-surface/40 px-3 py-2.5 text-xs text-gray-300"
+            >
+              <input
+                type="checkbox"
+                className="h-4 w-4 shrink-0 rounded border-border text-primary focus:ring-primary"
+                checked={Boolean(value[key])}
+                onChange={(e) => set(key, e.target.checked as never)}
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <SubsectionLabel>Volatility filter</SubsectionLabel>
+        <div className="flex flex-col gap-3 rounded border border-border/60 bg-surface/40 p-4 sm:flex-row sm:items-end sm:gap-6">
+          <label className="flex cursor-pointer items-center gap-3 text-xs text-gray-300 sm:shrink-0">
             <input
               type="checkbox"
-              checked={Boolean(value[key as keyof RiskSettings])}
-              onChange={(e) => set(key as keyof RiskSettings, e.target.checked as never)}
+              className="h-4 w-4 shrink-0 rounded border-border text-primary focus:ring-primary"
+              checked={value.enable_volatility_pause}
+              onChange={(e) => set('enable_volatility_pause', e.target.checked)}
             />
-            {label}
+            Pause on high volatility
           </label>
-        ))}
-        <label className="block">
-          <span className="block text-xs text-gray-500 mb-1">Volatility threshold %</span>
-          <input
-            type="number"
-            min="0.1"
-            step="0.1"
-            value={value.volatility_threshold ?? ''}
-            onChange={(e) => set('volatility_threshold', numberValue(e.target.value))}
-            className={inputClass}
-            placeholder="optional"
-          />
-        </label>
+          <label className="min-w-0 flex-1">
+            <span className="mb-1 block text-xs text-gray-500">Threshold % (optional)</span>
+            <input
+              type="number"
+              min="0.1"
+              step="0.1"
+              value={value.volatility_threshold ?? ''}
+              onChange={(e) => set('volatility_threshold', numberValue(e.target.value))}
+              className={RISK_INPUT_CLASS}
+              placeholder="e.g. 2.5"
+            />
+          </label>
+        </div>
       </div>
     </div>
   );
@@ -160,8 +203,6 @@ export default function Settings() {
   const loadBots = useRealtimeStore((state) => state.loadBots);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [liveModalOpen, setLiveModalOpen] = useState(false);
-  const [confirmInput, setConfirmInput] = useState('');
   const [actionError, setActionError] = useState<string | null>(null);
   const [globalRisk, setGlobalRisk] = useState<RiskSettings | null>(null);
   const [botRisk, setBotRisk] = useState<RiskSettings | null>(null);
@@ -169,6 +210,14 @@ export default function Settings() {
   const [selectedBotId, setSelectedBotId] = useState('');
   const [riskSaving, setRiskSaving] = useState(false);
   const [riskError, setRiskError] = useState<string | null>(null);
+  const [riskTab, setRiskTab] = useState<'global' | 'perBot'>('global');
+
+  const riskTabClass = (tab: 'global' | 'perBot') =>
+    `rounded-t border px-3 py-2 text-[10px] font-bold uppercase tracking-widest transition-colors ${
+      riskTab === tab
+        ? 'border-primary/50 bg-primary/15 text-primary'
+        : 'border-border/50 bg-surface/30 text-gray-500 hover:text-gray-300'
+    }`;
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -223,53 +272,6 @@ export default function Settings() {
       cancelled = true;
     };
   }, [selectedBotId]);
-
-  const useTestnet = settings?.execution_mode === 'testnet';
-
-  const applyTestnet = async () => {
-    if (!settings) return;
-    setSaving(true);
-    setActionError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/settings/trading`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ execution_mode: 'testnet', confirmation_phrase: null }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not switch to testnet');
-      await loadTradingSettings();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Request failed');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const applyLive = async () => {
-    if (!settings) return;
-    setSaving(true);
-    setActionError(null);
-    try {
-      const res = await fetch(`${API_BASE}/api/settings/trading`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          execution_mode: 'live',
-          confirmation_phrase: confirmInput.trim(),
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Could not enable live trading');
-      setLiveModalOpen(false);
-      setConfirmInput('');
-      await loadTradingSettings();
-    } catch (e) {
-      setActionError(e instanceof Error ? e.message : 'Request failed');
-    } finally {
-      setSaving(false);
-    }
-  };
 
   const setHalt = async (halted: boolean) => {
     if (halted && !window.confirm('Halt all bots now? Running bots will stop placing orders.')) return;
@@ -363,275 +365,251 @@ export default function Settings() {
   };
 
   return (
-    <main className="flex-1 flex overflow-hidden p-6">
-      <div className="w-full max-w-3xl">
-        <h1 className="text-2xl font-bold text-white mb-6">Settings</h1>
-
-        {loadError && (
-          <div className="mb-6 p-4 rounded-custom border border-red-500/40 bg-red-500/10 text-red-300 text-sm">
-            {loadError}
-          </div>
-        )}
-        {actionError && (
-          <div className="mb-6 p-4 rounded-custom border border-amber-500/40 bg-amber-500/10 text-amber-200 text-sm">
-            {actionError}
-          </div>
-        )}
-
-        <div className="space-y-6">
-          <div className="bg-panel border border-border rounded-custom p-6">
-            <h3 className="text-lg font-bold text-white mb-4">Binance API Keys</h3>
-            <p className="text-sm text-gray-400 mb-4">
-              Keys are read from your server <code className="bg-black/40 px-1 rounded">.env</code> files — not stored in
-              the browser.
+    <>
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="mx-auto min-h-0 w-full max-w-4xl flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:py-8">
+          <header className="mb-8 border-b border-border/60 pb-6">
+            <h1 className="font-headline text-2xl font-black uppercase italic tracking-tight text-white">
+              Configuration
+            </h1>
+            <p className="mt-2 max-w-2xl text-sm text-gray-500">
+              Binance credentials from your server <code className="font-mono text-xs text-gray-600">.env</code>, global
+              halt, and risk defaults. Live vs testnet routing is set <span className="text-gray-400">per bot</span>, not
+              here.
             </p>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">API Key</label>
-                <input
-                  type="password"
-                  value="••••••••••••••"
-                  readOnly
-                  className="w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm focus:outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-500 mb-1">Secret Key</label>
-                <input
-                  type="password"
-                  value="••••••••••••••"
-                  readOnly
-                  className="w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm focus:outline-none"
-                />
-              </div>
-            </div>
-          </div>
+          </header>
 
-          <div className="bg-panel border border-border rounded-custom p-6">
-            <h3 className="text-lg font-bold text-white mb-4">Trading Preferences</h3>
-            <div className="flex items-center justify-between py-2 border-b border-border">
-              <div>
-                <div className="font-bold text-white text-sm">Use Binance Spot Testnet (recommended)</div>
-                <div className="text-xs text-gray-500">
-                  Orders and balances use testnet (virtual funds). Turn off only when you intend to trade on mainnet.
-                </div>
-              </div>
-              <button
-                type="button"
-                role="switch"
-                aria-checked={useTestnet}
-                disabled={!settings || saving}
-                onClick={() => {
-                  if (!settings) return;
-                  if (useTestnet) {
-                    setConfirmInput('');
-                    setLiveModalOpen(true);
-                  } else {
-                    applyTestnet();
-                  }
-                }}
-                className={`relative w-12 h-7 rounded-full transition-colors shrink-0 ${
-                  useTestnet ? 'bg-primary' : 'bg-gray-600'
-                } ${!settings || saving ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
-              >
-                <span
-                  className={`absolute top-1 w-5 h-5 bg-white rounded-full transition-all ${
-                    useTestnet ? 'left-6' : 'left-1'
-                  }`}
-                />
-              </button>
+          {loadError && (
+            <div className="mb-6 rounded border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-300">
+              {loadError}
             </div>
+          )}
+          {actionError && (
+            <div className="mb-6 rounded border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-200">
+              {actionError}
+            </div>
+          )}
 
-            {settings && (
-              <p className="text-xs text-gray-500 mt-3">
-                Current mode:{' '}
-                <span className={settings.execution_mode === 'live' ? 'text-red-400' : 'text-blue-400'}>
-                  {settings.execution_mode === 'live' ? 'Mainnet (real funds)' : 'Testnet (simulated exchange funds)'}
-                </span>
+          <div className="flex flex-col gap-6">
+            <section className="border border-border bg-panel p-5 sm:p-6">
+              <h2 className="mb-1 text-lg font-bold text-white">Binance API keys</h2>
+              <p className="mb-6 text-sm text-gray-400">
+                Credentials come from your server <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-xs">.env</code>{' '}
+                only — nothing here is stored in the browser.
               </p>
-            )}
 
-            <div className="flex items-center justify-between py-2 mt-4">
-              <div>
-                <div className="font-bold text-white text-sm">Global killswitch</div>
-                <div className="text-xs text-gray-500">When on, no bot may enter the running state.</div>
-              </div>
-              <div className="flex items-center gap-3">
-                {settings?.global_trading_halted ? (
-                  <button
-                    type="button"
-                    disabled={saving}
-                    onClick={() => setHalt(false)}
-                    className="px-4 py-1.5 bg-emerald-600/20 text-emerald-400 border border-emerald-900/50 rounded text-sm font-bold hover:bg-emerald-600 hover:text-white transition-colors"
-                  >
-                    RESUME
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    disabled={saving}
-                    onClick={() => setHalt(true)}
-                    className="px-4 py-1.5 bg-red-600/20 text-red-500 border border-red-900/50 rounded text-sm font-bold hover:bg-red-600 hover:text-white transition-colors"
-                  >
-                    HALT ALL
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
+              <div className="space-y-8">
+                <div>
+                  <h3 className="mb-1 text-sm font-bold text-white">Spot testnet</h3>
+                  <p className="mb-4 font-mono text-[10px] uppercase tracking-wide text-gray-500">
+                    BINANCE_TESTNET_API_KEY · BINANCE_TESTNET_API_SECRET
+                  </p>
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-gray-500">Testnet API key</span>
+                      <input
+                        type="password"
+                        value="••••••••••••••"
+                        readOnly
+                        autoComplete="off"
+                        aria-label="BINANCE_TESTNET_API_KEY (masked)"
+                        className="w-full rounded border border-border bg-surface px-3 py-2 font-mono text-sm text-white focus:outline-none"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-gray-500">Testnet secret</span>
+                      <input
+                        type="password"
+                        value="••••••••••••••"
+                        readOnly
+                        autoComplete="off"
+                        aria-label="BINANCE_TESTNET_API_SECRET (masked)"
+                        className="w-full rounded border border-border bg-surface px-3 py-2 font-mono text-sm text-white focus:outline-none"
+                      />
+                    </label>
+                  </div>
+                </div>
 
-          <div className="bg-panel border border-border rounded-custom p-6">
-            <div className="flex items-start justify-between gap-4 mb-4">
-              <div>
-                <h3 className="text-lg font-bold text-white">Risk Management &amp; Position Sizing</h3>
-                <p className="text-xs text-gray-500 mt-1">
-                  Global defaults seed new bots; per-bot profiles control live sizing and protections.
+                <div className="border-t border-border/60 pt-8">
+                  <h3 className="mb-1 text-sm font-bold text-white">Spot mainnet (live)</h3>
+                  <p className="mb-4 font-mono text-[10px] uppercase tracking-wide text-gray-500">
+                    BINANCE_API_KEY · BINANCE_API_SECRET
+                  </p>
+                  <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-gray-500">Mainnet API key</span>
+                      <input
+                        type="password"
+                        value="••••••••••••••"
+                        readOnly
+                        autoComplete="off"
+                        aria-label="BINANCE_API_KEY (masked)"
+                        className="w-full rounded border border-border bg-surface px-3 py-2 font-mono text-sm text-white focus:outline-none"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-xs text-gray-500">Mainnet secret</span>
+                      <input
+                        type="password"
+                        value="••••••••••••••"
+                        readOnly
+                        autoComplete="off"
+                        aria-label="BINANCE_API_SECRET (masked)"
+                        className="w-full rounded border border-border bg-surface px-3 py-2 font-mono text-sm text-white focus:outline-none"
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section className="border border-border bg-panel p-5 sm:p-6">
+              <h2 className="mb-1 text-lg font-bold text-white">Global killswitch</h2>
+              <p className="mb-5 text-sm text-gray-400">
+                When halted, no bot may enter the running state. This is independent of which bots are on testnet or
+                promoted to live.
+              </p>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+                <p className="min-w-0 flex-1 text-xs text-gray-500">
+                  Status:{' '}
+                  <span className={settings?.global_trading_halted ? 'font-semibold text-amber-400' : 'text-emerald-400'}>
+                    {settings?.global_trading_halted ? 'HALTED — fleet stopped from starting' : 'Normal — bots may run'}
+                  </span>
                 </p>
+                <div className="flex shrink-0 items-center gap-3">
+                  {settings?.global_trading_halted ? (
+                    <button
+                      type="button"
+                      disabled={saving || !settings}
+                      onClick={() => setHalt(false)}
+                      className="rounded border border-emerald-900/50 bg-emerald-600/20 px-4 py-1.5 text-sm font-bold text-emerald-400 transition-colors hover:bg-emerald-600 hover:text-white disabled:opacity-50"
+                    >
+                      RESUME
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={saving || !settings}
+                      onClick={() => setHalt(true)}
+                      className="rounded border border-red-900/50 bg-red-600/20 px-4 py-1.5 text-sm font-bold text-red-500 transition-colors hover:bg-red-600 hover:text-white disabled:opacity-50"
+                    >
+                      HALT ALL
+                    </button>
+                  )}
+                </div>
               </div>
-              {riskSource && (
-                <span className="text-[10px] uppercase tracking-widest text-primary/80 border border-primary/20 bg-primary/10 px-2 py-1 rounded">
-                  Bot source: {riskSource}
-                </span>
+            </section>
+
+            <section className="border border-border bg-panel p-5 sm:p-6">
+              <h2 className="text-lg font-bold text-white">Risk & position sizing</h2>
+              <p className="mt-1 text-sm text-gray-500">
+                Global defaults seed new bots; per-bot profiles control live sizing and protections.
+              </p>
+
+              {riskError && (
+                <div className="mt-4 rounded border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-200">
+                  {riskError}
+                </div>
               )}
-            </div>
 
-            {riskError && (
-              <div className="mb-4 p-3 rounded-custom border border-amber-500/40 bg-amber-500/10 text-amber-200 text-xs">
-                {riskError}
+              <div className="mt-6 flex flex-wrap items-end gap-1 border-b border-border/60 pb-px">
+                <button type="button" className={riskTabClass('global')} onClick={() => setRiskTab('global')}>
+                  Global defaults
+                </button>
+                <button type="button" className={riskTabClass('perBot')} onClick={() => setRiskTab('perBot')}>
+                  Per-bot profile
+                </button>
+                {riskTab === 'perBot' && riskSource && (
+                  <span className="mb-1 ml-auto text-[10px] uppercase tracking-widest text-primary/80 sm:mb-2">
+                    Source: <span className="text-primary">{riskSource}</span>
+                  </span>
+                )}
               </div>
-            )}
 
-            <div className="space-y-6">
-              <section className="border border-border/70 bg-surface/40 rounded-custom p-4">
-                <div className="flex items-center justify-between gap-3 mb-4">
+              <div className="mt-5">
+                {riskTab === 'global' && (
                   <div>
-                    <h4 className="text-sm font-bold text-white">Global Default Risk Settings</h4>
-                    <p className="text-xs text-gray-500">
-                      Used when a bot is created without a template-specific profile.
-                    </p>
+                    <div className="mb-4 flex flex-wrap items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        disabled={!globalRisk || riskSaving}
+                        onClick={() => void saveGlobalRisk()}
+                        className="rounded bg-primary px-3 py-2 text-xs font-bold uppercase tracking-widest text-black disabled:opacity-50"
+                      >
+                        Save defaults
+                      </button>
+                    </div>
+                    {globalRisk ? (
+                      <RiskFields value={globalRisk} onChange={(next) => setGlobalRisk(cloneRiskSettings(next))} />
+                    ) : (
+                      <p className="text-sm text-gray-500">Loading defaults…</p>
+                    )}
                   </div>
-                  <button
-                    type="button"
-                    disabled={!globalRisk || riskSaving}
-                    onClick={() => void saveGlobalRisk()}
-                    className="px-3 py-2 rounded-custom bg-primary text-black text-xs font-bold uppercase tracking-widest disabled:opacity-50"
-                  >
-                    Save defaults
-                  </button>
-                </div>
-                {globalRisk ? (
-                  <RiskFields
-                    value={globalRisk}
-                    onChange={(next) => setGlobalRisk(cloneRiskSettings(next))}
-                  />
-                ) : (
-                  <p className="text-sm text-gray-500">Loading defaults…</p>
                 )}
-              </section>
 
-              <section className="border border-border/70 bg-surface/40 rounded-custom p-4">
-                <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3 mb-4">
-                  <div className="flex-1">
-                    <h4 className="text-sm font-bold text-white">Per-Bot Risk Profile</h4>
-                    <p className="text-xs text-gray-500 mb-2">
-                      These settings apply only to the selected bot.
-                    </p>
-                    <select
-                      value={selectedBotId}
-                      onChange={(e) => setSelectedBotId(e.target.value)}
-                      className="w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-primary"
-                    >
-                      {bots.length === 0 ? (
-                        <option value="">No bots available</option>
-                      ) : (
-                        bots.map((bot) => (
-                          <option key={bot.bot_id} value={bot.bot_id}>
-                            {bot.name} · {bot.symbol}
-                          </option>
-                        ))
-                      )}
-                    </select>
+                {riskTab === 'perBot' && (
+                  <div className="space-y-5">
+                    <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+                      <label className="min-w-0 flex-1 lg:max-w-md">
+                        <span className="mb-1 block text-xs text-gray-500">Bot</span>
+                        <select
+                          value={selectedBotId}
+                          onChange={(e) => setSelectedBotId(e.target.value)}
+                          className={`${RISK_INPUT_CLASS} font-mono text-xs sm:text-sm`}
+                        >
+                          {bots.length === 0 ? (
+                            <option value="">No bots available</option>
+                          ) : (
+                            bots.map((bot) => (
+                              <option key={bot.bot_id} value={bot.bot_id}>
+                                {bot.name} · {bot.symbol}
+                              </option>
+                            ))
+                          )}
+                        </select>
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          disabled={!botRisk || !selectedBotId || riskSaving}
+                          onClick={() => void resetBotRisk('global')}
+                          className="rounded border border-border px-3 py-2 text-xs text-gray-300 hover:text-white disabled:opacity-50"
+                        >
+                          Reset to global
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!botRisk || !selectedBotId || riskSaving}
+                          onClick={() => void resetBotRisk('template')}
+                          className="rounded border border-primary/40 px-3 py-2 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
+                        >
+                          Reset to template
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!botRisk || !selectedBotId || riskSaving}
+                          onClick={() => void saveBotRisk()}
+                          className="rounded bg-primary px-3 py-2 text-xs font-bold uppercase tracking-widest text-black disabled:opacity-50"
+                        >
+                          Save bot risk
+                        </button>
+                      </div>
+                    </div>
+                    {bots.length === 0 ? (
+                      <p className="text-sm text-gray-500">Create a bot from the Bots page to edit per-bot risk.</p>
+                    ) : botRisk ? (
+                      <RiskFields value={botRisk} onChange={(next) => setBotRisk(cloneRiskSettings(next))} />
+                    ) : (
+                      <p className="text-sm text-gray-500">Select a bot to load its risk profile.</p>
+                    )}
                   </div>
-                  <div className="flex flex-wrap gap-2">
-                    <button
-                      type="button"
-                      disabled={!botRisk || !selectedBotId || riskSaving}
-                      onClick={() => void resetBotRisk('global')}
-                      className="px-3 py-2 rounded-custom border border-border text-xs text-gray-300 hover:text-white disabled:opacity-50"
-                    >
-                      Reset to Global Defaults
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!botRisk || !selectedBotId || riskSaving}
-                      onClick={() => void resetBotRisk('template')}
-                      className="px-3 py-2 rounded-custom border border-primary/40 text-xs text-primary hover:bg-primary/10 disabled:opacity-50"
-                    >
-                      Reset to Template Defaults
-                    </button>
-                    <button
-                      type="button"
-                      disabled={!botRisk || !selectedBotId || riskSaving}
-                      onClick={() => void saveBotRisk()}
-                      className="px-3 py-2 rounded-custom bg-primary text-black text-xs font-bold uppercase tracking-widest disabled:opacity-50"
-                    >
-                      Save bot risk
-                    </button>
-                  </div>
-                </div>
-                {botRisk ? (
-                  <RiskFields value={botRisk} onChange={(next) => setBotRisk(cloneRiskSettings(next))} />
-                ) : (
-                  <p className="text-sm text-gray-500">Select a bot to edit its risk profile.</p>
                 )}
-              </section>
-            </div>
+              </div>
+            </section>
           </div>
         </div>
-      </div>
+      </main>
 
-      {liveModalOpen && settings && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="bg-panel border border-border rounded-custom max-w-md w-full p-6 shadow-xl">
-            <h3 className="text-lg font-bold text-white mb-2">Enable mainnet trading?</h3>
-            <p className="text-sm text-gray-400 mb-4">
-              This routes the backend to <span className="text-red-400">Binance mainnet</span> for wallet queries and
-              bot orders. Use testnet keys only on testnet — use separate API keys for mainnet.
-            </p>
-            <p className="text-xs text-gray-500 mb-2">
-              Type exactly: <code className="text-primary">{settings.live_confirmation_phrase}</code>
-            </p>
-            <input
-              type="text"
-              value={confirmInput}
-              onChange={(e) => setConfirmInput(e.target.value)}
-              className="w-full bg-surface border border-border rounded px-3 py-2 text-white text-sm mb-4 focus:outline-none focus:border-primary"
-              placeholder="Confirmation phrase"
-              autoComplete="off"
-            />
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                className="px-4 py-2 text-sm text-gray-300 hover:text-white"
-                onClick={() => {
-                  setLiveModalOpen(false);
-                  setConfirmInput('');
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                disabled={saving}
-                className="px-4 py-2 rounded-custom text-sm font-bold bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
-                onClick={() => applyLive()}
-              >
-                Enable live
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </main>
+    </>
   );
 }

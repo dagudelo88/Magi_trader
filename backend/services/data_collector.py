@@ -135,22 +135,42 @@ def _is_server_shutdown(stream_name: str | None, payload: dict) -> bool:
     return stream_name == "!serverShutdown" or payload.get("e") == "serverShutdown"
 
 
+def _num(payload: dict, key: str, default: float = 0.0) -> float:
+    try:
+        return float(payload.get(key, default) or 0)
+    except (TypeError, ValueError):
+        return default
+
+
 def _publish_market_tick(symbol: str, payload: dict) -> None:
     now = time.monotonic()
     if now - _last_market_broadcast.get(symbol, 0.0) < MARKET_BROADCAST_MIN_INTERVAL_SEC:
         return
     _last_market_broadcast[symbol] = now
+    st = state[symbol]
+    data: dict = {
+        "symbol": stream_id_to_ccxt(symbol),
+        "stream_id": symbol,
+        "last_price": _num(payload, "c"),
+        "price_change": _num(payload, "p"),
+        "price_change_percent": _num(payload, "P"),
+        "open_24h": _num(payload, "o"),
+        "high_24h": _num(payload, "h"),
+        "low_24h": _num(payload, "l"),
+        "volume_24h": _num(payload, "v"),
+        "quote_volume_24h": _num(payload, "q"),
+        "weighted_avg_price": _num(payload, "w"),
+        "event_time": int(payload.get("E", 0) or 0),
+    }
+    bid = float(st.get("bid") or 0)
+    ask = float(st.get("ask") or 0)
+    if bid > 0 and ask > 0:
+        data["best_bid"] = bid
+        data["best_ask"] = ask
+        data["spread_bps"] = float(st.get("spread_bps") or 0)
     publish_market_event(
         "market_tick",
-        {
-            "symbol": stream_id_to_ccxt(symbol),
-            "stream_id": symbol,
-            "last_price": float(payload.get("c", 0) or 0),
-            "price_change": float(payload.get("p", 0) or 0),
-            "price_change_percent": float(payload.get("P", 0) or 0),
-            "volume_24h": float(payload.get("v", 0) or 0),
-            "event_time": int(payload.get("E", 0) or 0),
-        },
+        data,
     )
 
 
