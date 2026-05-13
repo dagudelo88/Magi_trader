@@ -2137,14 +2137,14 @@ export default function BotDetail() {
               </button>
             ) : (
               <button type="button" disabled={busy} onClick={() => setStatus('paused')}
-                className="font-headline min-h-10 min-w-0 flex-1 bg-yellow-500 px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
+                className="font-headline min-h-10 min-w-0 flex-1 bg-amber-500/80 px-3 text-[9px] font-black uppercase tracking-widest text-black transition-colors hover:bg-amber-400 disabled:opacity-40 sm:flex-none sm:px-6 sm:text-[10px]">
                 PAUSE
               </button>
             )}
             <button type="button" disabled={busy}
-              onClick={() => { if (window.confirm('Terminate this bot?')) void setStatus('stopped'); }}
-              className="font-headline min-h-10 min-w-0 flex-1 bg-magi-hot px-3 text-[9px] font-black uppercase tracking-widest text-black hover:brightness-110 disabled:opacity-50 sm:flex-none sm:px-6 sm:text-[10px]">
-              TERMINATE
+              onClick={() => { if (window.confirm('Stop this bot?')) void setStatus('stopped'); }}
+              className="font-headline min-h-10 min-w-0 flex-1 bg-red-700/70 px-3 text-[9px] font-black uppercase tracking-widest text-white transition-colors hover:bg-red-600 disabled:opacity-40 sm:flex-none sm:px-6 sm:text-[10px]">
+              STOP
             </button>
           </div>
         </div>

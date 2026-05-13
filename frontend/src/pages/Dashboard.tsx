@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { API_BASE } from '../config';
 import {
   useRealtimeStore,
@@ -482,9 +482,8 @@ export default function Dashboard() {
         {/* Bot Performance Table */}
         {bots.length > 0 && (
           <div className="bg-panel border border-border rounded-custom shadow-md mb-6 overflow-hidden">
-            <div className="px-5 py-3 border-b border-border flex items-center justify-between">
+            <div className="px-5 py-3 border-b border-border">
               <h2 className="text-sm font-bold uppercase tracking-wider text-gray-300">Bot Performance</h2>
-              <Link to="/bots" className="text-xs text-primary hover:underline">Manage →</Link>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
