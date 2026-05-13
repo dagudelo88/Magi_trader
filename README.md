@@ -137,63 +137,154 @@ Registered strategy **keys** (UI loads via `GET /api/strategies`):
 
 ## Quick start
 
-**Requirements:** **Node.js** (LTS), **Python 3.11+** with **`pip`**, and **`.env`** (see [`backend/.env.example`](backend/.env.example)). Repo-root `.env` and `backend/.env` are both loaded.
+**Requirements:** **Node.js** (LTS) + **npm**, **Python 3.11+** with **`pip`**, and a **`.env`** at the repo root (copy from [`backend/.env.example`](backend/.env.example)). Both **repo-root `.env`** and **`backend/.env`** are loaded if present (backend overrides).
 
-### Install dependencies
+What the installers do: **`npm ci`** at the repo root, **`npm ci --prefix frontend --legacy-peer-deps`**, then **`pip install -r backend/requirements.txt`**. The **`--legacy-peer-deps`** flag matches the committed lockfiles while avoiding a **`@tailwindcss/vite`** vs **Vite 8** peer conflict.
 
-| Layer | Declared in | Install |
-|-------|-------------|---------|
-| Root (`concurrently`) | [`package.json`](package.json) | `npm ci` / `npm install` at repo root |
-| Frontend | [`frontend/package.json`](frontend/package.json) | `npm ci --prefix frontend` or `cd frontend && npm install` |
-| Backend | [`backend/requirements.txt`](backend/requirements.txt) | `python -m pip install -r backend/requirements.txt` |
+| Layer | Declared in |
+|-------|-------------|
+| Root (`concurrently`) | [`package.json`](package.json) |
+| Frontend | [`frontend/package.json`](frontend/package.json) (+ root / frontend **`package-lock.json`**) |
+| Backend | [`backend/requirements.txt`](backend/requirements.txt) |
 
-Lockfiles: **`package-lock.json`** at root and under **`frontend/`**. Python deps are mostly unpinned (some minimum versions).
+### Coding agents (Cursor, Copilot, Windsurf, …)
 
-**One command (recommended)**
+If you use an **AI coding assistant** to work in this repo, point it at this section so setup stays reproducible.
 
-```bash
-npm run setup
-```
+| Goal | What to tell the agent |
+|------|-------------------------|
+| **Install everything** | Run from the **repo root**: **`npm run setup`** (cross‑platform). Same behavior as [`scripts/setup.ps1`](scripts/setup.ps1) (Windows PowerShell) or [`scripts/setup.sh`](scripts/setup.sh) (Linux/macOS bash). Prefer **non‑interactive** commands; no prompts in those scripts. |
+| **Environment** | Copy [`backend/.env.example`](backend/.env.example) → **`.env`** at repo root (or `backend/.env`). **Never commit** `.env` or paste live API secrets into chat. |
+| **Sanity check** | **`cd backend && python -m unittest discover -s tests -p "test_*.py"`** — use **`python3`** on Linux if `python` is not v3. Optional: **`npm run dev`** then open **`http://localhost:5000`** (UI) and **`http://localhost:8000/docs`** (API). |
+| **Where things live** | HTTP API: [`backend/main.py`](backend/main.py). Strategies: [`backend/trading/strategies/`](backend/trading/strategies/). SQLite schema / pooling: [`backend/database.py`](backend/database.py). Dashboard: [`frontend/src/`](frontend/src/). |
+| **Local data** | **`data/magitrader.db`** is runtime state — **gitignored**; do not treat a missing DB as a bug on fresh clone. |
 
-Runs `npm ci`, `npm ci --prefix frontend --legacy-peer-deps`, then `pip` on `backend/requirements.txt`. **`--legacy-peer-deps`** works around a **`@tailwindcss/vite`** peer range vs **Vite 8** mismatch while staying aligned with committed lockfiles.
+Repo-root **[`AGENTS.md`](AGENTS.md)** mirrors this for tools that load agent instructions automatically (e.g. Cursor).
 
-**Repo scripts (same steps)**
+---
 
-- **Windows:** `.\scripts\setup.ps1` — if blocked: `powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1`
-- **Linux / macOS:** `./scripts/setup.sh` (`chmod +x scripts/setup.sh` if needed)
+### Windows (PowerShell)
 
-**Optional Python venv**
+1. **Install prerequisites:** [Node.js LTS](https://nodejs.org/) (includes npm) and [Python 3](https://www.python.org/) — during Python setup, enable **Add python.exe to PATH**. The Windows **`py`** launcher is optional; [`scripts/setup.ps1`](scripts/setup.ps1) tries `python` first, then `py -3`.
+
+2. **Clone** this repo and **open a terminal in the repo root** (the folder that contains `package.json`).
+
+3. **Environment:** copy [`backend/.env.example`](backend/.env.example) to **`.env`** at the repo root (or under `backend/`) and fill in keys.
+
+4. **Install dependencies** — choose one:
+
+   **A — Repo script (recommended)** — same steps as `npm run setup`, with clearer errors if Node/Python are missing:
+
+   ```powershell
+   .\scripts\setup.ps1
+   ```
+
+   If execution policy blocks it:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1
+   ```
+
+   **B — npm script**
+
+   ```powershell
+   npm run setup
+   ```
+
+5. **Run the app**
+
+   ```powershell
+   npm run dev
+   ```
+
+**Windows notes**
+
+- If **`npm ci`** fails with **EPERM** / **unlink** on a file under `node_modules`, stop other processes using the repo (running dev server, IDE indexing, antivirus scan) and run the install again.
+- Prefer **PowerShell** or **Windows Terminal** for `setup.ps1`; **CMD** does not run `.ps1` files natively.
+
+---
+
+### Linux
+
+These steps also work on **macOS** in **Terminal** (use **`./scripts/setup.sh`** the same way).
+
+1. **Install prerequisites** (names vary by distro):
+
+   - **Node.js LTS** — from your distro packages, [NodeSource](https://github.com/nodesource/distributions), [nvm](https://github.com/nvm-sh/nvm), or [fnm](https://github.com/Schniz/fnm).
+   - **Python 3** + **`pip`** — e.g. Debian/Ubuntu: `sudo apt update && sudo apt install -y python3 python3-pip python3-venv`.
+
+2. **Clone** the repo and **`cd`** into the repo root.
+
+3. **Environment:** copy [`backend/.env.example`](backend/.env.example) to **`.env`** at the repo root (or `backend/.env`) and edit values.
+
+4. **Install dependencies** — choose one:
+
+   **A — Repo script (recommended)**
+
+   ```bash
+   chmod +x scripts/setup.sh    # only if the file is not executable yet
+   ./scripts/setup.sh
+   ```
+
+   [`scripts/setup.sh`](scripts/setup.sh) uses **`python3`** if available, otherwise **`python`**.
+
+   **B — npm script**
+
+   ```bash
+   npm run setup
+   ```
+
+5. **Run the app**
+
+   ```bash
+   npm run dev
+   ```
+
+**Linux notes**
+
+- If **`npm ci`** reports missing **`package-lock.json`**, run **`git checkout`** / **`git pull`** so lockfiles are present; do not delete them for installs.
+- Rare native-addon build failures on minimal images may require **`build-essential`** (Debian/Ubuntu) or your distro’s compiler toolchain.
+
+---
+
+### Optional: Python virtualenv (Windows or Linux)
 
 ```bash
 python -m venv .venv
-# Windows: .\.venv\Scripts\Activate.ps1
-# Unix:    source .venv/bin/activate
 ```
 
-**Manual alternative**
+Activate, then run **`npm run setup`** or the OS script so **`pip`** installs into the venv:
+
+| OS | Activate |
+|----|----------|
+| Windows (PowerShell) | `.\.venv\Scripts\Activate.ps1` |
+| Linux / macOS | `source .venv/bin/activate` |
+
+---
+
+### Manual install (no scripts)
+
+If you prefer not to use [`scripts/setup.ps1`](scripts/setup.ps1) / [`scripts/setup.sh`](scripts/setup.sh) or **`npm run setup`**:
 
 ```bash
 npm install
-cd frontend && npm install && cd ..
+cd frontend && npm install --legacy-peer-deps && cd ..
 python -m pip install -r backend/requirements.txt
 ```
 
-If the frontend install fails on peers, use `npm install --legacy-peer-deps` inside **`frontend/`**.
+On Linux, use **`python3 -m pip`** if **`python`** is not Python 3.
 
-### Run the app
+---
 
-```bash
-npm run dev
-```
+### Run URLs & split processes
 
 - **Backend:** `http://0.0.0.0:8000` — OpenAPI at **`/docs`**
-- **Frontend:** Vite dev server on **`http://localhost:5000`** (`strictPort` in [`frontend/vite.config.ts`](frontend/vite.config.ts))
-
-Split processes:
+- **Frontend:** **`http://localhost:5000`** (`strictPort` in [`frontend/vite.config.ts`](frontend/vite.config.ts))
 
 ```bash
-npm run dev:backend    # API only
-npm run dev:frontend   # UI only
+npm run dev             # API + UI together
+npm run dev:backend     # API only
+npm run dev:frontend    # UI only
 ```
 
 ### Tests
@@ -204,6 +295,8 @@ From **`backend/`** (stdlib **unittest** discovery):
 cd backend
 python -m unittest discover -s tests -p "test_*.py"
 ```
+
+On Linux, if `python` is not Python 3, use **`python3`** instead of **`python`**.
 
 ---
 
@@ -223,6 +316,7 @@ python -m unittest discover -s tests -p "test_*.py"
 | `frontend/` | Vite React SPA (`src/pages`, `components`, `stores`, …) |
 | `data/` | Runtime SQLite (not committed) |
 | `scripts/` | **`setup.ps1`**, **`setup.sh`**, backtests, MetaMagi export, DB utilities |
+| `AGENTS.md` | Short instructions for **AI coding agents** (Cursor, etc.) — bootstrap, secrets, test command |
 | `docs/` | Product / architecture notes |
 
 ---
