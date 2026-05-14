@@ -153,7 +153,7 @@ If you use an **AI coding assistant** to work in this repo, point it at this sec
 
 | Goal | What to tell the agent |
 |------|-------------------------|
-| **Install everything** | Run from the **repo root**: **`npm run setup`** (cross‑platform). Same behavior as [`scripts/setup.ps1`](scripts/setup.ps1) (Windows PowerShell) or [`scripts/setup.sh`](scripts/setup.sh) (Linux/macOS bash). Prefer **non‑interactive** commands; no prompts in those scripts. |
+| **Install everything** | Run from the **repo root**: **`npm run setup`** (cross‑platform). Same behavior as [`scripts/setup.ps1`](scripts/setup.ps1) (Windows PowerShell) or [`scripts/setup.sh`](scripts/setup.sh) (Linux/macOS bash). Prefer **non‑interactive** commands; no prompts in those scripts. **`npm install`** at the repo root also runs **`postinstall`**, which installs **`frontend/`** deps so Vite is present after a root-only install. |
 | **Environment** | Copy [`backend/.env.example`](backend/.env.example) → **`.env`** at repo root (or `backend/.env`). **Never commit** `.env` or paste live API secrets into chat. |
 | **Sanity check** | **`cd backend && python -m unittest discover -s tests -p "test_*.py"`** — use **`python3`** on Linux if `python` is not v3. Optional: **`npm run dev`** then open **`http://localhost:5000`** (UI) and **`http://localhost:8000/docs`** (API). |
 | **Where things live** | HTTP API: [`backend/main.py`](backend/main.py). Strategies: [`backend/trading/strategies/`](backend/trading/strategies/). SQLite schema / pooling: [`backend/database.py`](backend/database.py). Dashboard: [`frontend/src/`](frontend/src/). |
@@ -281,6 +281,8 @@ On Linux, use **`python3 -m pip`** if **`python`** is not Python 3.
 - **Backend:** `http://0.0.0.0:8000` — OpenAPI at **`/docs`**
 - **Frontend:** **`http://localhost:5000`** (`strictPort` in [`frontend/vite.config.ts`](frontend/vite.config.ts))
 
+**Windows shortcut:** run **[`start.bat`](start.bat)** from the repo root (or double-click it). It frees listeners on ports **5000** and **8000**, ensures **`npm`** dependencies (root + frontend when needed), then runs **`npm run dev`** and writes a session log under **`logs\`**.
+
 ```bash
 npm run dev             # API + UI together
 npm run dev:backend     # API only
@@ -316,6 +318,7 @@ On Linux, if `python` is not Python 3, use **`python3`** instead of **`python`**
 | `frontend/` | Vite React SPA (`src/pages`, `components`, `stores`, …) |
 | `data/` | Runtime SQLite (not committed) |
 | `scripts/` | **`setup.ps1`**, **`setup.sh`**, backtests, MetaMagi export, DB utilities |
+| **`start.bat`** | **Windows:** clean ports 5000/8000, ensure npm deps, **`npm run dev`**, session logs in **`logs/`** |
 | `AGENTS.md` | Short instructions for **AI coding agents** (Cursor, etc.) — bootstrap, secrets, test command |
 | `docs/` | Product / architecture notes |
 

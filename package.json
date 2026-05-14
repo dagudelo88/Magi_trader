@@ -3,6 +3,7 @@
   "private": true,
   "scripts": {
     "setup": "npm ci && npm ci --prefix frontend --legacy-peer-deps && python -m pip install -r backend/requirements.txt",
+    "postinstall": "npm install --prefix frontend --legacy-peer-deps --no-audit --no-fund",
     "dev": "concurrently -n backend,frontend -c blue,magenta \"cd backend && uvicorn main:app --host 0.0.0.0 --port 8000\" \"cd frontend && npm run dev\"",
     "dev:backend": "cd backend && uvicorn main:app --host 0.0.0.0 --port 8000",
     "dev:frontend": "cd frontend && npm run dev"

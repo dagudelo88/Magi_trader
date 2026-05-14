@@ -11,6 +11,8 @@ Run **`npm run setup`** once per clone (Node + Python on `PATH`). Equivalent scr
 
 Uses **`npm ci`**, **`npm ci --prefix frontend --legacy-peer-deps`**, **`pip install -r backend/requirements.txt`**.
 
+**Note:** A root **`npm install`** (without `setup`) runs **`postinstall`**, which runs **`npm install --prefix frontend --legacy-peer-deps`** so the dashboard deps (including Vite) are not skipped.
+
 ## Secrets & env
 
 - Template: **`backend/.env.example`** → copy to **`.env`** at repo root or **`backend/.env`** (backend file overrides root).
@@ -25,6 +27,8 @@ cd backend && python -m unittest discover -s tests -p "test_*.py"
 Use **`python3`** on Linux when **`python`** is not Python 3.
 
 Optional manual run: **`npm run dev`** — API **`http://localhost:8000`**, UI **`http://localhost:5000`**, OpenAPI **`/docs`**.
+
+**Windows:** **`start.bat`** at repo root ensures deps and runs **`npm run dev`** (kills stale listeners on 5000/8000, logs under **`logs/`**).
 
 ## Architecture pointers
 

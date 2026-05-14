@@ -1,4 +1,5 @@
 @echo off
+setlocal EnableExtensions
 cd /d "%~dp0"
 
 echo Stopping any processes on ports 5000 and 8000 (including child processes)...
@@ -17,9 +18,34 @@ if exist "frontend\node_modules\.vite" (
   rd /s /q "frontend\node_modules\.vite" 2>nul
 )
 
-if not exist "node_modules" (
-  echo Installing dependencies...
+:: Root installs concurrently; postinstall installs frontend (see package.json).
+:: Also repair frontend if someone deleted frontend\node_modules only.
+set "NEED_NPM_INSTALL="
+if not exist "node_modules\.bin\concurrently.cmd" set "NEED_NPM_INSTALL=1"
+if not exist "frontend\node_modules\vite\bin\vite.js" set "NEED_NPM_INSTALL=1"
+
+if defined NEED_NPM_INSTALL (
+  echo Installing / repairing npm dependencies from repo root...
   call npm install
+  if errorlevel 1 (
+    echo npm install failed.
+    exit /b 1
+  )
+)
+
+if not exist "frontend\node_modules\vite\bin\vite.js" (
+  echo Frontend dependencies still missing - installing frontend only...
+  call npm install --prefix frontend --legacy-peer-deps --no-audit --no-fund
+  if errorlevel 1 (
+    echo Frontend npm install failed.
+    exit /b 1
+  )
+)
+
+where npm >nul 2>&1
+if errorlevel 1 (
+  echo npm not found on PATH. Install Node.js LTS from https://nodejs.org/
+  exit /b 1
 )
 
 :: Create logs directory if it doesn't exist
@@ -42,3 +68,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
   "    Write-Host $_;" ^
   "    ($_ -replace '\x1b\[[0-9;]*[mGKHF]', '') | Out-File -FilePath $log -Encoding UTF8 -Append" ^
   "}"
+
+endlocal
