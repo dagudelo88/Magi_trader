@@ -864,6 +864,13 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_voter_feedback_voter_ts "
         "ON voter_feedback(voter_name, timestamp)"
     )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_voter_feedback_unlabeled_ts "
+        "ON voter_feedback("
+        "timestamp, feedback_id, target_asset, forward_roc_30s, forward_roc_5m"
+        ") "
+        "WHERE forward_roc_30s IS NULL OR forward_roc_5m IS NULL"
+    )
 
     # Cached OHLCV candles — written by bot_runner on every fetch so the
     # backtesting engine can replay any historical window without hitting
@@ -1678,6 +1685,20 @@ def _roc_for_window(
     window_ms: int,
 ) -> float | None:
     """Return forward ROC for one feedback row/window using indexed lookups."""
+    rocs = _forward_rocs_for_windows(cur, target_asset, timestamp_ms, (window_ms,))
+    return rocs[window_ms]
+
+
+def _forward_rocs_for_windows(
+    cur: sqlite3.Cursor,
+    target_asset: str,
+    timestamp_ms: int,
+    window_ms_values: tuple[int, ...],
+) -> dict[int, float | None]:
+    """Return multiple forward ROCs with one shared base-price lookup."""
+    windows = tuple(dict.fromkeys(window_ms_values))
+    if not windows:
+        return {}
     cur.execute(
         """
         SELECT target_price FROM market_ticks
@@ -1689,24 +1710,31 @@ def _roc_for_window(
         (target_asset, timestamp_ms),
     )
     base = cur.fetchone()
-    cur.execute(
-        """
-        SELECT target_price FROM market_ticks
-        WHERE target_asset = ?
-          AND timestamp >= ?
-        ORDER BY timestamp ASC
-        LIMIT 1
-        """,
-        (target_asset, timestamp_ms + window_ms),
-    )
-    fwd = cur.fetchone()
-    if not base or not fwd:
-        return None
+    if not base:
+        return {window_ms: None for window_ms in windows}
     base_price = float(base["target_price"] or 0)
-    fwd_price = float(fwd["target_price"] or 0)
     if base_price <= 0:
-        return None
-    return (fwd_price - base_price) / base_price
+        return {window_ms: None for window_ms in windows}
+
+    out: dict[int, float | None] = {}
+    for window_ms in windows:
+        cur.execute(
+            """
+            SELECT target_price FROM market_ticks
+            WHERE target_asset = ?
+              AND timestamp >= ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+            """,
+            (target_asset, timestamp_ms + window_ms),
+        )
+        fwd = cur.fetchone()
+        if not fwd:
+            out[window_ms] = None
+            continue
+        fwd_price = float(fwd["target_price"] or 0)
+        out[window_ms] = (fwd_price - base_price) / base_price
+    return out
 
 
 def voter_feedback_label_window_bounds(
@@ -1790,23 +1818,28 @@ def label_voter_feedback_forward_roc_batch(
         rows = [dict(row) for row in cur.fetchall()]
         result["selected"] = len(rows)
         updates: list[tuple[float | None, float | None, int]] = []
+        roc_cache: dict[
+            tuple[str, int],
+            tuple[float | None, float | None],
+        ] = {}
         for row in rows:
             roc_30s = row["forward_roc_30s"]
             roc_5m = row["forward_roc_5m"]
+            label_key = (str(row["target_asset"]), int(row["timestamp"]))
+            cached_rocs = roc_cache.get(label_key)
+            if cached_rocs is None:
+                computed = _forward_rocs_for_windows(
+                    cur,
+                    label_key[0],
+                    label_key[1],
+                    (30_000, 300_000),
+                )
+                cached_rocs = (computed.get(30_000), computed.get(300_000))
+                roc_cache[label_key] = cached_rocs
             if roc_30s is None:
-                roc_30s = _roc_for_window(
-                    cur,
-                    row["target_asset"],
-                    int(row["timestamp"]),
-                    30_000,
-                )
+                roc_30s = cached_rocs[0]
             if roc_5m is None:
-                roc_5m = _roc_for_window(
-                    cur,
-                    row["target_asset"],
-                    int(row["timestamp"]),
-                    300_000,
-                )
+                roc_5m = cached_rocs[1]
             if roc_30s is not None or roc_5m is not None:
                 updates.append((roc_30s, roc_5m, int(row["feedback_id"])))
                 if row["forward_roc_30s"] is None and roc_30s is not None:
@@ -1924,7 +1957,7 @@ def metamagi_label_voter_feedback_catchup(
         bs = (
             batch_size
             if batch_size is not None
-            else int(os.environ.get("METAMAGI_CATCHUP_BATCH_SIZE", "120"))
+            else int(os.environ.get("METAMAGI_CATCHUP_BATCH_SIZE", "500"))
         )
         bt = (
             busy_timeout_ms
@@ -1955,7 +1988,7 @@ def metamagi_label_voter_feedback_catchup(
         sleep_s = (
             batch_sleep_sec
             if batch_sleep_sec is not None
-            else float(os.environ.get("METAMAGI_CATCHUP_BATCH_SLEEP_SEC", "0.05"))
+            else float(os.environ.get("METAMAGI_CATCHUP_BATCH_SLEEP_SEC", "0.01"))
         )
         busy_retry_sleep = float(
             os.environ.get("METAMAGI_CATCHUP_DB_BUSY_RETRY_SLEEP_SEC", "0.25")
